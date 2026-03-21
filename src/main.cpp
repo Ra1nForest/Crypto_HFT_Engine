@@ -1,7 +1,7 @@
 #include "market_data_feed.h"
 #include "arbitrage_detector.h"
 #include "display.h"
- 
+
 #include <iostream>
 #include <iomanip>
 #include <thread>
@@ -47,7 +47,7 @@ int main() {
 
     ArbitrageDetector detector(0.001, 0.01);
 
-    std::cout << "Formatting market access..." << std::endl;
+    std::cout << "Starting market data feeds..." << std::endl;
 
     std::thread binance_thread([&binance_feed]() {
         binance_feed.run();
@@ -68,18 +68,20 @@ int main() {
         OrderBook binance_book = binance_feed.getOrderBookSnapshot();
         OrderBook okx_book = okx_feed.getOrderBookSnapshot();
 
+        detector.detect(binance_book, okx_book);
+
         Display::render(
             binance_book, okx_book, detector,
-            binance_feed.getMessageCount(), binance_feed.getAvgLatency(),
-            binance_feed.getMaxLatency(), binance_feed.isRunning(),
-            okx_feed.getMessageCount(), okx_feed.getAvgLatency(),
-            okx_feed.getMaxLatency(), okx_feed.isRunning(),
+            binance_feed.getLatencyTracker(),
+            okx_feed.getLatencyTracker(),
+            binance_feed.isRunning(),
+            okx_feed.isRunning(),
             5
-);
+        );
     }
 
-    std::cout << "\n Closing connections..." << std::endl;
- 
+    std::cout << "\nClosing connections..." << std::endl;
+
     binance_feed.stop();
     okx_feed.stop();
 
@@ -87,13 +89,13 @@ int main() {
     okx_thread.detach();
 
     std::cout << "\n═══ Final Report ═══" << std::endl;
-    std::cout << "  Binance messages: " << binance_feed.getMessageCount() << std::endl;
-    std::cout << "  OKX messages:     " << okx_feed.getMessageCount() << std::endl;
+    Display::printDualLatencyReport(
+        binance_feed.getLatencyTracker(),
+        okx_feed.getLatencyTracker()
+    );
     std::cout << "  Arbitrage signals: " << detector.getTotalSignals() << std::endl;
     std::cout << "  Total net profit:  $" << detector.getTotalNetProfit() << std::endl;
     std::cout << "\nGoodbye!" << std::endl;
- 
+
     return 0;
-
-
 }

@@ -3,7 +3,12 @@
 A low-latency, cross-exchange cryptocurrency arbitrage monitoring system built in C++17. Connects to multiple exchanges via WebSocket, maintains real-time order books, and detects arbitrage opportunities across exchanges.
 
 ## Screenshot
-![Dashboard](screenshot.png)
+
+### Live Dashboard
+![Dashboard](docs/screenshot_dashboard.png)
+
+### Final Report
+![Report](docs/screenshot_report.png)
 
 ## Architecture
 

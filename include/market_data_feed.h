@@ -14,6 +14,7 @@
 
 #include "simdjson.h"
 #include "orderbook.h"
+#include "latency_tracker.h"
 
 #include <string>
 #include <iostream>
@@ -48,10 +49,7 @@ class MarketDataFeed {
     mutable std::mutex mutex_;
     std::atomic<bool> running_;
 
-    int message_count_;
-    long total_latency_us_;
-    long max_latency_us_;
-    long min_latency_us_;
+    LatencyTracker latency_;
 
     void connect() {
 
@@ -118,14 +116,7 @@ class MarketDataFeed {
             if (success) {
                 auto end = std::chrono::high_resolution_clock::now();
                 long latency = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-                message_count_++;
-                total_latency_us_ += latency;
-                if (latency > max_latency_us_) {
-                    max_latency_us_ = latency;
-                }
-                if (latency < min_latency_us_) {
-                    min_latency_us_ = latency;
-                }
+                latency_.record(latency);
             }
         }
 
@@ -212,10 +203,7 @@ public:
         : config_(config)
         , orderbook_(config.name + ":" + config.symbol)
         , running_(false)
-        , message_count_(0)
-        , total_latency_us_(0)
-        , max_latency_us_(0)
-        , min_latency_us_(999999) {}
+        , latency_(config.name) {}
     
     void run() {
         running_ = true;
@@ -237,22 +225,11 @@ public:
         return orderbook_;
     }
 
-    int getMessageCount() const {
-        return message_count_;
-    }
-    long getAvgLatency() const {
-        return message_count_ > 0 ? total_latency_us_ / message_count_ : 0;
-    }
-    long getMaxLatency() const {
-        return max_latency_us_;
-    }
-    long getMinLatency() const {
-        return min_latency_us_;
-    }
-    bool isRunning() const {
-        return running_;
-    }
-    const std::string& getName() const {
-        return config_.name;
-    }
+    const LatencyTracker& getLatencyTracker() const { return latency_; }
+
+    int getMessageCount() const { return latency_.getCount(); }
+
+    bool isRunning() const { return running_; }
+
+    const std::string& getName() const { return config_.name; }
 };
