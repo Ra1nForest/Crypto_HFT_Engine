@@ -7,7 +7,7 @@
 #include <iomanip>
 #include <algorithm>
 
-struct Pricelevel {
+struct PriceLevel {
     double price;
     double quantity;
 };
@@ -37,7 +37,7 @@ public:
         }
     }
 
-    Pricelevel getBestBid() const {
+    PriceLevel getBestBid() const {
         if (bids_.empty()) {
             return {0.0, 0.0};
         }
@@ -45,7 +45,7 @@ public:
         return {it->first, it->second};
     }
 
-    Pricelevel getBestAsk() const {
+    PriceLevel getBestAsk() const {
         if (asks_.empty()) {
             return {0.0, 0.0};
         }
@@ -54,8 +54,8 @@ public:
     }
 
     double getSpread() const {
-        Pricelevel bid = getBestBid();
-        Pricelevel ask = getBestAsk();
+        PriceLevel bid = getBestBid();
+        PriceLevel ask = getBestAsk();
         if (bid.price == 0.0 || ask.price == 0.0) {
             return 0.0;
         }
@@ -63,38 +63,32 @@ public:
     }
 
         void print(int levels = 10) const {
-        // 收集买盘数据（从高到低）
-        std::vector<Pricelevel> bidLevels;
+        std::vector<PriceLevel> bidLevels;
         int count = 0;
         for (auto it = bids_.rbegin(); it != bids_.rend() && count < levels; ++it, ++count) {
             bidLevels.push_back({it->first, it->second});
         }
  
-        // 收集卖盘数据（从低到高）
-        std::vector<Pricelevel> askLevels;
+        std::vector<PriceLevel> askLevels;
         count = 0;
         for (auto it = asks_.begin(); it != asks_.end() && count < levels; ++it, ++count) {
             askLevels.push_back({it->first, it->second});
         }
  
-        // 获取统计数据
         auto bestBid = getBestBid();
         auto bestAsk = getBestAsk();
         double spread = getSpread();
         double midPrice = (bestBid.price + bestAsk.price) / 2.0;
  
-        // 表头
         std::cout << "  ┌──────────── " << symbol_ << " ────────────┐" << std::endl;
-        std::cout << "  │     BID (买盘)     │     ASK (卖盘)     │" << std::endl;
+        std::cout << "  │        BID         │         ASK        │" << std::endl;
         std::cout << "  │  Qty       Price   │   Price      Qty   │" << std::endl;
         std::cout << "  ├────────────────────┼────────────────────┤" << std::endl;
  
-        // 逐行打印买卖盘
         int maxRows = std::max(bidLevels.size(), askLevels.size());
         for (int i = 0; i < maxRows; ++i) {
             std::cout << "  │";
  
-            // 左边：买盘
             if (i < static_cast<int>(bidLevels.size())) {
                 std::cout << std::setw(7) << std::fixed << std::setprecision(4) 
                           << bidLevels[i].quantity
@@ -107,7 +101,6 @@ public:
  
             std::cout << " │ ";
  
-            // 右边：卖盘
             if (i < static_cast<int>(askLevels.size())) {
                 std::cout << std::setw(9) << std::fixed << std::setprecision(2) 
                           << askLevels[i].price
@@ -121,7 +114,6 @@ public:
             std::cout << " │" << std::endl;
         }
  
-        // 底部统计
         std::cout << "  ├────────────────────┴────────────────────┤" << std::endl;
         std::cout << "  │ Spread: " << std::setw(8) << std::setprecision(2) << spread
                   << "    Mid: " << std::setw(12) << std::setprecision(2) << midPrice
@@ -133,4 +125,7 @@ public:
     void clearAsks() { asks_.clear(); }
 
     const std::string& getSymbol() const { return symbol_; }
+
+    const std::map<double, double>& getBids() const { return bids_; }
+    const std::map<double, double>& getAsks() const { return asks_; }
 };

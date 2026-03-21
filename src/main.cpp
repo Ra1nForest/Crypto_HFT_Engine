@@ -1,172 +1,99 @@
-#include <boost/beast/core.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/beast/websocket/ssl.hpp>
-#include <boost/asio/connect.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl.hpp>
-#include <openssl/err.h>
- 
-#include "simdjson.h"
-#include "orderbook.h"
+#include "market_data_feed.h"
+#include "arbitrage_detector.h"
+#include "display.h"
  
 #include <iostream>
-#include <string>
-#include <chrono>
 #include <iomanip>
-//#include <thread>
+#include <thread>
+#include <chrono>
+#include <csignal>
+#include <atomic>
 
-namespace beast = boost::beast;
-namespace websocket = beast::websocket;
-namespace net = boost::asio;
-namespace ssl = net::ssl;
-using tcp = net::ip::tcp;
+std::atomic<bool> g_running{true};
 
-double toDouble(std::string_view sv){
-    return std::stod(std::string(sv));
-}
-
-void clearScreen() {
-    std::cout << "\033[2J\033[1;1H";
+void signalHandler(int) {
+    g_running = false;
 }
 
 int main() {
-    try {
-        const std::string host = "stream.binance.com";
-        const std::string port = "9443";
-        const std::string path = "/ws/btcusdt@depth20@100ms";
+    std::signal(SIGINT, signalHandler);
 
-        std::cout << "Connecting to Binance WebSocket..." << std::endl;
-        std::cout << "Data Stream: wss://" << host << ":" << port << path << std::endl;
+    std::cout << "╔══════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║       Crypto HFT Engine v0.2                 ║" << std::endl;
+    std::cout << "║  Dual Exchange Arbitrage Monitor             ║" << std::endl;
+    std::cout << "╚══════════════════════════════════════════════╝" << std::endl;
+    std::cout << std::endl;
 
-        std::cout << std::endl;
+    FeedConfig binance_config;
+    binance_config.exchange = Exchange::BINANCE;
+    binance_config.name = "Binance";
+    binance_config.host = "stream.binance.com";
+    binance_config.port = "9443";
+    binance_config.path = "/ws/btcusdt@depth20@100ms";
+    binance_config.symbol = "BTCUSDT";
+    binance_config.subscribe_msg = "";
 
-        net::io_context ioc;
-        ssl::context ctx(ssl::context::tlsv12_client);
-        tcp::resolver resolver(ioc);
-        websocket::stream<beast::ssl_stream<tcp::socket>> ws{ioc, ctx};
+    FeedConfig okx_config;
+    okx_config.exchange = Exchange::OKX;
+    okx_config.name = "OKX";
+    okx_config.host = "ws.okx.com";
+    okx_config.port = "8443";
+    okx_config.path = "/ws/v5/public";
+    okx_config.symbol = "BTCUSDT";
+    okx_config.subscribe_msg = R"({"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT"}]})";
 
-        auto const results = resolver.resolve(host, port);
+    MarketDataFeed binance_feed(binance_config);
+    MarketDataFeed okx_feed(okx_config);
 
-        auto ep = net::connect(ws.next_layer().next_layer(), results);
+    ArbitrageDetector detector(0.001, 0.01);
 
-        if (!SSL_set_tlsext_host_name(
-                ws.next_layer().native_handle(), host.c_str())) {
-            throw beast::system_error(
-                beast::error_code(
-                    static_cast<int>(::ERR_get_error()),
-                    net::error::get_ssl_category()),
-                "Failed to set SNI hostname");
-        }
+    std::cout << "Formatting market access..." << std::endl;
 
-        ws.next_layer().handshake(ssl::stream_base::client);
+    std::thread binance_thread([&binance_feed]() {
+        binance_feed.run();
+    });
 
-        std::string ws_host = host + ":" + std::to_string(ep.port());
-        ws.handshake(ws_host, path);
+    std::thread okx_thread([&okx_feed]() {
+        okx_feed.run();
+    });
 
-        std::cout << "Connected successfully!" << std::endl;
-        std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Waiting for market data..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
-        OrderBook binance("Binance:BTCUSDT");
+    std::cout << std::fixed << std::setprecision(2);
 
-        simdjson::ondemand::parser parser;
-        beast::flat_buffer buffer;
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        int message_count = 0;
+        OrderBook binance_book = binance_feed.getOrderBookSnapshot();
+        OrderBook okx_book = okx_feed.getOrderBookSnapshot();
 
-        long total_latency_us = 0;
-        long max_latency_us = 0;
-        long min_latency_us = 999999;
+        Display::render(
+            binance_book, okx_book, detector,
+            binance_feed.getMessageCount(), binance_feed.getAvgLatency(),
+            binance_feed.getMaxLatency(), binance_feed.isRunning(),
+            okx_feed.getMessageCount(), okx_feed.getAvgLatency(),
+            okx_feed.getMaxLatency(), okx_feed.isRunning(),
+            5
+);
+    }
 
-        while (true) {
-            buffer.clear();
-            ws.read(buffer);
-
-            auto start = std::chrono::high_resolution_clock::now();
-
-            std::string msg = beast::buffers_to_string(buffer.data());
-            simdjson::padded_string padded(msg);
-
-            simdjson::ondemand::document doc;
-            auto error = parser.iterate(padded).get(doc);
-            if (error) {
-                std::cerr << "JSON Analysis Error: " << error << std::endl;
-                continue;
-            }
-            
-            binance.clearBids();
-            binance.clearAsks();
-
-            auto bids = doc["bids"].get_array();
-            for (auto bid : bids) {
-                auto arr = bid.get_array();
-                auto iter = arr.begin();
-                
-                // 第一个元素是价格字符串
-                std::string_view price_str = (*iter).get_string();
-                ++iter;
-                // 第二个元素是数量字符串
-                std::string_view qty_str = (*iter).get_string();
+    std::cout << "\n Closing connections..." << std::endl;
  
-                double price = toDouble(price_str);
-                double qty = toDouble(qty_str);
- 
-                if (qty > 0.0) {
-                    binance.updateBid(price, qty);
-                }
-            }
+    binance_feed.stop();
+    okx_feed.stop();
 
-            auto asks = doc["asks"].get_array();
-            for (auto ask : asks) {
-                auto arr = ask.get_array();
-                auto iter = arr.begin();
- 
-                std::string_view price_str = (*iter).get_string();
-                ++iter;
-                std::string_view qty_str = (*iter).get_string();
- 
-                double price = toDouble(price_str);
-                double qty = toDouble(qty_str);
- 
-                if (qty > 0.0) {
-                    binance.updateAsk(price, qty);
-                }
-            }
+    binance_thread.detach();
+    okx_thread.detach();
 
-            auto end = std::chrono::high_resolution_clock::now();
-            long latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                end - start).count();
-            
-            total_latency_us += latency_us;
-            message_count++;
-            if (latency_us > max_latency_us) max_latency_us = latency_us;
-            if (latency_us < min_latency_us) min_latency_us = latency_us;
-
-            clearScreen();
+    std::cout << "\n═══ Final Report ═══" << std::endl;
+    std::cout << "  Binance messages: " << binance_feed.getMessageCount() << std::endl;
+    std::cout << "  OKX messages:     " << okx_feed.getMessageCount() << std::endl;
+    std::cout << "  Arbitrage signals: " << detector.getTotalSignals() << std::endl;
+    std::cout << "  Total net profit:  $" << detector.getTotalNetProfit() << std::endl;
+    std::cout << "\nGoodbye!" << std::endl;
  
-            std::cout << "╔══════════════════════════════════════════════╗" << std::endl;
-            std::cout << "║     Crypto Arbitrage Monitor v0.1            ║" << std::endl;
-            std::cout << "╚══════════════════════════════════════════════╝" << std::endl;
-            std::cout << std::endl;
+    return 0;
 
-            binance.print(10);
- 
-            std::cout << "═══ Performance Statistics ═══" << std::endl;
-            std::cout << "  Message Count: " << message_count << std::endl;
-            std::cout << "  Current Latency: " << latency_us << " μs" << std::endl;
-            std::cout << "  Average Latency: " << total_latency_us / message_count 
-                      << " μs" << std::endl;
-            std::cout << "  Minimum Latency: " << min_latency_us << " μs" << std::endl;
-            std::cout << "  Maximum Latency: " << max_latency_us << " μs" << std::endl;
-            std::cout << std::endl;
-            std::cout << "Press Ctrl+C to Exit" << std::endl;
-        }
 
-        ws.close(websocket::close_code::normal);
-        
-    }  catch (const std::exception& e){
-            std::cerr << "Error: " << e.what() << std::endl;
-            return 1;
-        }
-        return 0;
 }
