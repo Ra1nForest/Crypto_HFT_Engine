@@ -1,0 +1,8 @@
+build/
+logs/
+third_party/
+.vscode/
+*.o
+*.out
+.cache/
+.DS_Store
