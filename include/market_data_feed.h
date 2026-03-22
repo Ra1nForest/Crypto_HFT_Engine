@@ -211,7 +211,9 @@ public:
             connect();
             receiveLoop();
         } catch (const std::exception& e) {
-            std::cerr << "[" << config_.name << "] Error: " << e.what() << std::endl;
+            if (running_) {
+                std::cerr << "[" << config_.name << "] Error: " << e.what() << std::endl;
+            }
             running_ = false;
         }
     }

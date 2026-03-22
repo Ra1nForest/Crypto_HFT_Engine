@@ -15,7 +15,7 @@
         "subscribe": "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"books5\",\"instId\":\"BTC-USDT\"}]}"
     },
     "arbitrage": {
-        "fee_rate": 0.001,
+        "fee_rate": 0.0,
         "min_profit": 0.01
     },
     "display": {

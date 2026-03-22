@@ -119,14 +119,14 @@ private:
 
     void printSignal(const ArbitrageSignal& s) const {
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "\n  ╔════════════════ ARBITRAGE DETECTED ═══════════════╗" << std::endl;
+        std::cout << "\n  ╔══════════════════ ARBITRAGE DETECTED ══════════════════╗" << std::endl;
         std::cout << "  ║ BUY  " << std::setw(20) << std::left << s.buy_exchange
-                  << " @ " << std::right << std::setw(12) << s.buy_price << "       ║" << std::endl;
+                  << " @ " << std::right << std::setw(12) << s.buy_price << "               ║" << std::endl;
         std::cout << "  ║ SELL " << std::setw(20) << std::left << s.sell_exchange
-                  << " @ " << std::right << std::setw(12) << s.sell_price << "       ║" << std::endl;
+                  << " @ " << std::right << std::setw(12) << s.sell_price << "               ║" << std::endl;
         std::cout << "  ║ Qty: " << std::setw(10) << s.quantity << " BTC"
                   << "  Gross: $" << std::setw(8) << s.gross_profit
-                  << "  Net: $" << std::setw(8) << s.net_profit << " ║" << std::endl;
-        std::cout << "  ╚═══════════════════════════════════════════════════╝\n" << std::endl;
+                  << "  Net: $" << std::setw(8) << s.net_profit << "  ║" << std::endl;
+        std::cout << "  ╚════════════════════════════════════════════════════════╝\n" << std::endl;
     }
 };

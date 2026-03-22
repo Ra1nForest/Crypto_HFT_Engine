@@ -30,7 +30,7 @@ public:
         std::cout << std::fixed << std::setprecision(2);
 
         std::cout << "╔" << repeat("═", 87) << "╗" << std::endl;
-        std::cout << "║" << center("Crypto HFT Engine v0.2", 87) << "║" << std::endl;
+        std::cout << "║" << center("Crypto HFT Engine v1.0", 87) << "║" << std::endl;
         std::cout << "╚" << repeat("═", 87) << "╝" << std::endl;
         std::cout << std::endl;
 
@@ -116,7 +116,7 @@ private:
 
         std::cout << "  ┌" << line << "┐ ┌" << line << "┐" << std::endl;
         std::cout << "  │" << center(book_a.getSymbol(), ob_width) << "│ │" << center(book_b.getSymbol(), ob_width) << "│" << std::endl;
-        std::cout << "  │" << "    Qty       Price   │   Price        Qty " << "│ │" << "    Qty       Price   │   Price        Qty " << "│" << std::endl;
+        std::cout << "  │" << "   Qty       Price   │  Price       Qty    " << "│ │" << "   Qty       Price   │  Price       Qty    " << "│" << std::endl;
         std::cout << "  ├" << line << "┤ ├" << line << "┤" << std::endl;
 
         int max_rows = std::max({(int)a_bids.size(), (int)a_asks.size(),
@@ -124,9 +124,9 @@ private:
 
         for (int i = 0; i < max_rows; ++i) {
             std::cout << "  │";
-            std::cout << formatRow(a_bids, a_asks, i);
+            std::cout << formatRow(a_bids, a_asks, i) << "  ";
             std::cout << "│ │";
-            std::cout << formatRow(b_bids, b_asks, i);
+            std::cout << formatRow(b_bids, b_asks, i) << "  ";
             std::cout << "│" << std::endl;
         }
 
@@ -154,11 +154,11 @@ private:
         ss << " │ ";
 
         if (i < static_cast<int>(asks.size()) && asks[i].price > 0) {
-            ss << std::setprecision(2) << std::setw(10) << asks[i].price
+            ss << std::setprecision(2) << std::setw(8) << asks[i].price
                << "  "
                << std::setprecision(4) << std::setw(8) << asks[i].quantity;
         } else {
-            ss << std::setw(20) << " ";
+            ss << std::setw(18) << " ";
         }
 
         return ss.str();

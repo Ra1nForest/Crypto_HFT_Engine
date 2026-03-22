@@ -86,16 +86,6 @@ int main() {
         OrderBook binance_book = binance_feed.getOrderBookSnapshot();
         OrderBook okx_book = okx_feed.getOrderBookSnapshot();
 
-        // 套利检测
-        bool signal_found = detector.detect(binance_book, okx_book);
-
-        if (signal_found) {
-            auto& signals = detector.getSignals();
-            if (!signals.empty()) {
-                logger.logSignal(signals.back());
-            }
-        }
-
         // 周期性记录价差
         loop_count++;
         if (loop_count % cfg.display.spread_log_interval == 0) {
@@ -120,6 +110,16 @@ int main() {
             okx_feed.isRunning(),
             cfg.display.levels
         );
+
+        
+        bool signal_found = detector.detect(binance_book, okx_book);
+
+        if (signal_found) {
+            auto& signals = detector.getSignals();
+            if (!signals.empty()) {
+                logger.logSignal(signals.back());
+            }
+        }
     }
 
     // 优雅退出
