@@ -1,10 +1,9 @@
 #pragma once
 
-#include <map>
-#include <vector>
 #include <string>
 #include <iostream>
 #include <iomanip>
+#include <vector>
 #include <algorithm>
 
 struct PriceLevel {
@@ -13,119 +12,76 @@ struct PriceLevel {
 };
 
 class OrderBook {
-
-    std::string symbol_;
-    std::map<double, double> bids_; // buy price -> quantity
-    std::map<double, double> asks_; // sell price -> quantity
-
 public:
-    OrderBook(const std::string& symbol) : symbol_(symbol) {}
-
-    void updateBid(double price, double quantity) {
-        if (quantity == 0.0) {
-            bids_.erase(price);
-        } else {
-            bids_[price] = quantity;
-        }
+    OrderBook() : symbol_("") {
+        bids_.reserve(20);
+        asks_.reserve(20);
     }
-
-    void updateAsk(double price, double quantity) {
-        if (quantity == 0.0) {
-            asks_.erase(price);
-        } else {
-            asks_[price] = quantity;
-        }
-    }
-
-    PriceLevel getBestBid() const {
-        if (bids_.empty()) {
-            return {0.0, 0.0};
-        }
-        auto it = bids_.rbegin();
-        return {it->first, it->second};
-    }
-
-    PriceLevel getBestAsk() const {
-        if (asks_.empty()) {
-            return {0.0, 0.0};
-        }
-        auto it = asks_.begin();
-        return {it->first, it->second};
-    }
-
-    double getSpread() const {
-        PriceLevel bid = getBestBid();
-        PriceLevel ask = getBestAsk();
-        if (bid.price == 0.0 || ask.price == 0.0) {
-            return 0.0;
-        }
-        return ask.price - bid.price;
-    }
-
-        void print(int levels = 10) const {
-        std::vector<PriceLevel> bidLevels;
-        int count = 0;
-        for (auto it = bids_.rbegin(); it != bids_.rend() && count < levels; ++it, ++count) {
-            bidLevels.push_back({it->first, it->second});
-        }
  
-        std::vector<PriceLevel> askLevels;
-        count = 0;
-        for (auto it = asks_.begin(); it != asks_.end() && count < levels; ++it, ++count) {
-            askLevels.push_back({it->first, it->second});
-        }
- 
-        auto bestBid = getBestBid();
-        auto bestAsk = getBestAsk();
-        double spread = getSpread();
-        double midPrice = (bestBid.price + bestAsk.price) / 2.0;
- 
-        std::cout << "  ┌──────────── " << symbol_ << " ────────────┐" << std::endl;
-        std::cout << "  │        BID         │         ASK        │" << std::endl;
-        std::cout << "  │  Qty       Price   │   Price      Qty   │" << std::endl;
-        std::cout << "  ├────────────────────┼────────────────────┤" << std::endl;
- 
-        int maxRows = std::max(bidLevels.size(), askLevels.size());
-        for (int i = 0; i < maxRows; ++i) {
-            std::cout << "  │";
- 
-            if (i < static_cast<int>(bidLevels.size())) {
-                std::cout << std::setw(7) << std::fixed << std::setprecision(4) 
-                          << bidLevels[i].quantity
-                          << "  " 
-                          << std::setw(10) << std::setprecision(2) 
-                          << bidLevels[i].price;
-            } else {
-                std::cout << std::setw(20) << " ";
-            }
- 
-            std::cout << " │ ";
- 
-            if (i < static_cast<int>(askLevels.size())) {
-                std::cout << std::setw(9) << std::fixed << std::setprecision(2) 
-                          << askLevels[i].price
-                          << "  " 
-                          << std::setw(7) << std::setprecision(4) 
-                          << askLevels[i].quantity;
-            } else {
-                std::cout << std::setw(20) << " ";
-            }
- 
-            std::cout << " │" << std::endl;
-        }
- 
-        std::cout << "  ├────────────────────┴────────────────────┤" << std::endl;
-        std::cout << "  │ Spread: " << std::setw(8) << std::setprecision(2) << spread
-                  << "    Mid: " << std::setw(12) << std::setprecision(2) << midPrice
-                  << "   │" << std::endl;
-        std::cout << "  └─────────────────────────────────────────┘" << std::endl;
+    OrderBook(const std::string& symbol) : symbol_(symbol) {
+        bids_.reserve(20);
+        asks_.reserve(20);
     }
 
     void clearBids() { bids_.clear(); }
     void clearAsks() { asks_.clear(); }
 
+    void updateBid(double price, double quantity) {
+        bids_.push_back({price, quantity});
+    }
+
+    void updateAsk(double price, double quantity) {
+        asks_.push_back({price, quantity});
+    }
+
+    PriceLevel getBestBid() const {
+        if (bids_.empty()) return {0.0, 0.0};
+        return bids_[0];
+    }
+
+    PriceLevel getBestAsk() const {
+        if (asks_.empty()) return {0.0, 0.0};
+        return asks_[0];
+    }
+
+    double getSpread() const {
+        auto bid = getBestBid();
+        auto ask = getBestAsk();
+        if (bid.price == 0.0 || ask.price == 0.0) return 0.0;
+        return ask.price - bid.price;
+    }
+
     const std::string& getSymbol() const { return symbol_; }
 
-    const std::map<double, double>& getBids() const { return bids_; }
-    const std::map<double, double>& getAsks() const { return asks_; }
+    const std::vector<PriceLevel>& getBids() const { return bids_; }
+    const std::vector<PriceLevel>& getAsks() const { return asks_; }
+    int getBidCount() const { return static_cast<int>(bids_.size()); }
+    int getAskCount() const { return static_cast<int>(asks_.size()); }
+
+    void print(int levels = 5) const {
+        std::cout << std::fixed;
+        std::cout << "  " << symbol_ << std::endl;
+        int show = std::min(levels, static_cast<int>(std::max(bids_.size(), asks_.size())));
+        for (int i = 0; i < show; ++i) {
+            if (i < static_cast<int>(bids_.size())) {
+                std::cout << "  " << std::setw(8) << std::setprecision(4) << bids_[i].quantity
+                          << "  " << std::setw(10) << std::setprecision(2) << bids_[i].price;
+            } else {
+                std::cout << std::setw(20) << " ";
+            }
+            std::cout << " | ";
+            if (i < static_cast<int>(asks_.size())) {
+                std::cout << std::setw(10) << std::setprecision(2) << asks_[i].price
+                          << "  " << std::setw(8) << std::setprecision(4) << asks_[i].quantity;
+            } else {
+                std::cout << std::setw(20) << " ";
+            }
+            std::cout << std::endl;
+        }
+    }
+
+private:
+    std::string symbol_;
+    std::vector<PriceLevel> bids_;
+    std::vector<PriceLevel> asks_;
 };

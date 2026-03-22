@@ -116,8 +116,7 @@ private:
 
         std::cout << "  ┌" << line << "┐ ┌" << line << "┐" << std::endl;
         std::cout << "  │" << center(book_a.getSymbol(), ob_width) << "│ │" << center(book_b.getSymbol(), ob_width) << "│" << std::endl;
-        std::cout << "  │" << center("         BID         │          ASK          ", ob_width+2) << "│ │" << center("         BID         │          ASK          ", ob_width+2) << "│" << std::endl;
-        std::cout << "  │" << "   Qty       Price   │    Price       Qty  " << "│ │" << "   Qty       Price   │    Price       Qty  " << "│" << std::endl;
+        std::cout << "  │" << "    Qty       Price   │   Price        Qty " << "│ │" << "    Qty       Price   │   Price        Qty " << "│" << std::endl;
         std::cout << "  ├" << line << "┤ ├" << line << "┤" << std::endl;
 
         int max_rows = std::max({(int)a_bids.size(), (int)a_asks.size(),
@@ -167,20 +166,20 @@ private:
 
     static std::vector<PriceLevel> collectBids(const OrderBook& book, int levels) {
         std::vector<PriceLevel> result;
-        auto bids = book.getBids();
-        int count = 0;
-        for (auto it = bids.rbegin(); it != bids.rend() && count < levels; ++it, ++count) {
-            result.push_back({it->first, it->second});
+        auto& bids = book.getBids();
+        int count = std::min(levels, static_cast<int>(bids.size()));
+        for (int i = 0; i < count; ++i) {
+            result.push_back(bids[i]);
         }
         return result;
     }
 
     static std::vector<PriceLevel> collectAsks(const OrderBook& book, int levels) {
         std::vector<PriceLevel> result;
-        auto asks = book.getAsks();
-        int count = 0;
-        for (auto it = asks.begin(); it != asks.end() && count < levels; ++it, ++count) {
-            result.push_back({it->first, it->second});
+        auto& asks = book.getAsks();
+        int count = std::min(levels, static_cast<int>(asks.size()));
+        for (int i = 0; i < count; ++i) {
+            result.push_back(asks[i]);
         }
         return result;
     }
