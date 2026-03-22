@@ -2,7 +2,7 @@
 
 #include "orderbook.h"
 
-#include <cstdlib>
+#include <cmath>
 #include <string>
 #include <iostream>
 #include <iomanip>
@@ -21,147 +21,112 @@ struct ArbitrageSignal {
 };
 
 class ArbitrageDetector {
-    int total_signals_;
-    double last_buy_price_ = 0.0;
-    double last_sell_price_ = 0.0;
-    double fee_rate_;
-    double min_profit_;
-    double total_net_profit_;
-    std::vector<ArbitrageSignal> signals_;
-
-    void printSignal(const ArbitrageSignal& s) const {
-        std::cout << std::fixed << std::setprecision(4);
-        std::cout << "\n  ╔════════════════ 🚨 ARBITRAGE DETECTED! ═══════════════╗" << std::endl;
-        std::cout << "  ║ BUY  " << s.buy_exchange 
-                  << " @ " << s.buy_price << "                         ║" << std::endl;
-        std::cout << "  ║ SELL " << s.sell_exchange 
-                  << " @ " << s.sell_price << "                     ║" << std::endl;
-        std::cout << "  ║ Qty: " << s.quantity << " BTC" << "                                       ║" << std::endl;
-        std::cout << "  ║ Gross: $" << s.gross_profit
-                  << "  Net: $" << s.net_profit << "                          ║"  << std::endl;
-        std::cout << "  ╚═══════════════════════════════════════════════════════╝\n" << std::endl;
-        std::cout << std::endl;
-        std::cout << std::endl;
-        std::cout << std::endl;
-    }
-
 public:
     ArbitrageDetector(double fee_rate = 0.001, double min_profit = 0.01)
-        : total_signals_(0),
-        fee_rate_(fee_rate),
-        min_profit_(min_profit),
-        total_net_profit_(0.0) {}
-    
+        : fee_rate_(fee_rate)
+        , min_profit_(min_profit)
+        , total_signals_(0)
+        , total_net_profit_(0.0)
+        , last_d1_buy_(0.0)
+        , last_d1_sell_(0.0)
+        , last_d2_buy_(0.0)
+        , last_d2_sell_(0.0) {}
+
     bool detect(const OrderBook& book_a, const OrderBook& book_b) {
         bool found = false;
 
         auto a_ask = book_a.getBestAsk();
-        auto b_bid = book_b.getBestBid();
-        auto b_ask = book_b.getBestAsk();
         auto a_bid = book_a.getBestBid();
+        auto b_ask = book_b.getBestAsk();
+        auto b_bid = book_b.getBestBid();
 
-        if (a_ask.price > 0 && b_bid.price > 0) {
-            double gross = b_bid.price - a_ask.price;
-            if (gross > 0) {
-                double qty = std::min(a_ask.quantity, b_bid.quantity);
-                double fee = (a_ask.price + b_bid.price) * qty * fee_rate_;
-                double net = gross * qty - fee;
+        // Direction 1: Buy A, Sell B
+        found |= checkDirection(
+            book_a.getSymbol(), a_ask.price, a_ask.quantity,
+            book_b.getSymbol(), b_bid.price, b_bid.quantity,
+            last_d1_buy_, last_d1_sell_
+        );
 
-                if (net > min_profit_) {
-                    if (std::abs(b_ask.price - last_buy_price_) < 0.01 &&
-                        std::abs(a_bid.price - last_sell_price_) < 0.01) {
-                        // 价格没变，不重复触发
-                    } else {
-                        last_buy_price_ = b_ask.price;
-                        last_sell_price_ = a_bid.price;
-
-                        ArbitrageSignal signal;
-                        signal.buy_exchange = book_a.getSymbol();
-                        signal.sell_exchange = book_b.getSymbol();
-                        signal.buy_price = a_ask.price;
-                        signal.sell_price = b_bid.price;
-                        signal.quantity = qty;
-                        signal.gross_profit = gross * qty;
-                        signal.net_profit = net;
-                        signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        signals_.push_back(signal);
-                        total_signals_++;
-                        total_net_profit_ += net;
-                        printSignal(signal);
-                        found = true;
-                    }
-                }
-            }
-        }
-
- 
-        if (b_ask.price > 0 && a_bid.price > 0) {
-            double gross = a_bid.price - b_ask.price;
-            if (gross > 0) {
-                double qty = std::min(b_ask.quantity, a_bid.quantity);
-                double fee = (b_ask.price + a_bid.price) * qty * fee_rate_;
-                double net = gross * qty - fee;
- 
-                if (net > min_profit_) {
-                    if (std::abs(b_ask.price - last_buy_price_) < 0.01 &&
-                        std::abs(a_bid.price - last_sell_price_) < 0.01) {
-                        // 价格没变，不重复触发
-                    } else {
-                        last_buy_price_ = b_ask.price;
-                        last_sell_price_ = a_bid.price;
-                        ArbitrageSignal signal;
-                        signal.buy_exchange = book_b.getSymbol();
-                        signal.sell_exchange = book_a.getSymbol();
-                        signal.buy_price = b_ask.price;
-                        signal.sell_price = a_bid.price;
-                        signal.quantity = qty;
-                        signal.gross_profit = gross * qty;
-                        signal.net_profit = net;
-                        signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-    
-                        signals_.push_back(signal);
-                        total_signals_++;
-                        total_net_profit_ += net;
-                        printSignal(signal);
-                        found = true;
-                    }
-                }
-            }
-        }
+        // Direction 2: Buy B, Sell A
+        found |= checkDirection(
+            book_b.getSymbol(), b_ask.price, b_ask.quantity,
+            book_a.getSymbol(), a_bid.price, a_bid.quantity,
+            last_d2_buy_, last_d2_sell_
+        );
 
         return found;
     }
 
-    void printSpreadStatus(const OrderBook& book_a, const OrderBook& book_b) const {
-        auto a_ask = book_a.getBestAsk();
-        auto a_bid = book_a.getBestBid();
-        auto b_ask = book_b.getBestAsk();
-        auto b_bid = book_b.getBestBid();
- 
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "  ┌─────────────── Arbitrage Monitor ───────────────┐" << std::endl;
-        std::cout << "  │ Direction 1: Buy " << book_a.getSymbol() 
-                  << " → Sell " << book_b.getSymbol() << std::endl;
-        std::cout << "  │   " << book_a.getSymbol() << " Ask: " << a_ask.price
-                  << "  vs  " << book_b.getSymbol() << " Bid: " << b_bid.price
-                  << "  Diff: " << (b_bid.price - a_ask.price) << std::endl;
-        std::cout << "  │" << std::endl;
-        std::cout << "  │ Direction 2: Buy " << book_b.getSymbol() 
-                  << " → Sell " << book_a.getSymbol() << std::endl;
-        std::cout << "  │   " << book_b.getSymbol() << " Ask: " << b_ask.price
-                  << "  vs  " << book_a.getSymbol() << " Bid: " << a_bid.price
-                  << "  Diff: " << (a_bid.price - b_ask.price) << std::endl;
-        std::cout << "  │" << std::endl;
-        std::cout << "  │ Fee Rate: " << (fee_rate_ * 100) << "% per side"
-                  << "  │  Min Profit: $" << min_profit_ << std::endl;
-        std::cout << "  │ Total Signals: " << total_signals_
-                  << "  │  Total Net Profit: $" << total_net_profit_ << std::endl;
-        std::cout << "  └──────────────────────────────────────────────────┘" << std::endl;
-    }
- 
     int getTotalSignals() const { return total_signals_; }
     double getTotalNetProfit() const { return total_net_profit_; }
     const std::vector<ArbitrageSignal>& getSignals() const { return signals_; }
+
+private:
+    double fee_rate_;
+    double min_profit_;
+    int total_signals_;
+    double total_net_profit_;
+    std::vector<ArbitrageSignal> signals_;
+
+    // 每个方向独立的去重价格
+    double last_d1_buy_;
+    double last_d1_sell_;
+    double last_d2_buy_;
+    double last_d2_sell_;
+
+    bool checkDirection(
+        const std::string& buy_sym, double buy_price, double buy_qty,
+        const std::string& sell_sym, double sell_price, double sell_qty,
+        double& last_buy, double& last_sell
+    ) {
+        if (buy_price <= 0 || sell_price <= 0) return false;
+
+        double gross = sell_price - buy_price;
+        if (gross <= 0) return false;
+
+        double qty = std::min(buy_qty, sell_qty);
+        double fee = (buy_price + sell_price) * qty * fee_rate_;
+        double net = gross * qty - fee;
+
+        if (net <= min_profit_) return false;
+
+        // 去重：买卖价跟上次一样就跳过
+        if (std::abs(buy_price - last_buy) < 0.01 &&
+            std::abs(sell_price - last_sell) < 0.01) {
+            return false;
+        }
+
+        last_buy = buy_price;
+        last_sell = sell_price;
+
+        ArbitrageSignal signal;
+        signal.buy_exchange = buy_sym;
+        signal.sell_exchange = sell_sym;
+        signal.buy_price = buy_price;
+        signal.sell_price = sell_price;
+        signal.quantity = qty;
+        signal.gross_profit = gross * qty;
+        signal.net_profit = net;
+        signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        signals_.push_back(signal);
+        total_signals_++;
+        total_net_profit_ += net;
+        printSignal(signal);
+        return true;
+    }
+
+    void printSignal(const ArbitrageSignal& s) const {
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "\n  ╔════════════════ ARBITRAGE DETECTED ═══════════════╗" << std::endl;
+        std::cout << "  ║ BUY  " << std::setw(20) << std::left << s.buy_exchange
+                  << " @ " << std::right << std::setw(12) << s.buy_price << "       ║" << std::endl;
+        std::cout << "  ║ SELL " << std::setw(20) << std::left << s.sell_exchange
+                  << " @ " << std::right << std::setw(12) << s.sell_price << "       ║" << std::endl;
+        std::cout << "  ║ Qty: " << std::setw(10) << s.quantity << " BTC"
+                  << "  Gross: $" << std::setw(8) << s.gross_profit
+                  << "  Net: $" << std::setw(8) << s.net_profit << " ║" << std::endl;
+        std::cout << "  ╚═══════════════════════════════════════════════════╝\n" << std::endl;
+    }
 };
