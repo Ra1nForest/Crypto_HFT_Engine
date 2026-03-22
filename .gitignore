@@ -6,3 +6,4 @@ third_party/
 *.out
 .cache/
 .DS_Store
+benchmark/*_bench
