@@ -21,6 +21,7 @@
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <charconv>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -91,13 +92,17 @@ class MarketDataFeed {
         simdjson::ondemand::parser parser;
         beast::flat_buffer buffer;
 
+        std::string msg;
+        msg.reserve(4096);
+
         while (running_) {
             buffer.clear();
             ws.read(buffer);
 
             auto start = std::chrono::high_resolution_clock::now();
 
-            std::string msg = beast::buffers_to_string(buffer.data());
+            msg.assign(boost::beast::buffers_to_string(buffer.data()));
+            
             simdjson::padded_string padded_msg(msg);
 
             simdjson::ondemand::document doc;
@@ -136,8 +141,8 @@ class MarketDataFeed {
                 std::string_view price_str = (*iter).get_string();
                 ++iter;
                 std::string_view qty_str = (*iter).get_string();
-                double price = std::stod(std::string(price_str));
-                double qty = std::stod(std::string(qty_str));
+                double price = fastParseDouble(price_str);
+                double qty = fastParseDouble(qty_str);
                 if (qty > 0.0) orderbook_.updateBid(price, qty);
             }
 
@@ -148,8 +153,8 @@ class MarketDataFeed {
                 std::string_view price_str = (*iter).get_string();
                 ++iter;
                 std::string_view qty_str = (*iter).get_string();
-                double price = std::stod(std::string(price_str));
-                double qty = std::stod(std::string(qty_str));
+                double price = fastParseDouble(price_str);
+                double qty = fastParseDouble(qty_str);
                 if (qty > 0.0) orderbook_.updateAsk(price, qty);
             }
             return true;
@@ -176,8 +181,8 @@ class MarketDataFeed {
                     std::string_view price_str = (*iter).get_string();
                     ++iter;
                     std::string_view qty_str = (*iter).get_string();
-                    double price = std::stod(std::string(price_str));
-                    double qty = std::stod(std::string(qty_str));
+                    double price = fastParseDouble(price_str);
+                    double qty = fastParseDouble(qty_str);
                     if (qty > 0.0) orderbook_.updateBid(price, qty);
                 }
 
@@ -187,8 +192,8 @@ class MarketDataFeed {
                     std::string_view price_str = (*iter).get_string();
                     ++iter;
                     std::string_view qty_str = (*iter).get_string();
-                    double price = std::stod(std::string(price_str));
-                    double qty = std::stod(std::string(qty_str));
+                    double price = fastParseDouble(price_str);
+                    double qty = fastParseDouble(qty_str);
                     if (qty > 0.0) orderbook_.updateAsk(price, qty);
                 }
             }
@@ -196,6 +201,12 @@ class MarketDataFeed {
         } catch (...) {
             return false;
         }
+    }
+
+    static double fastParseDouble(std::string_view sv) {
+        double val = 0.0;
+        std::from_chars(sv.data(), sv.data() + sv.size(), val);
+        return val;
     }
 
 public:
