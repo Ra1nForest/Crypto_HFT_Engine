@@ -10,6 +10,9 @@ A low-latency, cross-exchange cryptocurrency arbitrage monitoring system built i
 ### Final Report
 ![Report](docs/screenshot_report.png)
 
+### Orderbook Benchmark
+![Benchmark](docs/screenshot_benchmark.png)
+
 ## Architecture
 
 ```
@@ -18,15 +21,15 @@ A low-latency, cross-exchange cryptocurrency arbitrage monitoring system built i
                     │  Display + Arbitrage Detection Loop  │
                     └──────────┬───────────┬───────────────┘
                                │           │
-                    ┌──────────▼──┐  ┌─────▼──────────┐
-                    │   Thread 1  │  │    Thread 2    │
-                    │  Binance WS │  │     OKX WS     │
-                    └──────┬──────┘  └──────┬─────────┘
+                    ┌──────────▼──┐  ┌─────▼─────────┐
+                    │   Thread 1  │  │    Thread 2   │
+                    │  Binance WS │  │     OKX WS    │
+                    └──────┬──────┘  └──────┬────────┘
                            │                │
-                    ┌──────▼──────┐  ┌──────▼──────────┐
-                    │  OrderBook  │  │    OrderBook    │
-                    │  (Binance)  │  │     (OKX)       │
-                    └──────┬──────┘  └──────┬──────────┘
+                    ┌──────▼──────┐  ┌──────▼─────────┐
+                    │  OrderBook  │  │   OrderBook    │
+                    │  (Binance)  │  │     (OKX)      │
+                    └──────┬──────┘  └──────┬─────────┘
                            │                │
                     ┌──────▼────────────────▼──────────┐
                     │      ArbitrageDetector           │
