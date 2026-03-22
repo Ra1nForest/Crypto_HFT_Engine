@@ -22,6 +22,8 @@ struct ArbitrageSignal {
 
 class ArbitrageDetector {
     int total_signals_;
+    double last_buy_price_ = 0.0;
+    double last_sell_price_ = 0.0;
     double fee_rate_;
     double min_profit_;
     double total_net_profit_;
@@ -29,15 +31,18 @@ class ArbitrageDetector {
 
     void printSignal(const ArbitrageSignal& s) const {
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "\n  ╔═══════════════ 🚨 ARBITRAGE DETECTED! ═══════════════╗" << std::endl;
+        std::cout << "\n  ╔════════════════ 🚨 ARBITRAGE DETECTED! ═══════════════╗" << std::endl;
         std::cout << "  ║ BUY  " << s.buy_exchange 
-                  << " @ " << s.buy_price << std::endl;
+                  << " @ " << s.buy_price << "                         ║" << std::endl;
         std::cout << "  ║ SELL " << s.sell_exchange 
-                  << " @ " << s.sell_price << std::endl;
-        std::cout << "  ║ Qty: " << s.quantity << " BTC" << std::endl;
-        std::cout << "  ║ Gross: $" << s.gross_profit 
-                  << "  Net: $" << s.net_profit << std::endl;
-        std::cout << "  ╚════════════════════════════════════════════════════════╝\n" << std::endl;
+                  << " @ " << s.sell_price << "                     ║" << std::endl;
+        std::cout << "  ║ Qty: " << s.quantity << " BTC" << "                                       ║" << std::endl;
+        std::cout << "  ║ Gross: $" << s.gross_profit
+                  << "  Net: $" << s.net_profit << "                          ║"  << std::endl;
+        std::cout << "  ╚═══════════════════════════════════════════════════════╝\n" << std::endl;
+        std::cout << std::endl;
+        std::cout << std::endl;
+        std::cout << std::endl;
     }
 
 public:
@@ -52,6 +57,8 @@ public:
 
         auto a_ask = book_a.getBestAsk();
         auto b_bid = book_b.getBestBid();
+        auto b_ask = book_b.getBestAsk();
+        auto a_bid = book_a.getBestBid();
 
         if (a_ask.price > 0 && b_bid.price > 0) {
             double gross = b_bid.price - a_ask.price;
@@ -61,28 +68,33 @@ public:
                 double net = gross * qty - fee;
 
                 if (net > min_profit_) {
-                    ArbitrageSignal signal;
-                    signal.buy_exchange = book_a.getSymbol();
-                    signal.sell_exchange = book_b.getSymbol();
-                    signal.buy_price = a_ask.price;
-                    signal.sell_price = b_bid.price;
-                    signal.quantity = qty;
-                    signal.gross_profit = gross * qty;
-                    signal.net_profit = net;
-                    signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    signals_.push_back(signal);
-                    total_signals_++;
-                    total_net_profit_ += net;
-                    printSignal(signal);
-                    found = true;
+                    if (std::abs(b_ask.price - last_buy_price_) < 0.01 &&
+                        std::abs(a_bid.price - last_sell_price_) < 0.01) {
+                        // 价格没变，不重复触发
+                    } else {
+                        last_buy_price_ = b_ask.price;
+                        last_sell_price_ = a_bid.price;
+
+                        ArbitrageSignal signal;
+                        signal.buy_exchange = book_a.getSymbol();
+                        signal.sell_exchange = book_b.getSymbol();
+                        signal.buy_price = a_ask.price;
+                        signal.sell_price = b_bid.price;
+                        signal.quantity = qty;
+                        signal.gross_profit = gross * qty;
+                        signal.net_profit = net;
+                        signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        signals_.push_back(signal);
+                        total_signals_++;
+                        total_net_profit_ += net;
+                        printSignal(signal);
+                        found = true;
+                    }
                 }
             }
         }
 
-
-        auto b_ask = book_b.getBestAsk();
-        auto a_bid = book_a.getBestBid();
  
         if (b_ask.price > 0 && a_bid.price > 0) {
             double gross = a_bid.price - b_ask.price;
@@ -92,22 +104,29 @@ public:
                 double net = gross * qty - fee;
  
                 if (net > min_profit_) {
-                    ArbitrageSignal signal;
-                    signal.buy_exchange = book_b.getSymbol();
-                    signal.sell_exchange = book_a.getSymbol();
-                    signal.buy_price = b_ask.price;
-                    signal.sell_price = a_bid.price;
-                    signal.quantity = qty;
-                    signal.gross_profit = gross * qty;
-                    signal.net_profit = net;
-                    signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
- 
-                    signals_.push_back(signal);
-                    total_signals_++;
-                    total_net_profit_ += net;
-                    printSignal(signal);
-                    found = true;
+                    if (std::abs(b_ask.price - last_buy_price_) < 0.01 &&
+                        std::abs(a_bid.price - last_sell_price_) < 0.01) {
+                        // 价格没变，不重复触发
+                    } else {
+                        last_buy_price_ = b_ask.price;
+                        last_sell_price_ = a_bid.price;
+                        ArbitrageSignal signal;
+                        signal.buy_exchange = book_b.getSymbol();
+                        signal.sell_exchange = book_a.getSymbol();
+                        signal.buy_price = b_ask.price;
+                        signal.sell_price = a_bid.price;
+                        signal.quantity = qty;
+                        signal.gross_profit = gross * qty;
+                        signal.net_profit = net;
+                        signal.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+    
+                        signals_.push_back(signal);
+                        total_signals_++;
+                        total_net_profit_ += net;
+                        printSignal(signal);
+                        found = true;
+                    }
                 }
             }
         }
@@ -144,4 +163,5 @@ public:
  
     int getTotalSignals() const { return total_signals_; }
     double getTotalNetProfit() const { return total_net_profit_; }
+    const std::vector<ArbitrageSignal>& getSignals() const { return signals_; }
 };
