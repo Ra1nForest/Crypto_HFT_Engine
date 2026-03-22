@@ -135,8 +135,8 @@ Mutex contention is negligible compared to network latency. Premature lock-free 
 
 ## Roadmap
 
-- [ ] Latency histogram (p50/p95/p99)
-- [ ] Signal logging to file
+- [x] Latency histogram (p50/p95/p99)
+- [x] Signal logging to file
 - [ ] Add Bybit exchange support
 - [ ] Custom memory pool allocator
 - [ ] Lock-free SPSC queue for order book updates
