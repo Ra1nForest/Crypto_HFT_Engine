@@ -303,42 +303,39 @@ private:
         return s;
     }
 
-    // 构建延迟分布直方图
+    // 构建延迟分布直方图：各区间占比由 fractionBelowNs 在区间边界处的差值得到（覆盖全部样本）
     static std::vector<std::string> buildHistogramRows(const LatencyTracker& lat) {
         std::vector<std::string> rows;
 
-        auto samples = lat.getSamples();
-        if (samples.empty()) {
+        if (lat.count() == 0) {
             rows.push_back("  No data");
             return rows;
         }
 
-        const std::vector<long> boundaries = {5, 10, 20, 50, 100};
+        // 区间边界：5/10/20/50/100 µs（以纳秒表示）
+        const std::vector<std::uint64_t> boundaries_ns = {5000, 10000, 20000, 50000, 100000};
         const std::vector<std::string> labels = {
             " 0-5  ", " 5-10 ", "10-20 ", "20-50 ", "50-100", " 100+ "
         };
 
-        std::vector<int> buckets(boundaries.size() + 1, 0);
-        for (long s : samples) {
-            bool placed = false;
-            for (size_t i = 0; i < boundaries.size(); ++i) {
-                if (s < boundaries[i]) {
-                    buckets[i]++;
-                    placed = true;
-                    break;
-                }
-            }
-            if (!placed) buckets[boundaries.size()]++;
+        // 相邻边界的累计占比之差；行情线程并发写入时累计值可能轻微不单调，钳制为非负
+        std::vector<double> fractions(boundaries_ns.size() + 1, 0.0);
+        double below_prev = 0.0;
+        for (size_t i = 0; i < boundaries_ns.size(); ++i) {
+            double below = lat.fractionBelowNs(boundaries_ns[i]);
+            if (below < below_prev) below = below_prev;
+            fractions[i] = below - below_prev;
+            below_prev = below;
         }
+        fractions.back() = below_prev < 1.0 ? 1.0 - below_prev : 0.0;
 
-        int max_count = *std::max_element(buckets.begin(), buckets.end());
-        if (max_count == 0) max_count = 1;
+        double max_fraction = *std::max_element(fractions.begin(), fractions.end());
+        if (max_fraction <= 0.0) max_fraction = 1.0;
         const int bar_max = 18;
 
-        for (size_t i = 0; i < buckets.size(); ++i) {
-            double pct = 100.0 * buckets[i] / samples.size();
-            int bar_w = static_cast<int>(
-                static_cast<double>(buckets[i]) / max_count * bar_max);
+        for (size_t i = 0; i < fractions.size(); ++i) {
+            double pct = 100.0 * fractions[i];
+            int bar_w = static_cast<int>(fractions[i] / max_fraction * bar_max);
 
             std::ostringstream ss;
             ss << " " << labels[i];

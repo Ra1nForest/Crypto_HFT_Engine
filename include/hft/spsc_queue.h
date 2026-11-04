@@ -1,0 +1,193 @@
+//
+// spsc_queue.h
+// 有界无锁单生产者/单消费者环形队列：64 位单调递增下标 + 2 的幂掩码，仅使用 acquire/release 内存序。
+//
+
+#pragma once
+
+#include "common.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <new>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+
+namespace hft {
+
+// 设计要点：
+// - write_idx_ / read_idx_ 是 64 位单调递增计数，槽位 = 下标 & mask_。
+//   满：write - read == capacity；空：write == read。没有浪费的槽位。
+//   2^64 次操作在 10 亿次/秒下需要 584 年，实际不会回绕；即使回绕，无符号减法与相等比较也仍然正确。
+// - 生产者只写 write_idx_，消费者只写 read_idx_。每一端都缓存对方的下标
+//   （cached_read_idx_ / cached_write_idx_），只有缓存值显示"满/空"时才去读对方的缓存行。
+//   稳态下每次操作只触碰本端的缓存行和槽位所在的缓存行，避免缓存行在两个核之间来回颠簸。
+// - 两个下标与两个缓存副本各自 alignas(kCacheLineSize) 独占一个缓存行；只读字段单独一行。
+// - 内存序只用 acquire/release（没有 seq_cst）：
+//   生产者 placement-new 构造元素后 release 存 write_idx_，消费者 acquire 读到后才访问元素；
+//   消费者析构元素后 release 存 read_idx_，生产者 acquire 读到后才复用该槽位。
+//   各端读取自己的下标用 relaxed（只有自己会写它）。
+// - 原始对齐内存 + placement new：T 无需默认构造，支持只可移动类型；析构时销毁剩余元素。
+// - 线程约束：tryEmplace/tryPush 只能由一个生产者线程调用，front/pop/tryPop 只能由一个消费者线程调用；
+//   size/empty/capacity 任意线程可调用（对方并发操作时结果是近似值）。
+template <class T>
+class SpscQueue {
+    static_assert(std::is_nothrow_destructible_v<T>, "hft::SpscQueue<T>: T must be nothrow destructible");
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+                  "hft::SpscQueue requires lock-free 64-bit atomics");
+
+public:
+    using value_type = T;
+
+    // capacity：期望容量；实际容量向上取整到 2 的幂，最小为 2
+    explicit SpscQueue(std::size_t capacity)
+        : capacity_(roundCapacity(capacity))
+        , mask_(static_cast<std::uint64_t>(capacity_ - 1))
+        , storage_(allocateStorage(capacity_)) {}
+
+    // 销毁队列中剩余的元素并释放内存（调用者须保证此时两端线程都已停止访问）
+    ~SpscQueue() {
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            const std::uint64_t w = write_idx_.load(std::memory_order_acquire);
+            for (std::uint64_t r = read_idx_.load(std::memory_order_acquire); r != w; ++r) {
+                slot(r)->~T();
+            }
+        }
+        ::operator delete(storage_, std::align_val_t{kStorageAlign});
+    }
+
+    SpscQueue(const SpscQueue&) = delete;
+    SpscQueue& operator=(const SpscQueue&) = delete;
+
+    // ---------------- 生产者端 ----------------
+
+    // 原地构造一个元素；队列满时返回 false（不阻塞、不构造）。
+    // T 的构造函数抛异常时队列保持不变，异常继续向外传播。
+    template <class... Args>
+    bool tryEmplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        const std::uint64_t w = write_idx_.load(std::memory_order_relaxed);
+        if (HFT_UNLIKELY(w - cached_read_idx_ >= capacity_)) {
+            // 缓存显示已满：读取消费者的最新下标（acquire：保证其析构已完成，槽位可复用）
+            cached_read_idx_ = read_idx_.load(std::memory_order_acquire);
+            if (w - cached_read_idx_ >= capacity_) return false;
+        }
+        ::new (slotAddress(w)) T(std::forward<Args>(args)...);
+        write_idx_.store(w + 1, std::memory_order_release);  // 发布元素
+        return true;
+    }
+
+    bool tryPush(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+        return tryEmplace(v);
+    }
+
+    bool tryPush(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
+        return tryEmplace(std::move(v));
+    }
+
+    // ---------------- 消费者端 ----------------
+
+    // 队首元素指针；队列空时返回 nullptr。指针在 pop() 之前一直有效。
+    T* front() noexcept {
+        const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
+        if (r == cached_write_idx_) {
+            // 缓存显示为空：读取生产者的最新下标（acquire：保证看到元素的完整构造）
+            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
+            if (r == cached_write_idx_) return nullptr;
+        }
+        return slot(r);
+    }
+
+    // 弹出（析构）队首元素。前置条件：队列非空（例如 front() != nullptr）。
+    // 防御：队列为空时为空操作（启用 HFT_ASSERT 时直接报错）。
+    void pop() noexcept {
+        const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
+        if (HFT_UNLIKELY(r == cached_write_idx_)) {
+            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
+            HFT_ASSERT(r != cached_write_idx_ && "SpscQueue::pop() on an empty queue");
+            if (r == cached_write_idx_) return;
+        }
+        slot(r)->~T();
+        read_idx_.store(r + 1, std::memory_order_release);  // 归还槽位
+    }
+
+    // 弹出队首元素并移动赋值给 out；队列空时返回 false。
+    // 移动赋值抛异常时元素仍留在队列中。
+    bool tryPop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
+        const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
+        if (r == cached_write_idx_) {
+            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
+            if (r == cached_write_idx_) return false;
+        }
+        T* p = slot(r);
+        out = std::move(*p);
+        p->~T();
+        read_idx_.store(r + 1, std::memory_order_release);
+        return true;
+    }
+
+    // ---------------- 任意一端 ----------------
+
+    // 元素个数。由某一端调用时，自己的下标是精确的，对方的下标可能稍旧，因此是近似值。
+    std::size_t size() const noexcept {
+        // 先 acquire 读 read 再读 write：消费者写入的 read 值不会超过它当时看到的 write，
+        // 经 happens-before 传递后这里读到的 write >= read，差值不会下溢。
+        const std::uint64_t r = read_idx_.load(std::memory_order_acquire);
+        const std::uint64_t w = write_idx_.load(std::memory_order_acquire);
+        const std::uint64_t n = w - r;
+        // 第三方线程调用时两次读取之间对方可能继续推进，结果钳制到容量以内
+        return n > capacity_ ? capacity_ : static_cast<std::size_t>(n);
+    }
+
+    bool empty() const noexcept { return size() == 0; }
+
+    // 实际可用容量（2 的幂，>= 构造参数，最小 2）
+    std::size_t capacity() const noexcept { return capacity_; }
+
+private:
+    // 存储区按缓存行对齐（T 对齐要求更高时取 T 的对齐），避免首尾槽位与堆上其他数据伪共享
+    static constexpr std::size_t kStorageAlign =
+        alignof(T) > kCacheLineSize ? alignof(T) : kCacheLineSize;
+    // 容量上限：保证 2 的幂取整与字节数计算都不会溢出
+    static constexpr std::size_t kMaxCapacity =
+        (std::numeric_limits<std::size_t>::max() / 4) / sizeof(T);
+
+    static std::size_t roundCapacity(std::size_t requested) {
+        if (requested > kMaxCapacity) throw std::length_error("hft::SpscQueue: capacity too large");
+        const std::size_t c = nextPow2(requested);
+        return c < 2 ? 2 : c;
+    }
+
+    static unsigned char* allocateStorage(std::size_t capacity) {
+        // 字节数向上取整到缓存行，最后一个槽位所在的缓存行不与其他分配共享
+        const std::size_t bytes =
+            (capacity * sizeof(T) + kCacheLineSize - 1) / kCacheLineSize * kCacheLineSize;
+        return static_cast<unsigned char*>(::operator new(bytes, std::align_val_t{kStorageAlign}));
+    }
+
+    void* slotAddress(std::uint64_t index) const noexcept {
+        return storage_ + static_cast<std::size_t>(index & mask_) * sizeof(T);
+    }
+
+    // 指向槽位中已构造的对象
+    T* slot(std::uint64_t index) const noexcept {
+        return std::launder(static_cast<T*>(slotAddress(index)));
+    }
+
+    // 只读区：构造后不再修改，两端共享读取，缓存行常驻 Shared 状态，不会被失效
+    alignas(kCacheLineSize) const std::size_t capacity_;
+    const std::uint64_t mask_;
+    unsigned char* const storage_;
+
+    // 生产者区：write_idx_ 由生产者写、消费者偶尔读；cached_read_idx_ 只有生产者访问
+    alignas(kCacheLineSize) std::atomic<std::uint64_t> write_idx_{0};
+    alignas(kCacheLineSize) std::uint64_t cached_read_idx_ = 0;
+
+    // 消费者区：read_idx_ 由消费者写、生产者偶尔读；cached_write_idx_ 只有消费者访问
+    alignas(kCacheLineSize) std::atomic<std::uint64_t> read_idx_{0};
+    alignas(kCacheLineSize) std::uint64_t cached_write_idx_ = 0;
+};
+
+}  // namespace hft
