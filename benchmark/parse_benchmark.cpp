@@ -1,3 +1,8 @@
+//
+// parse_benchmark.cpp
+// 对比 std::stod 与 std::from_chars 的字符串转浮点性能。
+//
+
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -36,11 +41,11 @@ int main() {
         qty_strings[i] = qs.str();
     }
 
-    // ===== Benchmark: std::stod（需要构造std::string）=====
+    // ===== Benchmark: std::stod（需要构造 std::string）=====
     {
         volatile double sink = 0.0;
 
-        // Warmup
+    // Warmup：避免首次调用带来的噪声
         for (int i = 0; i < WARMUP; ++i) {
             double sum = 0.0;
             for (int j = 0; j < 40; ++j) {
@@ -54,7 +59,8 @@ int main() {
             sink = sum;
         }
 
-        auto start = std::chrono::high_resolution_clock::now();
+    // 正式计时
+    auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < ITERATIONS; ++i) {
             double sum = 0.0;
             for (int j = 0; j < 40; ++j) {
@@ -76,13 +82,14 @@ int main() {
         std::cout << "  Avg per snapshot: " << std::setw(8) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
         std::cout << "  Avg per snapshot: " << std::setw(8) << std::setprecision(2) << avg_ns / 1000.0 << " us" << std::endl;
         std::cout << std::endl;
+        (void)sink;
     }
 
     // ===== Benchmark: std::from_chars（零分配）=====
     {
         volatile double sink = 0.0;
 
-        // Warmup
+    // Warmup
         for (int i = 0; i < WARMUP; ++i) {
             double sum = 0.0;
             for (int j = 0; j < 40; ++j) {
@@ -96,7 +103,8 @@ int main() {
             sink = sum;
         }
 
-        auto start = std::chrono::high_resolution_clock::now();
+    // 正式计时
+    auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < ITERATIONS; ++i) {
             double sum = 0.0;
             for (int j = 0; j < 40; ++j) {
@@ -119,6 +127,7 @@ int main() {
         std::cout << "  Avg per snapshot: " << std::setw(8) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
         std::cout << "  Avg per snapshot: " << std::setw(8) << std::setprecision(2) << avg_ns / 1000.0 << " us" << std::endl;
         std::cout << std::endl;
+        (void)sink;
     }
 
     std::cout << "═══ Conclusion ═══" << std::endl;

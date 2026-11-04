@@ -1,3 +1,8 @@
+//
+// orderbook_benchmark.cpp
+// 对比 std::map 与 vector 订单簿在深度更新场景下的性能。
+//
+
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -6,13 +11,16 @@
 #include <random>
 #include <string>
 
+// map 版本订单簿：支持价格级别的插入/删除
 class MapOrderBook {
 public:
     MapOrderBook(const std::string& symbol) : symbol_(symbol) {}
  
+    // 清空双边
     void clearBids() { bids_.clear(); }
     void clearAsks() { asks_.clear(); }
  
+    // 更新买/卖盘：quantity==0 表示删除
     void updateBid(double price, double quantity) {
         if (quantity == 0.0) bids_.erase(price);
         else bids_[price] = quantity;
@@ -23,6 +31,7 @@ public:
         else asks_[price] = quantity;
     }
  
+    // 最优买/卖价（map 自动有序）
     double getBestBid() const {
         if (bids_.empty()) return 0.0;
         return bids_.rbegin()->first;
@@ -33,10 +42,12 @@ public:
         return asks_.begin()->first;
     }
  
+    // 点差
     double getSpread() const {
         return getBestAsk() - getBestBid();
     }
 
+    // 扫描求和（模拟计算负载）
     double sumBids() const {
         double sum = 0.0;
         for (auto& [price, qty] : bids_) sum += price * qty;
@@ -55,11 +66,13 @@ private:
     std::map<double, double> asks_;
 };
 
+// 简单价格档位结构
 struct PriceLevel {
     double price;
     double quantity;
 };
  
+// vector 版本订单簿：以数组顺序保存固定深度快照
 class VecOrderBook {
 public:
     VecOrderBook(const std::string& symbol) : symbol_(symbol) {
@@ -67,9 +80,11 @@ public:
         asks_.reserve(20);
     }
  
+    // 清空快照
     void clearBids() { bids_.clear(); }
     void clearAsks() { asks_.clear(); }
  
+    // 按顺序追加档位
     void updateBid(double price, double quantity) {
         bids_.push_back({price, quantity});
     }
@@ -78,6 +93,7 @@ public:
         asks_.push_back({price, quantity});
     }
  
+    // 最优买/卖价：假定 vector[0] 即最优
     double getBestBid() const {
         if (bids_.empty()) return 0.0;
         return bids_[0].price;
@@ -88,10 +104,12 @@ public:
         return asks_[0].price;
     }
  
+    // 点差
     double getSpread() const {
         return getBestAsk() - getBestBid();
     }
 
+    // 扫描求和（模拟计算负载）
     double sumBids() const {
         double sum = 0.0;
         for (auto& level : bids_) sum += level.price * level.quantity;
@@ -110,6 +128,7 @@ private:
     std::vector<PriceLevel> asks_;
 };
 
+// 模拟深度快照（固定 20 档）
 struct DepthSnapshot {
     double bid_prices[20];
     double bid_qtys[20];
@@ -117,6 +136,7 @@ struct DepthSnapshot {
     double ask_qtys[20];
 };
  
+// 生成随机快照：用于复现实验结果
 std::vector<DepthSnapshot> generateSnapshots(int count) {
     std::mt19937 gen(42);  // 固定种子，结果可复现
     std::uniform_real_distribution<> price_dist(69000.0, 71000.0);
@@ -148,6 +168,7 @@ int main() {
     std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
     std::cout << std::endl;
  
+    // 生成数据集（包含 warmup + 正式测试）
     auto snapshots = generateSnapshots(ITERATIONS + WARMUP);
  
     // ===== Benchmark: std::map OrderBook =====
@@ -155,7 +176,7 @@ int main() {
         MapOrderBook book("MAP:BTCUSDT");
         volatile double sink = 0.0;  // 防止编译器优化掉计算
  
-        // Warmup
+    // Warmup：让 CPU 与缓存进入稳定状态
         for (int i = 0; i < WARMUP; ++i) {
             book.clearBids();
             book.clearAsks();
@@ -166,7 +187,7 @@ int main() {
             sink = book.getSpread() + book.sumBids() + book.sumAsks();
         }
  
-        // Timed run
+    // Timed run：正式计时
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = WARMUP; i < WARMUP + ITERATIONS; ++i) {
             book.clearBids();
@@ -187,6 +208,7 @@ int main() {
         std::cout << "  Avg per update:" << std::setw(10) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
         std::cout << "  Avg per update:" << std::setw(10) << std::setprecision(2) << avg_ns / 1000.0 << " μs" << std::endl;
         std::cout << std::endl;
+        (void)sink;
     }
  
     // ===== Benchmark: flat vector OrderBook =====
@@ -194,7 +216,7 @@ int main() {
         VecOrderBook book("VEC:BTCUSDT");
         volatile double sink = 0.0;
  
-        // Warmup
+    // Warmup
         for (int i = 0; i < WARMUP; ++i) {
             book.clearBids();
             book.clearAsks();
@@ -205,7 +227,7 @@ int main() {
             sink = book.getSpread() + book.sumBids() + book.sumAsks();
         }
  
-        // Timed run
+    // Timed run
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = WARMUP; i < WARMUP + ITERATIONS; ++i) {
             book.clearBids();
@@ -226,6 +248,7 @@ int main() {
         std::cout << "  Avg per update:" << std::setw(10) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
         std::cout << "  Avg per update:" << std::setw(10) << std::setprecision(2) << avg_ns / 1000.0 << " μs" << std::endl;
         std::cout << std::endl;
+        (void)sink;
     }
  
     std::cout << "═══ Conclusion ═══" << std::endl;

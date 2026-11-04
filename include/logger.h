@@ -1,3 +1,8 @@
+//
+// logger.h
+// 日志模块：记录系统启动、套利信号、价差与延迟统计。
+//
+
 #pragma once
 
 #include "arbitrage_detector.h"
@@ -12,15 +17,18 @@
 #include <sstream>
 #include <sys/stat.h>
 
+// 文件日志器：按日期创建日志文件，支持多种类型的记录
 class Logger {
 public:
+    // log_dir: 日志目录，默认 logs
     Logger(const std::string& log_dir = "logs") : log_dir_(log_dir) {
         mkdir(log_dir_.c_str(), 0755);
 
         std::string date = getCurrentDate();
         std::string filepath = log_dir_ + "/arb_" + date + ".log";
 
-        file_.open(filepath, std::ios::app);
+    // 以追加方式打开文件，避免覆盖
+    file_.open(filepath, std::ios::app);
         
         if (!file_.is_open()) {
             std::cerr << "[Logger] Failed to open log file: " << filepath << std::endl;
@@ -32,6 +40,7 @@ public:
         std::cout << "[Logger] Log file: " << filepath << std::endl;
     }
 
+    // 析构时写入停止信息
     ~Logger() {
         if (file_.is_open()) {
             log("=== Crypto HFT Engine Stopped ===");
@@ -39,11 +48,13 @@ public:
         }
     }
 
+    // 通用文本日志
     void log(const std::string& message) {
         if (!file_.is_open()) return;
         file_ << getTimestamp() << " [INFO] " << message << std::endl;
     }
 
+    // 记录套利信号
     void logSignal(const ArbitrageSignal& signal){
         if (!file_.is_open()) return;
 
@@ -60,6 +71,7 @@ public:
         file_.flush();
     }
 
+    // 记录双边价差（周期性写入）
     void logSpread(const std::string& exchang_a, double ask_a,
          const std::string& exchange_b, double bid_b, double diff) {
             if (!file_.is_open()) return;
@@ -71,9 +83,10 @@ public:
                 << " | " << exchange_b << " Bid: " << bid_b
                 << " | Diff: $" << diff;
             
-            file_ << getTimestamp() << " [SPREAD] " << ss.str() << std::endl;
+        file_ << getTimestamp() << " [SPREAD] " << ss.str() << std::endl;
     }
 
+    // 记录延迟统计
     void logLatency(const LatencyTracker& tracker) {
         if (!file_.is_open()) return;
 
@@ -90,6 +103,7 @@ public:
         file_ << getTimestamp() << " [PERF] " << ss.str() << std::endl;
     }
 
+    // 记录最终报告（汇总统计）
     void logFinalReport(const LatencyTracker& lat_a, const LatencyTracker& lat_b, 
             const ArbitrageDetector& detector) {
         log("=== Final Report ===");
@@ -105,6 +119,7 @@ public:
         file_.flush();
     }
 
+    // 强制刷新缓冲区
     void flush() {
         if (file_.is_open()) {
             file_.flush();
@@ -112,9 +127,11 @@ public:
     }
 
 private:
+    // 日志目录与文件句柄
     std::string log_dir_;
     std::ofstream file_;
 
+    // 获取精确到毫秒的时间戳
     static std::string getTimestamp() {
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
@@ -126,6 +143,7 @@ private:
         return ss.str();
     }
 
+    // 当前日期（用于按天分文件）
     static std::string getCurrentDate() {
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);

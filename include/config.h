@@ -1,3 +1,8 @@
+//
+// config.h
+// 配置加载模块：从 JSON 读取交易所/套利/显示配置，并提供默认值。
+//
+
 #pragma once
 
 #include "simdjson.h"
@@ -7,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 
+// 交易所连接配置
 struct ExchangeConfig {
     bool enabled;
     std::string host;
@@ -16,17 +22,20 @@ struct ExchangeConfig {
     std::string subscribe_msg;
 };
 
+// 套利参数配置
 struct ArbitrageConfig {
     double fee_rate;
     double min_profit;
 };
 
+// UI 刷新配置
 struct DisplayConfig {
     int refresh_ms;
     int levels;
     int spread_log_interval;
 };
 
+// 应用级配置汇总
 struct AppConfig {
     ExchangeConfig binance;
     ExchangeConfig okx;
@@ -35,12 +44,15 @@ struct AppConfig {
     bool valid;
 };
 
+// 配置读取器：负责 JSON 解析与默认值回退
 class ConfigReader {
 public:
+    // 读取配置文件，失败时回退默认值
     static AppConfig load(const std::string& filepath) {
         AppConfig config;
         config.valid = false;
 
+        // 读取配置文件内容
         std::ifstream file(filepath);
         if (!file.is_open()) {
             std::cerr << "[Config] Cannot open: " << filepath
@@ -53,7 +65,8 @@ public:
         std::string json_str = buffer.str();
         file.close();
 
-        simdjson::dom::parser parser;
+    // 使用 simdjson 解析配置
+    simdjson::dom::parser parser;
         simdjson::dom::element doc;
         auto error = parser.parse(json_str).get(doc);
         if (error) {
@@ -63,12 +76,14 @@ public:
         }
 
         try {
+            // 逐字段解析（保持与 config.json 对齐）
             auto binance = doc["binance"];
             config.binance.enabled = binance["enabled"].get_bool().value();
             config.binance.host = std::string(binance["host"].get_string().value());
             config.binance.port = std::string(binance["port"].get_string().value());
             config.binance.path = std::string(binance["path"].get_string().value());
             config.binance.symbol = std::string(binance["symbol"].get_string().value());
+            // Binance 使用 URL/路径订阅，这里保持为空
             config.binance.subscribe_msg = "";
 
 
@@ -106,6 +121,7 @@ public:
     }
 
 private:
+    // 默认配置（用于解析失败或缺省字段）
     static AppConfig getDefaults() {
         AppConfig config;
         config.binance = {true, "stream.binance.com", "9443",

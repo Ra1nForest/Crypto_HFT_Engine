@@ -1,3 +1,8 @@
+//
+// latency_tracker.h
+// 延迟统计器：采集延迟样本并提供均值、分位数等统计指标。
+//
+
 #pragma once
 
 #include <vector>
@@ -9,8 +14,13 @@
 #include <chrono>
 #include <cmath>
 
+// 延迟统计器：
+// - 支持固定大小的采样池（reservoir）
+// - 计算 P50/P95/P99 等常用指标
 class LatencyTracker {
 public:
+    // name: 用于展示的标签
+    // reservoir_size: 采样池大小，控制内存与统计精度
     LatencyTracker(const std::string& name, int reservoir_size = 10000)
         : name_(name)
         , reservoir_size_(reservoir_size)
@@ -21,6 +31,7 @@ public:
         samples_.reserve(reservoir_size);
     }
 
+    // 记录单次延迟（微秒）
     void record(long latency_us) {
         if (latency_us < 0) return;
         count_++;
@@ -28,6 +39,7 @@ public:
         if (latency_us < min_us_) min_us_ = latency_us;
         if (latency_us > max_us_) max_us_ = latency_us;
 
+        // 采样池满后循环覆盖，保持固定内存
         if (static_cast<int>(samples_.size()) < reservoir_size_) {
             samples_.push_back(latency_us);
         } else {
@@ -35,12 +47,14 @@ public:
         }
     }
 
+    // 记录时间点区间延迟
     void record(std::chrono::high_resolution_clock::time_point start,
                 std::chrono::high_resolution_clock::time_point end) {
         long us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         record(us);
     }
 
+    // 获取分位数（0~1）
     long getPercentile(double percentile) const {
         if (samples_.empty()) return 0;
         std::vector<long> sorted = samples_;
@@ -51,6 +65,7 @@ public:
         return sorted[index];
     }
 
+    // 常用指标
     long getP50() const { return getPercentile(0.50); }
     long getP95() const { return getPercentile(0.95); }
     long getP99() const { return getPercentile(0.99); }
@@ -61,6 +76,7 @@ public:
     const std::string& getName() const { return name_; }
     const std::vector<long>& getSamples() const { return samples_; }
 
+    // 紧凑统计字符串（用于 UI 面板）
     std::string getCompactStats() const {
         std::ostringstream ss;
         ss << std::setw(6) << count_ << " msgs"
@@ -71,6 +87,7 @@ public:
         return ss.str();
     }
 
+    // 重置统计
     void reset() {
         samples_.clear();
         samples_.reserve(reservoir_size_);
@@ -81,9 +98,12 @@ public:
     }
 
 private:
+    // 展示名称
     std::string name_;
+    // 采样池大小与采样数据
     int reservoir_size_;
     std::vector<long> samples_;
+    // 统计字段
     int count_;
     long total_us_;
     long min_us_;

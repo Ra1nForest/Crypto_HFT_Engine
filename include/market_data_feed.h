@@ -1,3 +1,9 @@
+//
+// market_data_feed.h
+// 行情订阅模块：负责连接交易所 WebSocket，解析深度数据并更新 OrderBook。
+// 该实现使用 Boost.Beast + OpenSSL，simdjson 进行高性能解析。
+//
+
 #pragma once
 
 #include <boost/asio/ssl/error.hpp>
@@ -29,11 +35,13 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
+// 支持的交易所枚举
 enum class Exchange {
     BINANCE,
     OKX
 };
 
+// 行情订阅配置
 struct FeedConfig {
     Exchange exchange;
     std::string name;
@@ -44,6 +52,10 @@ struct FeedConfig {
     std::string subscribe_msg;
 };
 
+// 行情订阅器：
+// - 维护连接生命周期
+// - 解析深度并更新 OrderBook
+// - 记录解析延迟
 class MarketDataFeed {
     FeedConfig config_;
     OrderBook orderbook_;
@@ -52,21 +64,25 @@ class MarketDataFeed {
 
     LatencyTracker latency_;
 
+    // 预留的连接初始化入口（当前实现为空）
     void connect() {
 
     }
 
+    // 主接收循环：建立 WebSocket，持续读取并解析消息
     void receiveLoop() {
         net::io_context ioc;
         ssl::context ctx(ssl::context::tlsv12_client);
         tcp::resolver resolver(ioc);
         websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
 
-        auto const results = resolver.resolve(config_.host, config_.port);
+    // 解析 DNS 并连接
+    auto const results = resolver.resolve(config_.host, config_.port);
 
         auto ep = net::connect(ws.next_layer().next_layer(), results);
 
-        if (!SSL_set_tlsext_host_name(
+    // 设置 SNI，避免多证书环境下握手失败
+    if (!SSL_set_tlsext_host_name(
                 ws.next_layer().native_handle(), config_.host.c_str())) {
             
             throw beast::system_error(
@@ -77,13 +93,15 @@ class MarketDataFeed {
                 );
         }
 
-        ws.next_layer().handshake(ssl::stream_base::client);
+    // TLS + WebSocket 握手
+    ws.next_layer().handshake(ssl::stream_base::client);
 
         std::string ws_host = config_.host + ":" + std::to_string(ep.port());
         ws.handshake(ws_host, config_.path);
 
-        std::cout << "[" << config_.name << "]" << "Connected." << std::endl;
+    std::cout << "[" << config_.name << "]" << "Connected." << std::endl;
 
+        // 发送订阅消息（部分交易所需要）
         if (!config_.subscribe_msg.empty()) {
             ws.write(net::buffer(config_.subscribe_msg));
             std::cout << "[" << config_.name << "] Subscription message sent." << std::endl;
@@ -95,12 +113,14 @@ class MarketDataFeed {
         std::string msg;
         msg.reserve(4096);
 
+        // 持续读取消息，解析深度并记录延迟
         while (running_) {
             buffer.clear();
             ws.read(buffer);
 
             auto start = std::chrono::high_resolution_clock::now();
 
+            // 复制到字符串，便于 simdjson 解析
             msg.assign(boost::beast::buffers_to_string(buffer.data()));
             
             simdjson::padded_string padded_msg(msg);
@@ -111,6 +131,7 @@ class MarketDataFeed {
                 continue;
             }
 
+            // 根据交易所类型选择解析函数
             bool success = false;
             if (config_.exchange == Exchange::BINANCE) {
                 success = parseBinanceDepth(doc);
@@ -118,6 +139,7 @@ class MarketDataFeed {
                 success = parseOKXDepth(doc);
             }
 
+            // 记录单条消息解析延迟
             if (success) {
                 auto end = std::chrono::high_resolution_clock::now();
                 long latency = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -128,6 +150,7 @@ class MarketDataFeed {
         ws.close(websocket::close_code::normal);
     }
 
+    // Binance 深度解析：数组 bids/asks 为 [[price, qty], ...]
     bool parseBinanceDepth(simdjson::ondemand::document& doc){
         try{
             std::lock_guard<std::mutex> lock(mutex_);
@@ -163,6 +186,7 @@ class MarketDataFeed {
         }
     }
 
+    // OKX 深度解析：data 数组中包含 bids/asks
     bool parseOKXDepth(simdjson::ondemand::document& doc) {
         try {
             simdjson::ondemand::array data;
@@ -203,6 +227,7 @@ class MarketDataFeed {
         }
     }
 
+    // 高性能字符串转 double（基于 from_chars）
     static double fastParseDouble(std::string_view sv) {
         double val = 0.0;
         std::from_chars(sv.data(), sv.data() + sv.size(), val);
@@ -210,12 +235,14 @@ class MarketDataFeed {
     }
 
 public:
+    // 构造函数：初始化配置、订单簿与延迟统计
     MarketDataFeed(const FeedConfig& config)
         : config_(config)
         , orderbook_(config.name + ":" + config.symbol)
         , running_(false)
         , latency_(config.name) {}
     
+    // 启动订阅：建立连接并进入接收循环
     void run() {
         running_ = true;
         try {
@@ -229,20 +256,26 @@ public:
         }
     }
 
+    // 通知退出
     void stop() {
         running_ = false;
     }
 
+    // 获取订单簿快照（线程安全拷贝）
     OrderBook getOrderBookSnapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return orderbook_;
     }
 
+    // 访问延迟统计
     const LatencyTracker& getLatencyTracker() const { return latency_; }
 
+    // 已处理消息数量
     int getMessageCount() const { return latency_.getCount(); }
 
+    // 订阅线程是否仍在运行
     bool isRunning() const { return running_; }
 
+    // 交易所显示名称
     const std::string& getName() const { return config_.name; }
 };

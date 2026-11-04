@@ -1,3 +1,8 @@
+//
+// display.h
+// 终端 UI 渲染：负责双边盘口、套利面板、延迟统计的美观输出。
+//
+
 #pragma once
 
 #include "orderbook.h"
@@ -11,12 +16,15 @@
 #include <vector>
 #include <algorithm>
 
+// 纯静态显示类：不持有状态，仅负责格式化与渲染
 class Display {
 public:
+    // 清屏并将光标移动到左上角
     static void clearScreen() {
         std::cout << "\033[2J\033[1;1H";
     }
 
+    // 主渲染入口：展示订单簿、套利面板与性能统计
     static void render(
         const OrderBook& book_a,
         const OrderBook& book_b,
@@ -26,7 +34,7 @@ public:
         bool live_a, bool live_b,
         int levels = 5
     ) {
-        clearScreen();
+    clearScreen();
         std::cout << std::fixed << std::setprecision(2);
 
         std::cout << "╔" << repeat("═", 87) << "╗" << std::endl;
@@ -34,13 +42,16 @@ public:
         std::cout << "╚" << repeat("═", 87) << "╝" << std::endl;
         std::cout << std::endl;
 
-        printDualOrderBook(book_a, book_b, levels);
+    // 订单簿并排展示
+    printDualOrderBook(book_a, book_b, levels);
         std::cout << std::endl;
 
-        printArbitragePanel(book_a, book_b, detector);
+    // 套利面板
+    printArbitragePanel(book_a, book_b, detector);
         std::cout << std::endl;
 
-        std::cout << "═══ Performance ═══" << std::endl;
+    // 性能与延迟统计
+    std::cout << "═══ Performance ═══" << std::endl;
         std::cout << "  " << lat_a.getName() << ": " << lat_a.getCompactStats()
                   << "  " << (live_a ? "[\033[32mLIVE\033[0m]" : "[\033[31mDOWN\033[0m]")
                   << std::endl;
@@ -51,6 +62,7 @@ public:
         std::cout << "Press Ctrl+C to exit" << std::endl;
     }
 
+    // 最终报告：左右并排的延迟统计表
     static void printDualLatencyReport(const LatencyTracker& lat_a, const LatencyTracker& lat_b) {
         const int col_width = 42;
         std::string line = repeat("─", col_width);
@@ -77,6 +89,7 @@ public:
     }
 
 private:
+    // 重复字符串 n 次
     static std::string repeat(const std::string& s, int n) {
         std::string result;
         result.reserve(s.size() * n);
@@ -84,12 +97,14 @@ private:
         return result;
     }
 
+    // 价格格式化
     static std::string fmtPrice(double price) {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(2) << std::setw(10) << price;
         return ss.str();
     }
 
+    // 字符串居中
     static std::string center(const std::string& text, int width) {
         int pad = width - static_cast<int>(text.size());
         if (pad <= 0) return text.substr(0, width);
@@ -98,6 +113,7 @@ private:
         return std::string(left, ' ') + text + std::string(right, ' ');
     }
 
+    // 右侧填充空格
     static std::string padRow(const std::string& s, int width) {
         if (static_cast<int>(s.size()) >= width) return s.substr(0, width);
         return s + std::string(width - s.size(), ' ');
@@ -105,6 +121,7 @@ private:
 
     // ═══ Order Book 并排显示 ═══
 
+    // 打印双边订单簿
     static void printDualOrderBook(const OrderBook& book_a, const OrderBook& book_b, int levels) {
         auto a_bids = collectBids(book_a, levels);
         auto a_asks = collectAsks(book_a, levels);
@@ -119,6 +136,7 @@ private:
         std::cout << "  │" << "   Qty       Price   │  Price       Qty    " << "│ │" << "   Qty       Price   │  Price       Qty    " << "│" << std::endl;
         std::cout << "  ├" << line << "┤ ├" << line << "┤" << std::endl;
 
+    // 计算最大行数，以防一侧深度较少
         int max_rows = std::max({(int)a_bids.size(), (int)a_asks.size(),
                                   (int)b_bids.size(), (int)b_asks.size()});
 
@@ -138,6 +156,7 @@ private:
         std::cout << "  └" << line << "┘ └" << line << "┘" << std::endl;
     }
 
+    // 格式化单行的买卖盘
     static std::string formatRow(const std::vector<PriceLevel>& bids,
                                   const std::vector<PriceLevel>& asks, int i) {
         std::ostringstream ss;
@@ -164,6 +183,7 @@ private:
         return ss.str();
     }
 
+    // 取出前 N 档买盘
     static std::vector<PriceLevel> collectBids(const OrderBook& book, int levels) {
         std::vector<PriceLevel> result;
         auto& bids = book.getBids();
@@ -174,6 +194,7 @@ private:
         return result;
     }
 
+    // 取出前 N 档卖盘
     static std::vector<PriceLevel> collectAsks(const OrderBook& book, int levels) {
         std::vector<PriceLevel> result;
         auto& asks = book.getAsks();
@@ -186,6 +207,7 @@ private:
 
     // ═══ 套利面板 ═══
 
+    // 打印套利面板：显示双向价差与累计收益
     static void printArbitragePanel(const OrderBook& book_a, const OrderBook& book_b,
                                      const ArbitrageDetector& detector) {
         auto a_ask = book_a.getBestAsk();
@@ -193,8 +215,9 @@ private:
         auto b_ask = book_b.getBestAsk();
         auto b_bid = book_b.getBestBid();
 
-        double diff1 = b_bid.price - a_ask.price;
-        double diff2 = a_bid.price - b_ask.price;
+    // diff1：A 买 B 卖，diff2：B 买 A 卖
+    double diff1 = b_bid.price - a_ask.price;
+    double diff2 = a_bid.price - b_ask.price;
 
         std::string g = "\033[32m";
         std::string r = "\033[31m";
@@ -245,6 +268,7 @@ private:
 
     // ═══ 延迟报告 ═══
 
+    // 构建统计行（计数、P50/P95/P99 等）
     static std::vector<std::string> buildLatencyRows(const LatencyTracker& lat) {
         const int w = 42;
         std::vector<std::string> rows;
@@ -267,6 +291,7 @@ private:
         return rows;
     }
 
+    // 构建单行统计文本
     static std::string makeStatRow(const std::string& label, const std::string& value,
                                      const std::string& unit, int width) {
         std::ostringstream ss;
@@ -278,6 +303,7 @@ private:
         return s;
     }
 
+    // 构建延迟分布直方图
     static std::vector<std::string> buildHistogramRows(const LatencyTracker& lat) {
         std::vector<std::string> rows;
 
