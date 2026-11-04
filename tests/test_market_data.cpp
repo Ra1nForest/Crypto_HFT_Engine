@@ -1,0 +1,2683 @@
+//
+// test_market_data.cpp
+// 行情模块测试：L2 订单簿、BookSnapshot、CRC32 以及 Binance / OKX / Bybit 协议适配器。
+// 全部离线运行：报文按官方文档示例手写，或由测试内的"交易所模型"生成（OKX 校验和由测试里独立的逐位 CRC32 计算）。
+//
+
+// 启用库内调试断言（必须在包含任何 hft 头文件之前定义）
+#define HFT_ENABLE_ASSERTS
+
+#include "test_framework.h"
+
+#include "book_snapshot.h"
+#include "exchanges/adapters.h"
+#include "hft/crc32.h"
+#include "hft/spsc_queue.h"
+#include "orderbook.h"
+
+#include <algorithm>
+#include <atomic>
+#include <charconv>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <new>
+#include <optional>
+#include <random>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+// ============================================================================
+// 全局 operator new 计数：用于验证适配器预热后每条消息零堆分配
+// ============================================================================
+
+namespace {
+std::atomic<bool> g_count_allocs{false};
+std::atomic<std::uint64_t> g_alloc_count{0};
+}  // namespace
+
+// 替换函数标记 noinline：否则 GCC 把 free 内联进调用点后会对"operator new 返回的指针被 free"
+// 误报 -Wmismatched-new-delete（替换 operator new/delete 本身就是标准允许的用法）
+__attribute__((noinline)) void* operator new(std::size_t n) {
+    if (g_count_allocs.load(std::memory_order_relaxed)) g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+    void* p = std::malloc(n == 0 ? 1 : n);
+    if (p == nullptr) throw std::bad_alloc();
+    return p;
+}
+__attribute__((noinline)) void* operator new[](std::size_t n) { return ::operator new(n); }
+__attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
+__attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
+__attribute__((noinline)) void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+__attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+// nothrow 版本也必须替换：否则（例如在 ASan 下）simdjson 的 new (std::nothrow) 来自另一个分配器，
+// 却由上面的 operator delete[] 用 free 释放
+__attribute__((noinline)) void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    if (g_count_allocs.load(std::memory_order_relaxed)) g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+    return std::malloc(n == 0 ? 1 : n);
+}
+__attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
+    return ::operator new(n, t);
+}
+__attribute__((noinline)) void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+__attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+
+namespace {
+
+// ============================================================================
+// 通用辅助
+// ============================================================================
+
+constexpr const char* kOkxSubscribe = R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
+constexpr const char* kOkxUnsubscribe = R"({"op":"unsubscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
+constexpr const char* kOkxBooks5Subscribe = R"({"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT"}]})";
+constexpr const char* kBybitSubscribe = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
+constexpr const char* kBybitUnsubscribe = R"({"op":"unsubscribe","args":["orderbook.50.BTCUSDT"]})";
+
+using Level = std::pair<std::string, std::string>;  // (价格字符串, 数量字符串)
+using Levels = std::vector<Level>;
+
+AdapterConfig makeConfig(Exchange ex) {
+    AdapterConfig c;
+    c.name = exchangeName(ex);
+    c.symbol = "BTCUSDT";
+    if (ex == Exchange::OKX) c.subscribe_msg = kOkxSubscribe;
+    if (ex == Exchange::BYBIT) c.subscribe_msg = kBybitSubscribe;
+    return c;
+}
+
+AdapterResult feed(ExchangeAdapter& a, std::string_view payload) {
+    AdapterResult r;
+    a.onMessage(payload, r);
+    return r;
+}
+
+AdapterResult restSnapshot(ExchangeAdapter& a, std::string_view body) {
+    AdapterResult r;
+    a.onRestSnapshot(body, r);
+    return r;
+}
+
+double num(std::string_view s) {
+    double v = 0.0;
+    std::from_chars(s.data(), s.data() + s.size(), v);
+    return v;
+}
+
+bool contains(const std::string& haystack, std::string_view needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+std::string levelsJson(const Levels& levels, bool okx_extra = false) {
+    std::string s = "[";
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+        if (i != 0) s += ',';
+        s += "[\"" + levels[i].first + "\",\"" + levels[i].second + "\"";
+        if (okx_extra) s += ",\"0\",\"3\"";
+        s += ']';
+    }
+    s += ']';
+    return s;
+}
+
+// ---- Binance 报文 ----
+std::string binanceDepth(std::uint64_t last_id, const Levels& bids, const Levels& asks) {
+    return "{\"lastUpdateId\":" + std::to_string(last_id) + ",\"bids\":" + levelsJson(bids) +
+           ",\"asks\":" + levelsJson(asks) + "}";
+}
+
+std::string binanceDiff(std::uint64_t first, std::uint64_t last, const Levels& bids, const Levels& asks,
+                        std::int64_t event_ms = 1672515782136) {
+    return "{\"e\":\"depthUpdate\",\"E\":" + std::to_string(event_ms) + ",\"s\":\"BTCUSDT\",\"U\":" +
+           std::to_string(first) + ",\"u\":" + std::to_string(last) + ",\"b\":" + levelsJson(bids) +
+           ",\"a\":" + levelsJson(asks) + "}";
+}
+
+std::string binanceCombined(std::string_view stream, const std::string& inner) {
+    return "{\"stream\":\"" + std::string(stream) + "\",\"data\":" + inner + "}";
+}
+
+// ---- OKX 报文 ----
+std::string okxBooks(std::string_view action, const Levels& bids, const Levels& asks, std::int64_t prev_seq,
+                     std::int64_t seq, std::optional<std::int64_t> checksum, std::int64_t ts = 1597026383085) {
+    std::string s = "{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"" + std::string(action) +
+                    "\",\"data\":[{\"asks\":" + levelsJson(asks, true) + ",\"bids\":" + levelsJson(bids, true) +
+                    ",\"ts\":\"" + std::to_string(ts) + "\"";
+    if (checksum) s += ",\"checksum\":" + std::to_string(*checksum);
+    s += ",\"prevSeqId\":" + std::to_string(prev_seq) + ",\"seqId\":" + std::to_string(seq) + "}]}";
+    return s;
+}
+
+std::string okxBooks5(const Levels& bids, const Levels& asks, std::int64_t ts = 1626537446491) {
+    return "{\"arg\":{\"channel\":\"books5\",\"instId\":\"BTC-USDT\"},\"data\":[{\"asks\":" + levelsJson(asks, true) +
+           ",\"bids\":" + levelsJson(bids, true) + ",\"instId\":\"BTC-USDT\",\"ts\":\"" + std::to_string(ts) +
+           "\"}]}";
+}
+
+// ---- Bybit 报文 ----
+std::string bybitBook(std::string_view type, std::uint64_t u, const Levels& bids, const Levels& asks,
+                      std::int64_t ts = 1687940967466) {
+    return "{\"topic\":\"orderbook.50.BTCUSDT\",\"type\":\"" + std::string(type) + "\",\"ts\":" + std::to_string(ts) +
+           ",\"data\":{\"s\":\"BTCUSDT\",\"b\":" + levelsJson(bids) + ",\"a\":" + levelsJson(asks) +
+           ",\"u\":" + std::to_string(u) + ",\"seq\":66544703342},\"cts\":" + std::to_string(ts - 2) + "}";
+}
+
+// ---- 独立的 CRC32 与 OKX 校验串（逐位实现，与库的查表实现无共享代码） ----
+std::uint32_t bitwiseCrc32(std::string_view s) {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (unsigned char c : s) {
+        crc ^= c;
+        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+std::int32_t asSigned(std::uint32_t u) {
+    std::int32_t r = 0;
+    std::memcpy(&r, &u, sizeof(r));
+    return r;
+}
+
+std::string okxChecksumString(const Levels& bids, const Levels& asks) {
+    std::string s;
+    for (std::size_t i = 0; i < 25; ++i) {
+        if (i < bids.size()) {
+            if (!s.empty()) s += ':';
+            s += bids[i].first + ":" + bids[i].second;
+        }
+        if (i < asks.size()) {
+            if (!s.empty()) s += ':';
+            s += asks[i].first + ":" + asks[i].second;
+        }
+    }
+    return s;
+}
+
+std::int32_t okxChecksum(const Levels& bids, const Levels& asks) {
+    return asSigned(bitwiseCrc32(okxChecksumString(bids, asks)));
+}
+
+// ---- 簿比较 ----
+std::string describeSide(const std::vector<PriceLevel>& v, std::size_t max_levels = 8) {
+    std::ostringstream ss;
+    ss.precision(12);
+    for (std::size_t i = 0; i < v.size() && i < max_levels; ++i) ss << " " << v[i].price << "x" << v[i].quantity;
+    if (v.size() > max_levels) ss << " ... (" << v.size() << " levels)";
+    return ss.str();
+}
+
+// 一侧是否与期望档位（字符串）完全一致；不一致时写明原因
+bool sideEquals(const std::vector<PriceLevel>& actual, const Levels& expected, std::string& why) {
+    if (actual.size() != expected.size()) {
+        why = "size " + std::to_string(actual.size()) + " != " + std::to_string(expected.size()) + ":" +
+              describeSide(actual);
+        return false;
+    }
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        if (actual[i].price != num(expected[i].first) || actual[i].quantity != num(expected[i].second)) {
+            why = "level " + std::to_string(i) + " differs: " + describeSide(actual);
+            return false;
+        }
+    }
+    return true;
+}
+
+// 两个簿的档位完全相同（价格与数量逐位相等）
+bool sameLevels(const OrderBook& x, const OrderBook& y) {
+    auto eq = [](const std::vector<PriceLevel>& a, const std::vector<PriceLevel>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i].price != b[i].price || a[i].quantity != b[i].quantity) return false;
+        }
+        return true;
+    };
+    return eq(x.getBids(), y.getBids()) && eq(x.getAsks(), y.getAsks());
+}
+
+#define CHECK_BOOK(book, bids, asks)                                                        \
+    do {                                                                                    \
+        std::string why_b_, why_a_;                                                         \
+        if (!sideEquals((book).getBids(), (bids), why_b_))                                  \
+            ::hft_test::reportFailure(__FILE__, __LINE__, "bids: " + why_b_);               \
+        if (!sideEquals((book).getAsks(), (asks), why_a_))                                  \
+            ::hft_test::reportFailure(__FILE__, __LINE__, "asks: " + why_a_);               \
+    } while (0)
+
+// 价格格式化
+std::string fixedTicks(std::int64_t ticks, int decimals) {  // ticks / 10^decimals，固定小数位
+    std::int64_t scale = 1;
+    for (int i = 0; i < decimals; ++i) scale *= 10;
+    std::string frac = std::to_string(ticks % scale);
+    while (static_cast<int>(frac.size()) < decimals) frac.insert(frac.begin(), '0');
+    return std::to_string(ticks / scale) + (decimals > 0 ? "." + frac : "");
+}
+
+std::string okxPrice(std::int64_t ticks) {  // 0.1 跳价，去掉末尾的 0（"3366"、"3366.1"），与 OKX 文档一致
+    if (ticks % 10 == 0) return std::to_string(ticks / 10);
+    return std::to_string(ticks / 10) + "." + std::to_string(ticks % 10);
+}
+
+// 随机数量字符串：随机小数位，随机保留/去掉末尾 0（考验"原样字符串"）
+std::string randomSize(std::mt19937_64& rng) {
+    const int decimals = static_cast<int>(rng() % 9);
+    std::int64_t mantissa = static_cast<std::int64_t>(rng() % 5000000) + 1;
+    std::string s = fixedTicks(mantissa, decimals);
+    if (decimals > 0 && (rng() % 2) == 0) {
+        while (s.back() == '0') s.pop_back();
+        if (s.back() == '.') s.pop_back();
+    }
+    return s;
+}
+
+// 交易所侧的簿模型：tick -> (价格字符串, 数量字符串)
+struct BookModel {
+    std::map<std::int64_t, Level> bids;  // 按 tick 升序存放，输出时倒序
+    std::map<std::int64_t, Level> asks;
+
+    Levels bidLevels(std::size_t max_levels = SIZE_MAX) const {
+        Levels out;
+        for (auto it = bids.rbegin(); it != bids.rend() && out.size() < max_levels; ++it) out.push_back(it->second);
+        return out;
+    }
+    Levels askLevels(std::size_t max_levels = SIZE_MAX) const {
+        Levels out;
+        for (auto it = asks.begin(); it != asks.end() && out.size() < max_levels; ++it) out.push_back(it->second);
+        return out;
+    }
+    std::int64_t bestBidTick() const { return bids.empty() ? std::numeric_limits<std::int64_t>::min() : bids.rbegin()->first; }
+    std::int64_t bestAskTick() const { return asks.empty() ? std::numeric_limits<std::int64_t>::max() : asks.begin()->first; }
+};
+
+// ============================================================================
+// OrderBook
+// ============================================================================
+
+TEST_CASE("orderbook: upsert keeps bids strictly descending and asks strictly ascending") {
+    OrderBook b("T");
+    b.updateBid(100.0, 1);
+    b.updateBid(102.0, 2);
+    b.updateBid(101.0, 3);
+    b.updateBid(99.5, 4);
+    b.updateAsk(105.0, 1);
+    b.updateAsk(103.0, 2);
+    b.updateAsk(104.0, 3);
+    b.updateAsk(110.0, 4);
+    const std::vector<double> bid_prices = {102.0, 101.0, 100.0, 99.5};
+    const std::vector<double> ask_prices = {103.0, 104.0, 105.0, 110.0};
+    REQUIRE_EQ(b.getBidCount(), 4);
+    REQUIRE_EQ(b.getAskCount(), 4);
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK_EQ(b.getBids()[i].price, bid_prices[i]);
+        CHECK_EQ(b.getAsks()[i].price, ask_prices[i]);
+    }
+    b.updateBid(101.0, 7);  // 已存在：原地修改
+    CHECK_EQ(b.getBidCount(), 4);
+    CHECK_EQ(b.getBids()[1].quantity, 7.0);
+    b.updateAsk(110.0, 9);  // 尾部已存在的价格
+    CHECK_EQ(b.getAsks()[3].quantity, 9.0);
+    b.updateBid(102.0, 5);  // 头部已存在的价格
+    CHECK_EQ(b.getBids()[0].quantity, 5.0);
+    std::string why;
+    CHECK(b.validate(&why));
+    CHECK(why.empty());
+    CHECK(&b.levels(BookSide::Bid) == &b.getBids());
+    CHECK(&b.levels(BookSide::Ask) == &b.getAsks());
+}
+
+TEST_CASE("orderbook: quantity <= 0 erases, erasing an absent level is a no-op, setLevel reports changes") {
+    OrderBook b;
+    CHECK(b.setLevel(BookSide::Bid, 100.0, 1.0));
+    CHECK(!b.setLevel(BookSide::Bid, 100.0, 1.0));  // 数量不变
+    CHECK(b.setLevel(BookSide::Bid, 100.0, 2.0));
+    CHECK(b.setLevel(BookSide::Bid, 100.0, 0.0));   // 删除
+    CHECK(!b.setLevel(BookSide::Bid, 100.0, 0.0));  // 已不存在
+    CHECK(!b.setLevel(BookSide::Bid, 50.0, -1.0));
+    CHECK(b.empty());
+    for (double p : {10.0, 20.0, 30.0, 40.0, 50.0}) b.updateAsk(p, p);
+    CHECK(b.setLevel(BookSide::Ask, 10.0, -3.0));  // 负数量同样删除（头部）
+    CHECK(b.setLevel(BookSide::Ask, 50.0, 0.0));   // 尾部
+    CHECK(b.setLevel(BookSide::Ask, 30.0, 0.0));   // 中间
+    CHECK(!b.setLevel(BookSide::Ask, 35.0, 0.0));  // 中间不存在
+    CHECK(!b.setLevel(BookSide::Ask, 5.0, 0.0));   // 比头部更优、不存在
+    CHECK(!b.setLevel(BookSide::Ask, 60.0, 0.0));  // 比尾部更差、不存在
+    REQUIRE_EQ(b.getAskCount(), 2);
+    CHECK_EQ(b.getAsks()[0].price, 20.0);
+    CHECK_EQ(b.getAsks()[1].price, 40.0);
+    CHECK(b.validate());
+}
+
+TEST_CASE("orderbook: non-finite prices or quantities are ignored") {
+    OrderBook b;
+    b.updateBid(100.0, 1.0);
+    b.updateAsk(101.0, 1.0);
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    CHECK(!b.setLevel(BookSide::Bid, nan, 1.0));
+    CHECK(!b.setLevel(BookSide::Bid, inf, 1.0));
+    CHECK(!b.setLevel(BookSide::Ask, -inf, 1.0));
+    CHECK(!b.setLevel(BookSide::Bid, 100.0, nan));
+    CHECK(!b.setLevel(BookSide::Bid, 100.0, inf));
+    CHECK(!b.setLevel(BookSide::Ask, 101.0, -inf));
+    CHECK_EQ(b.getBidCount(), 1);
+    CHECK_EQ(b.getAskCount(), 1);
+    CHECK_EQ(b.getBids()[0].quantity, 1.0);
+    CHECK(b.validate());
+}
+
+TEST_CASE("orderbook: legacy clear + append in exchange order reproduces the input (tail fast path)") {
+    std::mt19937_64 rng(7);
+    OrderBook b("Binance:BTCUSDT");
+    for (int round = 0; round < 50; ++round) {
+        std::vector<PriceLevel> bids, asks;
+        double p = 65000.0 + static_cast<double>(rng() % 100);
+        for (int i = 0; i < 20; ++i) {
+            bids.push_back({p, 0.001 * static_cast<double>(1 + rng() % 5000)});
+            p -= 0.01 * static_cast<double>(1 + rng() % 5);
+        }
+        p = bids.front().price + 0.01;
+        for (int i = 0; i < 20; ++i) {
+            asks.push_back({p, 0.001 * static_cast<double>(1 + rng() % 5000)});
+            p += 0.01 * static_cast<double>(1 + rng() % 5);
+        }
+        b.clearBids();
+        b.clearAsks();
+        for (const PriceLevel& l : bids) b.updateBid(l.price, l.quantity);
+        for (const PriceLevel& l : asks) b.updateAsk(l.price, l.quantity);
+        REQUIRE_EQ(b.getBids().size(), bids.size());
+        REQUIRE_EQ(b.getAsks().size(), asks.size());
+        for (std::size_t i = 0; i < bids.size(); ++i) {
+            CHECK_EQ(b.getBids()[i].price, bids[i].price);
+            CHECK_EQ(b.getBids()[i].quantity, bids[i].quantity);
+            CHECK_EQ(b.getAsks()[i].price, asks[i].price);
+            CHECK_EQ(b.getAsks()[i].quantity, asks[i].quantity);
+        }
+        CHECK(!b.isCrossed());
+    }
+    // 逆序输入（每次插到头部）同样得到有序结果
+    OrderBook r;
+    for (int i = 0; i < 100; ++i) r.updateBid(1000.0 + i, 1.0);
+    for (int i = 0; i < 100; ++i) r.updateAsk(2000.0 - i, 1.0);
+    CHECK(r.validate());
+    CHECK_EQ(r.getBids().front().price, 1099.0);
+    CHECK_EQ(r.getAsks().front().price, 1901.0);
+}
+
+TEST_CASE("orderbook: best, spread, mid and crossed accessors") {
+    OrderBook b;
+    const PriceLevel empty_bid = b.getBestBid();
+    const PriceLevel empty_ask = b.getBestAsk();
+    CHECK_EQ(empty_bid.price, 0.0);
+    CHECK_EQ(empty_bid.quantity, 0.0);
+    CHECK_EQ(empty_ask.price, 0.0);
+    CHECK_EQ(b.getSpread(), 0.0);
+    CHECK_EQ(b.getMid(), 0.0);
+    CHECK(!b.isCrossed());
+    b.updateBid(100.0, 2.0);
+    CHECK_EQ(b.getMid(), 0.0);  // 只有一侧
+    CHECK_EQ(b.getSpread(), 0.0);
+    CHECK(!b.isCrossed());
+    b.updateAsk(101.0, 3.0);
+    CHECK_EQ(b.getSpread(), 1.0);
+    CHECK_EQ(b.getMid(), 100.5);
+    CHECK(!b.isCrossed());
+    const PriceLevel bb = b.getBestBid();
+    CHECK_EQ(bb.price, 100.0);
+    CHECK_EQ(bb.quantity, 2.0);
+    b.updateBid(101.0, 1.0);  // 买一 == 卖一：交叉
+    CHECK(b.isCrossed());
+    b.updateBid(101.0, 0.0);
+    b.updateBid(102.0, 1.0);  // 买一 > 卖一
+    CHECK(b.isCrossed());
+}
+
+TEST_CASE("orderbook: truncate, cumulativeQty, clear, update id, symbol and print") {
+    OrderBook b("OKX:BTCUSDT");
+    for (int i = 0; i < 10; ++i) {
+        b.updateBid(100.0 - i, 1.0 + i);
+        b.updateAsk(101.0 + i, 2.0 + i);
+    }
+    CHECK_EQ(b.cumulativeQty(BookSide::Bid, 3), 1.0 + 2.0 + 3.0);
+    CHECK_EQ(b.cumulativeQty(BookSide::Ask, 2), 2.0 + 3.0);
+    CHECK_EQ(b.cumulativeQty(BookSide::Ask, 0), 0.0);
+    CHECK_EQ(b.cumulativeQty(BookSide::Bid, 1000), 55.0);
+    b.truncate(4);
+    CHECK_EQ(b.getBidCount(), 4);
+    CHECK_EQ(b.getAskCount(), 4);
+    CHECK_EQ(b.getBids().back().price, 97.0);
+    b.truncate(100);  // 不足时不变
+    CHECK_EQ(b.getBidCount(), 4);
+    b.setUpdateId(42);
+    CHECK_EQ(b.getUpdateId(), 42u);
+    std::ostringstream captured;
+    std::streambuf* old = std::cout.rdbuf(captured.rdbuf());
+    b.print(2);
+    std::cout.rdbuf(old);
+    CHECK(contains(captured.str(), "OKX:BTCUSDT"));
+    CHECK(contains(captured.str(), "100.00"));
+    b.clear();
+    CHECK(b.empty());
+    CHECK_EQ(b.getUpdateId(), 0u);
+    CHECK_EQ(b.getSymbol(), std::string("OKX:BTCUSDT"));
+    b.setSymbol("Bybit:BTCUSDT");
+    CHECK_EQ(b.getSymbol(), std::string("Bybit:BTCUSDT"));
+    b.reserve(500);
+    CHECK_GE(b.getBids().capacity(), 500u);
+    CHECK_GE(b.getAsks().capacity(), 500u);
+}
+
+TEST_CASE("orderbook: randomized differential vs std::map reference (200k ops)") {
+    std::mt19937_64 rng(20261104);
+    OrderBook book;
+    std::map<double, double, std::greater<double>> ref_bids;
+    std::map<double, double> ref_asks;
+    int mismatches = 0;
+    auto compare = [&]() {
+        std::string why;
+        if (!book.validate(&why)) {
+            ++mismatches;
+            ::hft_test::reportFailure(__FILE__, __LINE__, "validate: " + why);
+            return;
+        }
+        auto check_side = [&](const std::vector<PriceLevel>& v, const auto& ref) {
+            if (v.size() != ref.size()) return false;
+            std::size_t i = 0;
+            for (const auto& kv : ref) {
+                if (v[i].price != kv.first || v[i].quantity != kv.second) return false;
+                ++i;
+            }
+            return true;
+        };
+        if (!check_side(book.getBids(), ref_bids) || !check_side(book.getAsks(), ref_asks)) {
+            ++mismatches;
+            ::hft_test::reportFailure(__FILE__, __LINE__, "book differs from the std::map reference");
+        }
+    };
+    for (int step = 0; step < 200000 && mismatches < 5; ++step) {
+        const bool bid = (rng() & 1u) != 0;
+        // 价格分布：大部分集中在头部附近，偶尔远端
+        const std::int64_t tick = (rng() % 10 == 0) ? static_cast<std::int64_t>(rng() % 2000)
+                                                     : static_cast<std::int64_t>(rng() % 60);
+        const double price = bid ? 1000.0 - 0.5 * static_cast<double>(tick) : 1000.5 + 0.5 * static_cast<double>(tick);
+        const unsigned kind = static_cast<unsigned>(rng() % 10);
+        double qty = kind < 3 ? (kind == 0 ? -1.0 : 0.0) : 0.25 * static_cast<double>(1 + rng() % 40);
+        if (kind == 9 && step % 1000 == 0) {
+            // 偶尔整侧重建（clear + 有序追加），覆盖尾部快路径
+            book.clearBids();
+            for (const auto& kv : ref_bids) book.updateBid(kv.first, kv.second);
+            continue;
+        }
+        bool expected_change = false;
+        if (bid) {
+            auto it = ref_bids.find(price);
+            if (qty > 0) {
+                expected_change = it == ref_bids.end() || it->second != qty;
+                ref_bids[price] = qty;
+            } else if (it != ref_bids.end()) {
+                expected_change = true;
+                ref_bids.erase(it);
+            }
+        } else {
+            auto it = ref_asks.find(price);
+            if (qty > 0) {
+                expected_change = it == ref_asks.end() || it->second != qty;
+                ref_asks[price] = qty;
+            } else if (it != ref_asks.end()) {
+                expected_change = true;
+                ref_asks.erase(it);
+            }
+        }
+        const bool changed = book.setLevel(bid ? BookSide::Bid : BookSide::Ask, price, qty);
+        if (changed != expected_change) {
+            ++mismatches;
+            ::hft_test::reportFailure(__FILE__, __LINE__, "setLevel change flag mismatch at step " + std::to_string(step));
+        }
+        if (step % 97 == 0) compare();
+    }
+    compare();
+    CHECK_EQ(mismatches, 0);
+}
+
+TEST_CASE("orderbook: every insert/update/erase position on books of 0..20 levels matches std::map") {
+    // 覆盖尾部快路径、顶部顺序查找（8 档）与二分查找三段之间的所有边界
+    for (int size = 0; size <= 20; ++size) {
+        for (int target = -1; target <= 2 * size + 1; ++target) {   // 偶数位置 = 已有档位，奇数 = 两档之间
+            for (int op = 0; op < 3; ++op) {                      // 0 改量/插入, 1 删除, 2 数量不变
+                for (BookSide side : {BookSide::Bid, BookSide::Ask}) {
+                    const bool bid = side == BookSide::Bid;
+                    OrderBook b;
+                    std::map<double, double> ref;  // 价格 -> 数量
+                    for (int k = 0; k < size; ++k) {
+                        const double p = bid ? 1000.0 - 2.0 * k : 1000.0 + 2.0 * k;  // 最优在前
+                        b.setLevel(side, p, 1.0 + k);
+                        ref[p] = 1.0 + k;
+                    }
+                    const double p = bid ? 1001.0 - static_cast<double>(target) : 999.0 + static_cast<double>(target);
+                    const double q = op == 0 ? 77.0 : op == 1 ? 0.0 : (ref.count(p) ? ref[p] : 5.0);
+                    const bool existed = ref.count(p) != 0;
+                    const bool expect_change = op == 1 ? existed : !(existed && ref[p] == q);
+                    if (q > 0) ref[p] = q; else ref.erase(p);
+                    const bool changed = b.setLevel(side, p, q);
+                    std::vector<PriceLevel> expected;
+                    for (const auto& kv : ref) expected.push_back({kv.first, kv.second});
+                    if (bid) std::reverse(expected.begin(), expected.end());
+                    const std::vector<PriceLevel>& got = b.levels(side);
+                    bool same = got.size() == expected.size() && changed == expect_change && b.validate();
+                    for (std::size_t i = 0; same && i < got.size(); ++i) {
+                        same = got[i].price == expected[i].price && got[i].quantity == expected[i].quantity;
+                    }
+                    if (!same) {
+                        FAIL("size " + std::to_string(size) + " target " + std::to_string(target) + " op " +
+                             std::to_string(op) + (bid ? " bid" : " ask"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("orderbook: assignLevels bulk-copies sorted input and sanitizes anything else") {
+    OrderBook b;
+    b.updateBid(5.0, 1.0);
+    const PriceLevel sorted_bids[] = {{100.0, 1.0}, {99.5, 2.0}, {99.0, 3.0}};
+    CHECK(b.assignLevels(BookSide::Bid, sorted_bids, 3));
+    REQUIRE_EQ(b.getBidCount(), 3);
+    CHECK_EQ(b.getBids()[2].price, 99.0);
+    const PriceLevel sorted_asks[] = {{101.0, 1.0}, {102.0, 2.0}};
+    CHECK(b.assignLevels(BookSide::Ask, sorted_asks, 2));
+    CHECK_EQ(b.getAskCount(), 2);
+    CHECK(b.assignLevels(BookSide::Ask, sorted_asks, 0));  // 空
+    CHECK_EQ(b.getAskCount(), 0);
+    // 乱序、重复、非正数量、NaN：退化为逐档 upsert
+    const PriceLevel messy[] = {{99.0, 1.0}, {100.0, 2.0}, {99.0, 4.0}, {98.0, 0.0},
+                                {std::numeric_limits<double>::quiet_NaN(), 1.0}, {97.0, -1.0}};
+    CHECK(!b.assignLevels(BookSide::Bid, messy, 6));
+    REQUIRE_EQ(b.getBidCount(), 2);
+    CHECK_EQ(b.getBids()[0].price, 100.0);
+    CHECK_EQ(b.getBids()[1].quantity, 4.0);  // 重复价格以后出现者为准
+    CHECK(b.validate());
+    const PriceLevel wrong_order_asks[] = {{102.0, 1.0}, {101.0, 1.0}};
+    CHECK(!b.assignLevels(BookSide::Ask, wrong_order_asks, 2));
+    CHECK_EQ(b.getAsks()[0].price, 101.0);
+    CHECK(b.validate());
+}
+
+TEST_CASE("orderbook: garbage input through the public API always leaves a valid book") {
+    std::mt19937_64 rng(99);
+    const double specials[] = {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                               -std::numeric_limits<double>::infinity(), -0.0, 0.0, -5.0, 1e308, 5e-324};
+    OrderBook b;
+    for (int i = 0; i < 50000; ++i) {
+        const double price = (rng() % 8 == 0) ? specials[rng() % 8] : static_cast<double>(rng() % 50);
+        const double qty = (rng() % 6 == 0) ? specials[rng() % 8] : static_cast<double>(rng() % 5);
+        b.setLevel((rng() & 1u) ? BookSide::Bid : BookSide::Ask, price, qty);
+    }
+    std::string why;
+    CHECK(b.validate(&why));
+    CHECK(why.empty());
+}
+
+// ============================================================================
+// BookSnapshot
+// ============================================================================
+
+TEST_CASE("snapshot: assignFrom/copyTo round trip keeps the top levels and the update id") {
+    OrderBook src("Binance:BTCUSDT");
+    for (int i = 0; i < 30; ++i) {
+        src.updateBid(65000.0 - 0.5 * i, 0.1 + i);
+        src.updateAsk(65000.5 + 0.5 * i, 0.2 + i);
+    }
+    src.setUpdateId(777);
+    BookSnapshot s;
+    s.venue = 3;
+    s.seq = 9;
+    s.recv_ns = 11;
+    s.assignFrom(src);
+    CHECK_EQ(s.bid_count, 20u);
+    CHECK_EQ(s.ask_count, 20u);
+    CHECK_EQ(s.update_id, 777u);
+    CHECK_EQ(s.venue, 3u);  // assignFrom 只写档位与 update id
+    CHECK_EQ(s.seq, 9u);
+    CHECK_EQ(s.recv_ns, 11);
+    for (int i = 0; i < 20; ++i) {
+        CHECK_EQ(s.bids[i].price, src.getBids()[i].price);
+        CHECK_EQ(s.bids[i].quantity, src.getBids()[i].quantity);
+        CHECK_EQ(s.asks[i].price, src.getAsks()[i].price);
+        CHECK_EQ(s.asks[i].quantity, src.getAsks()[i].quantity);
+    }
+    OrderBook dst("OKX:BTCUSDT");
+    dst.updateBid(1.0, 1.0);  // 旧内容必须被替换
+    dst.updateAsk(99999.0, 1.0);
+    s.copyTo(dst);
+    REQUIRE_EQ(dst.getBidCount(), 20);
+    REQUIRE_EQ(dst.getAskCount(), 20);
+    for (int i = 0; i < 20; ++i) {
+        CHECK_EQ(dst.getBids()[i].price, src.getBids()[i].price);
+        CHECK_EQ(dst.getAsks()[i].quantity, src.getAsks()[i].quantity);
+    }
+    CHECK_EQ(dst.getUpdateId(), 777u);
+    CHECK_EQ(dst.getSymbol(), std::string("OKX:BTCUSDT"));
+}
+
+TEST_CASE("snapshot: the levels argument is clamped to [0, kMaxLevels]") {
+    OrderBook src;
+    for (int i = 0; i < 25; ++i) {
+        src.updateBid(100.0 - i, 1.0);
+        src.updateAsk(101.0 + i, 1.0);
+    }
+    BookSnapshot s;
+    s.assignFrom(src, 5);
+    CHECK_EQ(s.bid_count, 5u);
+    CHECK_EQ(s.ask_count, 5u);
+    s.assignFrom(src, 0);
+    CHECK_EQ(s.bid_count, 0u);
+    s.assignFrom(src, -3);
+    CHECK_EQ(s.ask_count, 0u);
+    s.assignFrom(src, 1000);
+    CHECK_EQ(s.bid_count, static_cast<std::uint32_t>(BookSnapshot::kMaxLevels));
+    OrderBook small;
+    small.updateBid(1.0, 1.0);
+    s.assignFrom(small);
+    CHECK_EQ(s.bid_count, 1u);
+    CHECK_EQ(s.ask_count, 0u);
+    OrderBook out;
+    s.copyTo(out);
+    CHECK_EQ(out.getBidCount(), 1);
+    CHECK_EQ(out.getAskCount(), 0);
+}
+
+TEST_CASE("snapshot: copyTo sanitizes corrupt snapshots") {
+    BookSnapshot s;
+    s.bid_count = 1000;  // 越界计数被钳制
+    s.ask_count = 7;
+    for (int i = 0; i < BookSnapshot::kMaxLevels; ++i) {
+        s.bids[i] = {static_cast<double>((i * 7) % 5), (i % 3 == 0) ? -1.0 : 1.0};  // 乱序、重复、负数量
+        s.asks[i] = {std::numeric_limits<double>::quiet_NaN(), 1.0};
+    }
+    s.asks[3] = {50.0, 2.0};
+    OrderBook out;
+    s.copyTo(out);
+    std::string why;
+    CHECK(out.validate(&why));
+    CHECK_LE(out.getBidCount(), BookSnapshot::kMaxLevels);
+    CHECK_EQ(out.getAskCount(), 1);
+}
+
+TEST_CASE("snapshot: trivially copyable value travels through hft::SpscQueue") {
+    static_assert(std::is_trivially_copyable_v<BookSnapshot>, "BookSnapshot must be trivially copyable");
+    hft::SpscQueue<BookSnapshot> q(4);
+    OrderBook src;
+    for (int i = 0; i < 20; ++i) {
+        src.updateBid(500.0 - i, 1.0 + i);
+        src.updateAsk(501.0 + i, 2.0 + i);
+    }
+    for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+        BookSnapshot s;
+        s.venue = 2;
+        s.seq = seq;
+        s.assignFrom(src, static_cast<int>(seq) * 5);
+        CHECK(q.tryPush(s));
+    }
+    for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+        BookSnapshot s;
+        REQUIRE(q.tryPop(s));
+        CHECK_EQ(s.seq, seq);
+        CHECK_EQ(s.bid_count, static_cast<std::uint32_t>(seq * 5));
+        CHECK_EQ(s.bids[0].price, 500.0);
+    }
+    BookSnapshot a;
+    a.assignFrom(src);
+    BookSnapshot b;
+    std::memcpy(static_cast<void*>(&b), &a, sizeof(BookSnapshot));
+    CHECK_EQ(b.asks[19].price, a.asks[19].price);
+}
+
+// ============================================================================
+// CRC32
+// ============================================================================
+
+TEST_CASE("crc32: standard check values") {
+    CHECK_EQ(hft::crc32("123456789", 9), 0xCBF43926u);
+    CHECK_EQ(hft::crc32(std::string_view("123456789")), 0xCBF43926u);
+    CHECK_EQ(hft::crc32("", 0), 0u);
+    CHECK_EQ(hft::crc32(std::string_view("a")), 0xE8B7BE43u);
+    CHECK_EQ(hft::crc32(std::string_view("The quick brown fox jumps over the lazy dog")), 0x414FA339u);
+    CHECK_EQ(hft::crc32Signed("123456789"), asSigned(0xCBF43926u));
+}
+
+TEST_CASE("crc32: OKX documentation example vector") {
+    const std::string doc = "3366.1:7:3366.8:9:3366:6:3368:8";
+    CHECK_EQ(hft::crc32(doc), 2413953002u);
+    CHECK_EQ(hft::crc32Signed(doc), -1881014294);
+    CHECK_EQ(bitwiseCrc32(doc), 2413953002u);
+    // 文档的两个拼接规则示例：交错，以及一侧不足时继续拼另一侧
+    const Levels bids1 = {{"3366.1", "7"}, {"3366", "6"}};
+    const Levels asks1 = {{"3366.8", "9"}, {"3368", "8"}};
+    CHECK_EQ(okxChecksumString(bids1, asks1), doc);
+    const Levels bids2 = {{"3366.1", "7"}};
+    const Levels asks2 = {{"3366.8", "9"}, {"3368", "8"}, {"3372", "8"}};
+    CHECK_EQ(okxChecksumString(bids2, asks2), std::string("3366.1:7:3366.8:9:3368:8:3372:8"));
+}
+
+TEST_CASE("crc32: slicing-by-8 matches a bitwise reference for all lengths and alignments") {
+    std::mt19937_64 rng(5);
+    std::vector<unsigned char> buf(4096 + 16);
+    for (auto& c : buf) c = static_cast<unsigned char>(rng());
+    for (std::size_t offset = 0; offset < 8; ++offset) {
+        for (std::size_t len = 0; len <= 300; ++len) {
+            const std::string_view sv(reinterpret_cast<const char*>(buf.data() + offset), len);
+            if (hft::crc32(sv.data(), sv.size()) != bitwiseCrc32(sv)) {
+                FAIL("crc mismatch at offset " + std::to_string(offset) + " len " + std::to_string(len));
+            }
+        }
+    }
+    const std::string_view big(reinterpret_cast<const char*>(buf.data() + 3), 4096);
+    CHECK_EQ(hft::crc32(big), bitwiseCrc32(big));
+}
+
+TEST_CASE("crc32: seed chaining equals the CRC of the concatenation") {
+    std::mt19937_64 rng(11);
+    for (int iter = 0; iter < 500; ++iter) {
+        std::string s(static_cast<std::size_t>(rng() % 200), '\0');
+        for (auto& c : s) c = static_cast<char>(rng());
+        const std::size_t cut = s.empty() ? 0 : static_cast<std::size_t>(rng() % (s.size() + 1));
+        const std::uint32_t head = hft::crc32(s.data(), cut);
+        CHECK_EQ(hft::crc32(s.data() + cut, s.size() - cut, head), hft::crc32(s));
+    }
+}
+
+TEST_CASE("crc32: toSignedCrc is the two's complement reinterpretation") {
+    static_assert(hft::toSignedCrc(0u) == 0);
+    static_assert(hft::toSignedCrc(0x7FFFFFFFu) == 2147483647);
+    static_assert(hft::toSignedCrc(0x80000000u) == std::numeric_limits<std::int32_t>::min());
+    static_assert(hft::toSignedCrc(0xFFFFFFFFu) == -1);
+    std::mt19937_64 rng(3);
+    for (int i = 0; i < 1000; ++i) {
+        const auto u = static_cast<std::uint32_t>(rng());
+        CHECK_EQ(hft::toSignedCrc(u), asSigned(u));
+    }
+}
+
+// ============================================================================
+// 十进制解析快路径：必须与 std::from_chars 逐位一致
+// ============================================================================
+
+// 参考实现：std::from_chars + 整串消费 + 有限值
+bool referenceDecimal(std::string_view s, double& out) {
+    if (s.empty()) return false;
+    const auto res = std::from_chars(s.data(), s.data() + s.size(), out);
+    return res.ec == std::errc() && res.ptr == s.data() + s.size() && std::isfinite(out);
+}
+
+void checkDecimal(const std::string& s, int& mismatches) {
+    double fast = -12345.0, ref = -12345.0;
+    const bool ok_fast = adapter_detail::parseDecimal(s, fast);
+    const bool ok_ref = referenceDecimal(s, ref);
+    if (ok_fast != ok_ref || (ok_ref && std::memcmp(&fast, &ref, sizeof(double)) != 0)) {
+        if (++mismatches <= 5) {
+            ::hft_test::reportFailure(__FILE__, __LINE__, "parseDecimal differs from from_chars for \"" + s + "\"");
+        }
+    }
+}
+
+TEST_CASE("decimal: fast path is bit-identical to std::from_chars on random exchange-style numbers (3M strings)") {
+    std::mt19937_64 rng(31337);
+    int mismatches = 0;
+    std::string s;
+    for (int i = 0; i < 3000000; ++i) {
+        s.clear();
+        const int int_digits = static_cast<int>(rng() % 21);       // 0..20 位整数部分
+        const int frac_digits = static_cast<int>(rng() % 26) - 1;  // -1 = 无小数点，0 = "1." 形式
+        if (rng() % 16 == 0) s += '0';                             // 前导 0
+        for (int d = 0; d < int_digits; ++d) s += static_cast<char>('0' + rng() % 10);
+        if (frac_digits >= 0) {
+            s += '.';
+            for (int d = 0; d < frac_digits; ++d) s += static_cast<char>('0' + rng() % 10);
+            if (rng() % 4 == 0) s.append(static_cast<std::size_t>(rng() % 6), '0');  // 尾随 0
+        }
+        checkDecimal(s, mismatches);
+    }
+    // 2^53 附近与快路径边界
+    for (std::uint64_t m = (std::uint64_t{1} << 53) - 2000; m < (std::uint64_t{1} << 53) + 2000; ++m) {
+        const std::string digits = std::to_string(m);
+        checkDecimal(digits, mismatches);
+        for (std::size_t k = 1; k < digits.size(); k += 3) {
+            checkDecimal(digits.substr(0, digits.size() - k) + "." + digits.substr(digits.size() - k), mismatches);
+        }
+        checkDecimal("0." + digits, mismatches);
+    }
+    for (const char* edge : {"0", "00", "0.0", "-0", "-0.0", "1.", ".5", "1e5", "1E-3", "+1", "-1", "inf", "nan",
+                             "infinity", "0x1p3", "", " 1", "1 ", "1.2.3", "1..2", "1e", "1e400", "1e-400",
+                             "123456789012345678901234567890", "0.1234567890123456789012345", "9007199254740993",
+                             "4.9406564584124654e-324", "65000.12", "0.00000001", "0.10000000", "3366.1"}) {
+        checkDecimal(edge, mismatches);
+    }
+    CHECK_EQ(mismatches, 0);
+}
+
+// ============================================================================
+// 适配器公共
+// ============================================================================
+
+TEST_CASE("adapters: factory, names, ping settings and the moved Exchange enum") {
+    CHECK_EQ(std::string(exchangeName(Exchange::BINANCE)), std::string("Binance"));
+    CHECK_EQ(std::string(exchangeName(Exchange::OKX)), std::string("OKX"));
+    CHECK_EQ(std::string(exchangeName(Exchange::BYBIT)), std::string("Bybit"));
+    CHECK_EQ(std::string(exchangeName(static_cast<Exchange>(42))), std::string("Unknown"));
+    CHECK(makeAdapter(static_cast<Exchange>(42), AdapterConfig{}) == nullptr);
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        auto a = makeAdapter(ex, makeConfig(ex));
+        REQUIRE(a != nullptr);
+        CHECK(a->exchange() == ex);
+        CHECK(!a->synced());
+        CHECK(a->book().empty());
+        CHECK_EQ(a->book().getSymbol(), std::string(exchangeName(ex)) + ":BTCUSDT");
+        const std::vector<std::string> frames = a->onConnected();
+        if (ex == Exchange::BINANCE) {
+            CHECK(frames.empty());  // 通过 URL 路径订阅
+            CHECK_EQ(a->pingIntervalMs(), 0);
+            CHECK(a->pingMessage().empty());
+        } else {
+            REQUIRE_EQ(frames.size(), 1u);
+            CHECK_EQ(frames[0], a->config().subscribe_msg);
+            CHECK_EQ(a->pingIntervalMs(), 20000);
+        }
+        // 默认 onRestSnapshot（OKX/Bybit）为空操作
+        if (ex != Exchange::BINANCE) {
+            const AdapterResult r = restSnapshot(*a, "{}");
+            CHECK(!r.book_updated && !r.need_rest_snapshot && !r.reconnect && r.error.empty());
+        }
+    }
+    auto okx = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    CHECK_EQ(okx->pingMessage(), std::string("ping"));
+    auto bybit = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    CHECK_EQ(bybit->pingMessage(), std::string(R"({"op":"ping"})"));
+    AdapterConfig with_sub = makeConfig(Exchange::BINANCE);
+    with_sub.subscribe_msg = R"({"method":"SUBSCRIBE","params":["btcusdt@depth"],"id":1})";
+    auto binance = makeAdapter(Exchange::BINANCE, with_sub);
+    const std::vector<std::string> frames = binance->onConnected();
+    REQUIRE_EQ(frames.size(), 1u);
+    CHECK_EQ(frames[0], with_sub.subscribe_msg);
+}
+
+TEST_CASE("adapters: AdapterResult::reset clears every field") {
+    AdapterResult r;
+    r.book_updated = r.need_rest_snapshot = r.reconnect = true;
+    r.send = {"a", "b"};
+    r.exchange_ts_ms = 5;
+    r.error = "x";
+    r.reset();
+    CHECK(!r.book_updated && !r.need_rest_snapshot && !r.reconnect);
+    CHECK(r.send.empty());
+    CHECK_EQ(r.exchange_ts_ms, 0);
+    CHECK(r.error.empty());
+}
+
+TEST_CASE("adapters: unsubscribe message derivation") {
+    CHECK_EQ(makeUnsubscribeMessage(kOkxSubscribe), std::string(kOkxUnsubscribe));
+    CHECK_EQ(makeUnsubscribeMessage(kBybitSubscribe), std::string(kBybitUnsubscribe));
+    CHECK_EQ(makeUnsubscribeMessage(R"({ "op" : "subscribe", "args":["x"]})"),
+             std::string(R"({ "op" : "unsubscribe", "args":["x"]})"));
+    CHECK_EQ(makeUnsubscribeMessage(R"({"args":["op"],"op":"subscribe"})"),
+             std::string(R"({"args":["op"],"op":"unsubscribe"})"));
+    CHECK(makeUnsubscribeMessage(R"({"method":"SUBSCRIBE","params":["btcusdt@depth"]})").empty());
+    CHECK(makeUnsubscribeMessage(R"({"op":"login"})").empty());
+    CHECK(makeUnsubscribeMessage("").empty());
+    CHECK(makeUnsubscribeMessage(R"({"op")").empty());
+    CHECK(makeUnsubscribeMessage(R"({"op":)").empty());
+}
+
+// ============================================================================
+// Binance
+// ============================================================================
+
+const Levels kBinBids = {{"65000.10", "0.50000000"}, {"65000.00", "1.25000000"}, {"64999.50", "2.00000000"}};
+const Levels kBinAsks = {{"65000.20", "0.40000000"}, {"65000.30", "0.10000000"}, {"65001.00", "3.00000000"}};
+
+TEST_CASE("binance: partial depth snapshot replaces the book") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    // 文档示例
+    AdapterResult r = feed(*a, R"({"lastUpdateId":160,"bids":[["0.0024","10"]],"asks":[["0.0026","100"]]})");
+    CHECK(r.book_updated);
+    CHECK(!r.need_rest_snapshot && !r.reconnect && r.error.empty());
+    CHECK_EQ(r.exchange_ts_ms, 0);
+    CHECK(a->synced());
+    CHECK_BOOK(a->book(), Levels({{"0.0024", "10"}}), Levels({{"0.0026", "100"}}));
+    CHECK_EQ(a->book().getUpdateId(), 160u);
+    // 第二个快照完全替换；数量为 0 的档位被跳过
+    Levels bids = kBinBids;
+    bids.push_back({"64999.00", "0.00000000"});
+    r = feed(*a, binanceDepth(161, bids, kBinAsks));
+    CHECK(r.book_updated);
+    CHECK_BOOK(a->book(), kBinBids, kBinAsks);
+    CHECK_EQ(a->book().getUpdateId(), 161u);
+    // 比当前更旧的快照被忽略
+    r = feed(*a, binanceDepth(150, kBinBids, Levels({{"70000.00", "1"}})));
+    CHECK(!r.book_updated);
+    CHECK_BOOK(a->book(), kBinBids, kBinAsks);
+    // 空数组是合法快照（空簿）
+    r = feed(*a, binanceDepth(170, {}, {}));
+    CHECK(r.book_updated);
+    CHECK(a->book().empty());
+    const AdapterStats& st = a->stats();
+    CHECK_EQ(st.messages, 4u);
+    CHECK_EQ(st.snapshots, 3u);
+    CHECK_EQ(st.ignored, 1u);
+    CHECK_EQ(st.book_updates, 3u);
+    CHECK_EQ(st.parse_errors, 0u);
+}
+
+TEST_CASE("binance: combined stream wrapper for partial depth and diff events") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    AdapterResult r = feed(*a, binanceCombined("btcusdt@depth20@100ms", binanceDepth(100, kBinBids, kBinAsks)));
+    CHECK(r.book_updated);
+    CHECK_BOOK(a->book(), kBinBids, kBinAsks);
+    // "data" 在 "stream" 之前也可以
+    r = feed(*a, "{\"data\":" + binanceDiff(101, 102, {{"65000.10", "0.7"}}, {}, 1700000000123) +
+                     ",\"stream\":\"btcusdt@depth@100ms\"}");
+    CHECK(r.book_updated);
+    CHECK_EQ(r.exchange_ts_ms, 1700000000123);
+    CHECK_EQ(a->book().getBids()[0].quantity, 0.7);
+    CHECK_EQ(a->book().getUpdateId(), 102u);
+    // 嵌套两层包装不是 Binance 的格式
+    r = feed(*a, binanceCombined("x", binanceCombined("y", binanceDepth(200, kBinBids, kBinAsks))));
+    CHECK(!r.book_updated);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    CHECK_EQ(a->stats().ignored, 1u);
+}
+
+// Binance 增量深度：同步前缓冲 + REST 快照
+TEST_CASE("binance: diff events are buffered before sync and a snapshot is requested once per attempt") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    AdapterResult r = feed(*a, binanceDiff(157, 160, {{"0.0024", "10"}}, {{"0.0026", "100"}}));  // 文档示例
+    CHECK(r.need_rest_snapshot);
+    CHECK(!r.book_updated);
+    CHECK_EQ(r.exchange_ts_ms, 1672515782136);
+    CHECK(!a->synced());
+    CHECK(bin.awaitingSnapshot());
+    for (std::uint64_t id = 161; id < 166; ++id) {
+        r = feed(*a, binanceDiff(id, id, {{"0.0024", std::to_string(id)}}, {}));
+        CHECK(!r.need_rest_snapshot);  // 同一轮尝试只请求一次
+        CHECK(!r.book_updated);
+    }
+    CHECK_EQ(bin.bufferedEvents(), 6u);
+    CHECK_EQ(bin.firstBufferedId(), 157u);
+    CHECK(a->book().empty());
+}
+
+TEST_CASE("binance: REST snapshot drops buffered events with u <= lastUpdateId and applies the rest") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(100, 103, {{"65000.10", "9"}}, {}));        // u <= L：丢弃
+    feed(*a, binanceDiff(104, 108, {{"65000.00", "0"}}, {{"65000.20", "0.5"}}));  // 跨过 L：应用
+    feed(*a, binanceDiff(109, 110, {{"64999.00", "4"}}, {}));       // 应用
+    AdapterResult r = restSnapshot(*a, binanceDepth(105, kBinBids, kBinAsks));
+    CHECK(r.book_updated);
+    CHECK(!r.need_rest_snapshot);
+    CHECK(r.error.empty());
+    CHECK(a->synced());
+    CHECK(!bin.awaitingSnapshot());
+    CHECK_EQ(bin.bufferedEvents(), 0u);
+    CHECK_EQ(bin.lastUpdateId(), 110u);
+    CHECK_EQ(a->book().getUpdateId(), 110u);
+    const Levels bids = {{"65000.10", "0.5"}, {"64999.50", "2"}, {"64999.00", "4"}};
+    const Levels asks = {{"65000.20", "0.5"}, {"65000.30", "0.1"}, {"65001.00", "3"}};
+    CHECK_BOOK(a->book(), bids, asks);
+    const AdapterStats& st = a->stats();
+    CHECK_EQ(st.rest_snapshots, 1u);
+    CHECK_EQ(st.snapshots, 1u);
+    CHECK_EQ(st.deltas, 2u);
+    CHECK_EQ(st.ignored, 1u);
+    CHECK_EQ(st.gaps, 0u);
+    // 之后的实时事件按更新规则继续
+    r = feed(*a, binanceDiff(111, 111, {{"65000.10", "0.6"}}, {}));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->book().getBids()[0].quantity, 0.6);
+}
+
+TEST_CASE("binance: snapshot older than the first buffered event is fetched again") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(100, 102, {{"65000.10", "1"}}, {}));
+    feed(*a, binanceDiff(103, 104, {{"65000.10", "2"}}, {}));
+    AdapterResult r = restSnapshot(*a, binanceDepth(99, kBinBids, kBinAsks));  // L < 第一条 U
+    CHECK(r.need_rest_snapshot);
+    CHECK(!r.book_updated);
+    CHECK(contains(r.error, "too old"));
+    CHECK(!a->synced());
+    CHECK(bin.awaitingSnapshot());
+    CHECK_EQ(bin.bufferedEvents(), 2u);  // 缓冲保留
+    CHECK_EQ(a->stats().rest_snapshots, 1u);
+    // 期间继续缓冲，不会重复请求
+    r = feed(*a, binanceDiff(105, 105, {{"65000.00", "7"}}, {}));
+    CHECK(!r.need_rest_snapshot);
+    // L == U - 1 同样"太旧"（文档：strictly less than U）
+    r = restSnapshot(*a, binanceDepth(99, kBinBids, kBinAsks));
+    CHECK(r.need_rest_snapshot);
+    // L == U：第一条事件跨过 L
+    r = restSnapshot(*a, binanceDepth(100, kBinBids, kBinAsks));
+    CHECK(r.book_updated);
+    CHECK(a->synced());
+    CHECK_EQ(bin.lastUpdateId(), 105u);
+    CHECK_EQ(a->book().getBids()[0].quantity, 2.0);
+    CHECK_EQ(a->book().getBids()[1].quantity, 7.0);
+    CHECK_EQ(a->stats().rest_snapshots, 3u);
+    CHECK_EQ(a->stats().snapshots, 1u);
+}
+
+TEST_CASE("binance: the first applied event satisfies U <= L+1 <= u (straddle and exact boundary)") {
+    for (std::uint64_t L : {109u, 110u, 111u, 113u}) {
+        auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+        auto& bin = static_cast<BinanceAdapter&>(*a);
+        a->onConnected();
+        feed(*a, binanceDiff(105, 109, {{"65000.10", "1"}}, {}));
+        feed(*a, binanceDiff(110, 113, {{"65000.10", "2"}}, {}));
+        feed(*a, binanceDiff(114, 120, {{"65000.10", "3"}}, {}));
+        const AdapterResult r = restSnapshot(*a, binanceDepth(L, kBinBids, kBinAsks));
+        CHECK(r.book_updated);
+        CHECK(a->synced());
+        CHECK_EQ(bin.lastUpdateId(), 120u);
+        CHECK_EQ(a->book().getBids()[0].quantity, 3.0);
+        CHECK_EQ(a->stats().gaps, 0u);
+        const std::uint64_t dropped = L >= 113 ? 2u : 1u;
+        CHECK_EQ(a->stats().ignored, dropped);
+        CHECK_EQ(a->stats().deltas, 3u - dropped);
+    }
+}
+
+TEST_CASE("binance: stale events after sync are ignored") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    feed(*a, binanceDiff(10, 10, {}, {}));
+    restSnapshot(*a, binanceDepth(20, kBinBids, kBinAsks));
+    REQUIRE(a->synced());
+    AdapterResult r = feed(*a, binanceDiff(15, 20, {{"65000.10", "99"}}, {}));  // u == L
+    CHECK(!r.book_updated);
+    r = feed(*a, binanceDiff(12, 13, {{"65000.10", "99"}}, {}));
+    CHECK(!r.book_updated);
+    CHECK_BOOK(a->book(), kBinBids, kBinAsks);
+    CHECK_EQ(a->stats().ignored, 3u);  // 含快照时丢弃的缓冲事件
+    CHECK_EQ(a->stats().gaps, 0u);
+    r = feed(*a, binanceDiff(21, 21, {{"65000.10", "1"}}, {}));
+    CHECK(r.book_updated);
+    // 只改变"已有数量相同"的档位、删除不存在的档位：簿不变 → book_updated = false
+    r = feed(*a, binanceDiff(22, 22, {{"65000.10", "1"}, {"60000.00", "0"}}, {}));
+    CHECK(!r.book_updated);
+    CHECK_EQ(a->book().getUpdateId(), 22u);
+}
+
+TEST_CASE("binance: a gap after sync clears the book and resyncs with the gap event buffered") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(100, 100, {}, {}));
+    restSnapshot(*a, binanceDepth(105, kBinBids, kBinAsks));
+    feed(*a, binanceDiff(106, 110, {{"65000.10", "1"}}, {}));
+    REQUIRE(a->synced());
+    AdapterResult r = feed(*a, binanceDiff(112, 115, {{"65000.00", "5"}}, {}));  // 缺 111
+    CHECK(r.need_rest_snapshot);
+    CHECK(r.book_updated);  // 清空可见的簿
+    CHECK(contains(r.error, "gap"));
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(bin.bufferedEvents(), 1u);
+    CHECK_EQ(bin.firstBufferedId(), 112u);
+    CHECK_EQ(a->stats().gaps, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    // 之后的事件继续缓冲
+    r = feed(*a, binanceDiff(116, 118, {}, {{"65000.20", "0"}}));
+    CHECK(!r.need_rest_snapshot);
+    // 新快照：L = 113 落在 [112, 115] 内
+    r = restSnapshot(*a, binanceDepth(113, kBinBids, kBinAsks));
+    CHECK(r.book_updated);
+    CHECK(a->synced());
+    CHECK_EQ(bin.lastUpdateId(), 118u);
+    const Levels bids = {{"65000.10", "0.5"}, {"65000.00", "5"}, {"64999.50", "2"}};
+    const Levels asks = {{"65000.30", "0.1"}, {"65001.00", "3"}};
+    CHECK_BOOK(a->book(), bids, asks);
+}
+
+TEST_CASE("binance: a gap inside the buffered events keeps the rest buffered and requests again") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(100, 103, {{"65000.10", "1"}}, {}));
+    feed(*a, binanceDiff(104, 106, {{"65000.10", "2"}}, {}));
+    feed(*a, binanceDiff(110, 112, {{"65000.10", "3"}}, {{"65000.20", "0.9"}}));  // 107..109 丢失
+    feed(*a, binanceDiff(113, 113, {{"65000.10", "4"}}, {}));
+    AdapterResult r = restSnapshot(*a, binanceDepth(101, kBinBids, kBinAsks));
+    CHECK(r.need_rest_snapshot);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(bin.bufferedEvents(), 2u);
+    CHECK_EQ(bin.firstBufferedId(), 110u);
+    CHECK_EQ(a->stats().gaps, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    CHECK_EQ(a->stats().deltas, 2u);
+    // 保留下来的事件的档位必须仍然正确（前缀删除后重定位）
+    r = restSnapshot(*a, binanceDepth(111, kBinBids, kBinAsks));
+    CHECK(a->synced());
+    CHECK_EQ(bin.lastUpdateId(), 113u);
+    CHECK_EQ(a->book().getBids()[0].quantity, 4.0);
+    CHECK_EQ(a->book().getAsks()[0].quantity, 0.9);
+}
+
+TEST_CASE("binance: pre-sync buffer overflow drops the buffer, counts a gap and requests a fresh snapshot") {
+    AdapterConfig cfg = makeConfig(Exchange::BINANCE);
+    cfg.max_buffered_events = 3;
+    auto a = makeAdapter(Exchange::BINANCE, cfg);
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    AdapterResult r = feed(*a, binanceDiff(1, 1, {{"1.0", "1"}}, {}));
+    CHECK(r.need_rest_snapshot);
+    feed(*a, binanceDiff(2, 2, {{"1.0", "2"}}, {}));
+    r = feed(*a, binanceDiff(3, 3, {{"1.0", "3"}}, {}));
+    CHECK(!r.need_rest_snapshot);
+    CHECK_EQ(bin.bufferedEvents(), 3u);
+    r = feed(*a, binanceDiff(4, 4, {{"1.0", "4"}}, {}));
+    CHECK(r.need_rest_snapshot);  // 新一轮尝试
+    CHECK(contains(r.error, "overflow"));
+    CHECK_EQ(a->stats().gaps, 1u);
+    CHECK_EQ(bin.bufferedEvents(), 1u);
+    CHECK_EQ(bin.firstBufferedId(), 4u);
+    r = restSnapshot(*a, binanceDepth(3, {{"1.0", "3"}}, {{"2.0", "1"}}));  // 比新缓冲的第一条（U=4）旧
+    CHECK(r.need_rest_snapshot);
+    CHECK(!a->synced());
+    r = restSnapshot(*a, binanceDepth(4, {{"1.0", "4"}}, {{"2.0", "1"}}));
+    CHECK(a->synced());
+    CHECK_EQ(a->book().getBids()[0].quantity, 4.0);
+    // max_buffered_events = 0 视为 1
+    cfg.max_buffered_events = 0;
+    auto z = makeAdapter(Exchange::BINANCE, cfg);
+    z->onConnected();
+    feed(*z, binanceDiff(1, 1, {}, {}));
+    r = feed(*z, binanceDiff(2, 2, {}, {}));
+    CHECK(r.need_rest_snapshot);
+    CHECK_EQ(static_cast<BinanceAdapter&>(*z).bufferedEvents(), 1u);
+}
+
+TEST_CASE("binance: REST error body, non-JSON and empty bodies request the snapshot again") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(10, 12, {{"65000.10", "1"}}, {}));
+    AdapterResult r = restSnapshot(*a, R"({"code":-1121,"msg":"Invalid symbol."})");
+    CHECK(r.need_rest_snapshot);
+    CHECK(contains(r.error, "-1121"));
+    CHECK(contains(r.error, "Invalid symbol."));
+    CHECK(!r.book_updated);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    for (const char* body : {"<html><body>502 Bad Gateway</body></html>", "", "{\"lastUpdateId\":5",
+                             "{\"lastUpdateId\":5,\"bids\":[]}", "[]", "null",
+                             "{\"lastUpdateId\":-5,\"bids\":[],\"asks\":[]}"}) {
+        r = restSnapshot(*a, body);
+        CHECK(r.need_rest_snapshot);
+        CHECK(!r.error.empty());
+        CHECK(!r.book_updated);
+    }
+    CHECK_EQ(a->stats().parse_errors, 7u);
+    CHECK_EQ(a->stats().rest_snapshots, 0u);
+    CHECK(bin.awaitingSnapshot());
+    CHECK_EQ(bin.bufferedEvents(), 1u);
+    r = restSnapshot(*a, binanceDepth(11, kBinBids, kBinAsks));
+    CHECK(a->synced());
+}
+
+TEST_CASE("binance: unrequested REST snapshots are ignored") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    AdapterResult r = restSnapshot(*a, binanceDepth(5, kBinBids, kBinAsks));  // 还没有缓冲任何事件
+    CHECK(!r.book_updated && !r.need_rest_snapshot);
+    CHECK(a->book().empty());
+    feed(*a, binanceDepth(100, kBinBids, kBinAsks));
+    r = restSnapshot(*a, binanceDepth(200, {}, {}));  // 部分深度模式下已同步
+    CHECK(!r.book_updated);
+    CHECK_BOOK(a->book(), kBinBids, kBinAsks);
+    CHECK_EQ(a->stats().ignored, 2u);
+}
+
+TEST_CASE("binance: serverShutdown requests a reconnect (raw and combined)") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    AdapterResult r = feed(*a, R"({"e":"serverShutdown","E":1770123456789})");
+    CHECK(r.reconnect);
+    CHECK(!r.book_updated);
+    r = feed(*a, R"({"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1770123456789}})");
+    CHECK(r.reconnect);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+}
+
+TEST_CASE("binance: subscription responses, API errors and unrelated events are ignored") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    for (const char* msg : {R"({"result":null,"id":1})", R"({"result":["btcusdt@depth"],"id":3})",
+                            R"({"result":true,"id":2})", R"({})",
+                            R"({"e":"trade","E":1,"s":"BTCUSDT","t":12345,"p":"0.001","q":"100"})"}) {
+        const AdapterResult r = feed(*a, msg);
+        CHECK(!r.book_updated && !r.need_rest_snapshot && !r.reconnect);
+        CHECK(r.error.empty());
+    }
+    const AdapterResult r = feed(*a, R"({"code":2,"msg":"Invalid request: unknown variant","id":7})");
+    CHECK(contains(r.error, "Invalid request"));
+    CHECK_EQ(a->stats().ignored, 6u);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    CHECK(a->book().empty());
+}
+
+TEST_CASE("binance: a crossed book after an update or snapshot triggers a resync") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(1, 1, {}, {}));
+    restSnapshot(*a, binanceDepth(1, kBinBids, kBinAsks));
+    REQUIRE(a->synced());
+    AdapterResult r = feed(*a, binanceDiff(2, 2, {{"65000.25", "1"}}, {}));  // 买一 > 卖一 65000.20
+    CHECK(r.need_rest_snapshot);
+    CHECK(r.book_updated);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(a->stats().crossed_books, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    CHECK_EQ(bin.bufferedEvents(), 1u);
+    // 交叉的 REST 快照：不采用，继续请求（缓冲保留）
+    r = restSnapshot(*a, binanceDepth(2, {{"100", "1"}}, {{"99", "1"}}));
+    CHECK(r.need_rest_snapshot);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(a->stats().crossed_books, 2u);
+    CHECK_EQ(bin.bufferedEvents(), 1u);
+    // 交叉的部分深度快照被丢弃
+    auto p = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    p->onConnected();
+    feed(*p, binanceDepth(1, kBinBids, kBinAsks));
+    r = feed(*p, binanceDepth(2, {{"100", "1"}}, {{"99", "1"}}));
+    CHECK(r.book_updated);
+    CHECK(p->book().empty());
+    CHECK(!p->synced());
+    CHECK_EQ(p->stats().crossed_books, 1u);
+    r = feed(*p, binanceDepth(3, kBinBids, kBinAsks));
+    CHECK(p->synced());
+    CHECK_BOOK(p->book(), kBinBids, kBinAsks);
+}
+
+TEST_CASE("binance: onConnected resets protocol state but keeps statistics") {
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    auto& bin = static_cast<BinanceAdapter&>(*a);
+    a->onConnected();
+    feed(*a, binanceDiff(1, 5, {{"1", "1"}}, {}));
+    restSnapshot(*a, binanceDepth(3, {{"1", "2"}}, {{"2", "1"}}));
+    REQUIRE(a->synced());
+    a->onConnected();
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(bin.bufferedEvents(), 0u);
+    CHECK(!bin.awaitingSnapshot());
+    CHECK_EQ(bin.lastUpdateId(), 0u);
+    CHECK_EQ(a->stats().messages, 1u);
+    CHECK_EQ(a->stats().rest_snapshots, 1u);
+    // 新连接的第一条事件再次请求快照
+    const AdapterResult r = feed(*a, binanceDiff(50, 51, {}, {}));
+    CHECK(r.need_rest_snapshot);
+}
+
+// Binance 交易所模拟：逐个 update id 变化一档，事件 = 连续若干个 id 的聚合；可在任意 id 生成 REST 快照
+class BinanceSim {
+public:
+    explicit BinanceSim(std::uint64_t seed) : rng_(seed) {
+        for (std::int64_t t = 1; t <= 300; ++t) {
+            state_.bids[kMid - t] = {fixedTicks(kMid - t, 2), qty()};
+            state_.asks[kMid + t] = {fixedTicks(kMid + t, 2), qty()};
+        }
+        initial_ = state_;
+    }
+
+    struct Change {
+        bool bid;
+        std::int64_t tick;
+        std::string qty;  // "0.00000000" = 删除
+    };
+    struct Event {
+        std::uint64_t first, last;
+        std::string json;
+    };
+
+    // 生成下一条事件（同时推进交易所状态）
+    Event next() {
+        const std::size_t k = 1 + rng_() % 6;
+        std::map<std::pair<bool, std::int64_t>, std::string> agg;
+        const std::uint64_t first = id_ + 1;
+        for (std::size_t i = 0; i < k; ++i) {
+            const Change c = randomChange();
+            apply(state_, c);
+            changes_.push_back(c);
+            agg[{c.bid, c.tick}] = c.qty;
+            ++id_;
+        }
+        Levels b, a;
+        for (const auto& kv : agg) (kv.first.first ? b : a).push_back({fixedTicks(kv.first.second, 2), kv.second});
+        return {first, id_, binanceDiff(first, id_, b, a, 1700000000000 + static_cast<std::int64_t>(id_))};
+    }
+
+    // 只向前移动的回放游标：交易所在 id 时刻的簿
+    struct Cursor {
+        BookModel book;
+        std::uint64_t id;
+    };
+    Cursor start() const { return {initial_, kStartId}; }
+    void advance(Cursor& c, std::uint64_t id) const {
+        while (c.id < id && c.id < id_) {
+            apply(c.book, changes_[c.id - kStartId]);
+            ++c.id;
+        }
+    }
+
+    // 交易所在某个 update id 时的完整簿（REST 快照）
+    std::string snapshotAt(std::uint64_t id) const {
+        Cursor c = start();
+        advance(c, id);
+        return binanceDepth(c.id, c.book.bidLevels(), c.book.askLevels());
+    }
+
+    const BookModel& state() const { return state_; }
+    std::uint64_t id() const { return id_; }
+    static constexpr std::uint64_t kStartId = 1000;
+
+private:
+    static constexpr std::int64_t kMid = 6500000;  // 65000.00
+
+    std::string qty() { return fixedTicks(static_cast<std::int64_t>(1 + rng_() % 500000000), 8); }
+
+    Change randomChange() {
+        const bool bid = (rng_() & 1u) != 0;
+        auto& side = bid ? state_.bids : state_.asks;
+        const unsigned kind = static_cast<unsigned>(rng_() % 10);
+        if (kind < 4 && !side.empty()) {  // 改数量（偏向头部）
+            auto it = bid ? std::prev(side.end()) : side.begin();
+            const std::size_t skip = rng_() % std::min<std::size_t>(side.size(), 30);
+            for (std::size_t i = 0; i < skip; ++i) it = bid ? std::prev(it) : std::next(it);
+            return {bid, it->first, qty()};
+        }
+        if (kind < 7 && side.size() > 20) {  // 删除一档
+            auto it = side.begin();
+            std::advance(it, static_cast<std::ptrdiff_t>(rng_() % side.size()));
+            return {bid, it->first, "0.00000000"};
+        }
+        if (kind == 7) {  // 删除不存在的远端档位
+            return {bid, bid ? kMid - 5000 - static_cast<std::int64_t>(rng_() % 100)
+                             : kMid + 5000 + static_cast<std::int64_t>(rng_() % 100),
+                    "0.00000000"};
+        }
+        // 插入新档位：不越过对手方最优价（保持不交叉）
+        const std::int64_t best_bid = state_.bestBidTick();
+        const std::int64_t best_ask = state_.bestAskTick();
+        std::int64_t tick;
+        if (bid) {
+            tick = best_ask - 1 - static_cast<std::int64_t>(rng_() % 40);
+        } else {
+            tick = best_bid + 1 + static_cast<std::int64_t>(rng_() % 40);
+        }
+        return {bid, tick, qty()};
+    }
+
+    static void apply(BookModel& m, const Change& c) {
+        auto& side = c.bid ? m.bids : m.asks;
+        if (num(c.qty) > 0) {
+            side[c.tick] = {fixedTicks(c.tick, 2), c.qty};
+        } else {
+            side.erase(c.tick);
+        }
+    }
+
+    std::mt19937_64 rng_;
+    BookModel state_;
+    BookModel initial_;
+    std::vector<Change> changes_;
+    std::uint64_t id_ = kStartId;
+};
+
+TEST_CASE("binance: randomized diff stream with drops, stale and future snapshots tracks the exchange book") {
+    for (std::uint64_t seed : {1u, 2u, 3u}) {
+        BinanceSim sim(seed);
+        std::vector<BinanceSim::Event> events;
+        for (int i = 0; i < 1500; ++i) events.push_back(sim.next());  // 预先生成：REST 快照可以领先于已投递的事件
+        BinanceSim::Cursor cursor = sim.start();
+        std::mt19937_64 rng(seed * 7919);
+        auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+        auto& bin = static_cast<BinanceAdapter&>(*a);
+        a->onConnected();
+        std::uint64_t last_delivered = BinanceSim::kStartId;
+        int compared = 0, snapshots = 0;
+        std::uint64_t too_old = 0;
+        for (std::size_t step = 0; step < events.size(); ++step) {
+            const BinanceSim::Event& e = events[step];
+            if (rng() % 60 == 0) continue;  // 传输中丢失
+            last_delivered = e.last;
+            AdapterResult r = feed(*a, e.json);
+            // REST 快照的 lastUpdateId 在已投递事件附近随机：可能太旧（L < 第一条缓冲的 U），也可能领先
+            for (int tries = 0; r.need_rest_snapshot && tries < 50; ++tries) {
+                const std::int64_t want = static_cast<std::int64_t>(last_delivered) +
+                                          static_cast<std::int64_t>(rng() % 16) - 5;
+                const std::uint64_t L = static_cast<std::uint64_t>(std::clamp<std::int64_t>(
+                    want, static_cast<std::int64_t>(BinanceSim::kStartId), static_cast<std::int64_t>(sim.id())));
+                r = restSnapshot(*a, sim.snapshotAt(L));
+                if (contains(r.error, "too old")) ++too_old;
+                ++snapshots;
+            }
+            REQUIRE(!r.need_rest_snapshot);
+            if (a->synced()) {
+                if (bin.lastUpdateId() < cursor.id) FAIL("local update id moved backwards");
+                sim.advance(cursor, bin.lastUpdateId());
+                std::string why_b, why_a;
+                if (!sideEquals(a->book().getBids(), cursor.book.bidLevels(), why_b) ||
+                    !sideEquals(a->book().getAsks(), cursor.book.askLevels(), why_a)) {
+                    FAIL("seed " + std::to_string(seed) + " step " + std::to_string(step) + ": " + why_b + why_a);
+                }
+                ++compared;
+            }
+            CHECK(!a->book().isCrossed());
+        }
+        CHECK_GT(compared, 1300);
+        CHECK_GT(a->stats().gaps, 5u);
+        CHECK_GT(snapshots, 5);
+        CHECK_GT(too_old, 0u);
+        CHECK_GT(a->stats().ignored, 0u);  // 领先的快照使后续事件过期
+        CHECK_EQ(a->stats().parse_errors, 0u);
+        CHECK_EQ(a->stats().crossed_books, 0u);
+    }
+}
+
+// ============================================================================
+// OKX
+// ============================================================================
+
+TEST_CASE("okx: documentation checksum examples verify without failures") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    const Levels bids = {{"3366.1", "7"}, {"3366", "6"}};
+    const Levels asks = {{"3366.8", "9"}, {"3368", "8"}};
+    AdapterResult r = feed(*a, okxBooks("snapshot", bids, asks, -1, 100, -1881014294));
+    CHECK(r.book_updated);
+    CHECK(r.error.empty());
+    CHECK(a->synced());
+    CHECK(okx.checksumEnabled());
+    CHECK_EQ(okx.checksumString(), std::string("3366.1:7:3366.8:9:3366:6:3368:8"));
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    CHECK_EQ(okx.lastSeqId(), 100);
+    CHECK_EQ(a->book().getUpdateId(), 100u);
+    CHECK_EQ(r.exchange_ts_ms, 1597026383085);
+    // 第二个示例：买盘不足时继续拼卖盘
+    const Levels bids2 = {{"3366.1", "7"}};
+    const Levels asks2 = {{"3366.8", "9"}, {"3368", "8"}, {"3372", "8"}};
+    r = feed(*a, okxBooks("snapshot", bids2, asks2, -1, 200, okxChecksum(bids2, asks2)));
+    CHECK(r.error.empty());
+    CHECK_EQ(okx.checksumString(), std::string("3366.1:7:3366.8:9:3368:8:3372:8"));
+    CHECK(okx.checksumEnabled());
+    // 同一 CRC 的无符号写法（2413953002）同样接受
+    r = feed(*a, okxBooks("snapshot", bids, asks, -1, 300, 2413953002LL));
+    CHECK(r.error.empty());
+    CHECK(okx.checksumEnabled());
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    // 超出 32 位范围的值不会因为低 32 位相同而被误判为一致
+    r = feed(*a, okxBooks("snapshot", bids, asks, -1, 400, 2413953002LL + (std::int64_t{1} << 32)));
+    CHECK(contains(r.error, "checksum verification disabled"));
+    CHECK_EQ(a->stats().checksum_failures, 1u);
+}
+
+TEST_CASE("okx: books5 and bbo-tbt pushes replace the book") {
+    AdapterConfig cfg = makeConfig(Exchange::OKX);
+    cfg.subscribe_msg = kOkxBooks5Subscribe;
+    auto a = makeAdapter(Exchange::OKX, cfg);
+    a->onConnected();
+    const Levels bids = {{"31738.2", "0.67557666"}, {"31738", "0.02466947"}, {"31736.3", "0.01705046"}};
+    const Levels asks = {{"31738.3", "0.05973179"}, {"31738.5", "0.11035404"}, {"31739.6", "0.01"}};
+    AdapterResult r = feed(*a, okxBooks5(bids, asks));  // ccxt 中的 books5 示例
+    CHECK(r.book_updated);
+    CHECK(a->synced());
+    CHECK_EQ(r.exchange_ts_ms, 1626537446491);
+    CHECK_BOOK(a->book(), bids, asks);
+    r = feed(*a, R"({"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["36232.2","1.8826134","0","17"]],"bids":[["36232.1","0.00572212","0","2"]],"ts":"1651826598363"}]})");
+    CHECK(r.book_updated);
+    CHECK_BOOK(a->book(), Levels({{"36232.1", "0.00572212"}}), Levels({{"36232.2", "1.8826134"}}));
+    CHECK_EQ(r.exchange_ts_ms, 1651826598363);
+    // 全量频道的交叉推送：清空等待下一次推送，不发送重订阅帧
+    r = feed(*a, okxBooks5({{"100", "1"}}, {{"99", "1"}}));
+    CHECK(r.book_updated);
+    CHECK(r.send.empty());
+    CHECK(!r.reconnect);
+    CHECK(a->book().empty());
+    CHECK(!a->synced());
+    CHECK_EQ(a->stats().crossed_books, 1u);
+    r = feed(*a, okxBooks5(bids, asks));
+    CHECK(a->synced());
+    CHECK_EQ(a->stats().snapshots, 4u);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+}
+
+// OKX 交易所模拟：400 档簿，随机更新，校验和由逐位 CRC 独立计算
+class OkxSim {
+public:
+    explicit OkxSim(std::uint64_t seed, int levels = 400) : rng_(seed) {
+        for (int t = 1; t <= levels; ++t) {
+            const std::int64_t bt = kMid - t - static_cast<std::int64_t>(rng_() % 2) * 1000;  // 偶尔远端
+            const std::int64_t at = kMid + t + static_cast<std::int64_t>(rng_() % 2) * 1000;
+            state_.bids[bt] = {okxPrice(bt), randomSize(rng_)};
+            state_.asks[at] = {okxPrice(at), randomSize(rng_)};
+        }
+    }
+
+    std::string snapshot() {
+        prev_ = -1;
+        seq_ += 1 + static_cast<std::int64_t>(rng_() % 3);
+        const Levels b = state_.bidLevels(), a = state_.askLevels();
+        return okxBooks("snapshot", b, a, -1, seq_, okxChecksum(b, a));
+    }
+
+    // 生成一条随机增量（同时推进状态）；corrupt_checksum 时故意给出错误的校验和
+    std::string update(bool corrupt_checksum = false, bool heartbeat = false) {
+        Levels b, a;
+        if (!heartbeat) {
+            const std::size_t k = 1 + rng_() % 12;
+            for (std::size_t i = 0; i < k; ++i) change(b, a);
+        }
+        const std::int64_t prev = seq_;
+        if (!heartbeat) seq_ += 1 + static_cast<std::int64_t>(rng_() % 3);
+        std::int32_t cs = okxChecksum(state_.bidLevels(25), state_.askLevels(25));
+        if (corrupt_checksum) cs ^= 0x10;
+        return okxBooks("update", b, a, prev, seq_, cs);
+    }
+
+    const BookModel& state() const { return state_; }
+    std::int64_t seq() const { return seq_; }
+    std::mt19937_64& rng() { return rng_; }
+
+private:
+    static constexpr std::int64_t kMid = 300000;  // 30000.0
+
+    void change(Levels& b, Levels& a) {
+        const bool bid = (rng_() & 1u) != 0;
+        auto& side = bid ? state_.bids : state_.asks;
+        Levels& out = bid ? b : a;
+        const unsigned kind = static_cast<unsigned>(rng_() % 20);
+        auto pickNearTop = [&]() {
+            auto it = bid ? std::prev(side.end()) : side.begin();
+            const std::size_t skip = rng_() % std::min<std::size_t>(side.size(), 40);
+            for (std::size_t i = 0; i < skip; ++i) it = bid ? std::prev(it) : std::next(it);
+            return it;
+        };
+        if (kind < 8 && !side.empty()) {  // 改数量：通常是新值；偶尔数值不变、只换写法（"1.5" -> "1.50"）
+            auto it = pickNearTop();
+            std::string& sz = it->second.second;
+            if (rng_() % 8 == 0 && sz.size() < 16) {
+                sz += sz.find('.') == std::string::npos ? ".0" : "0";
+            } else {
+                sz = randomSize(rng_);
+            }
+            out.push_back(it->second);
+            return;
+        }
+        if (kind < 13 && side.size() > 30) {  // 删除
+            auto it = pickNearTop();
+            out.push_back({it->second.first, "0"});
+            side.erase(it);
+            return;
+        }
+        if (kind == 13 && !side.empty()) {  // 同一价格换一种写法（"30000.1" -> "30000.10"）
+            auto it = pickNearTop();
+            std::string& px = it->second.first;
+            if (px.size() < 16) px += px.find('.') == std::string::npos ? ".0" : "0";
+            out.push_back(it->second);
+            return;
+        }
+        if (kind == 14) {  // 删除不存在的档位
+            const std::int64_t t = bid ? kMid - 5000 : kMid + 5000;
+            out.push_back({okxPrice(t), "0"});
+            return;
+        }
+        // 插入新档位（含顶部改善，但不越过对手方最优价）
+        const std::int64_t tick = bid ? state_.bestAskTick() - 1 - static_cast<std::int64_t>(rng_() % 30)
+                                      : state_.bestBidTick() + 1 + static_cast<std::int64_t>(rng_() % 30);
+        if (side.count(tick) != 0) return;
+        side[tick] = {okxPrice(tick), randomSize(rng_)};
+        out.push_back(side[tick]);
+    }
+
+    std::mt19937_64 rng_;
+    BookModel state_;
+    std::int64_t seq_ = 1000;
+    std::int64_t prev_ = -1;
+};
+
+TEST_CASE("okx: 400-level books snapshot + hundreds of random updates verify against independent checksums") {
+    for (std::uint64_t seed : {11u, 12u}) {
+        OkxSim sim(seed);
+        auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+        auto& okx = static_cast<OkxAdapter&>(*a);
+        a->onConnected();
+        AdapterResult r = feed(*a, sim.snapshot());
+        REQUIRE(r.error.empty());
+        REQUIRE(a->synced());
+        CHECK_EQ(a->book().getBidCount(), 400);
+        CHECK_EQ(a->book().getAskCount(), 400);
+        CHECK_BOOK(a->book(), sim.state().bidLevels(), sim.state().askLevels());
+        for (int step = 0; step < 800; ++step) {
+            const bool heartbeat = step % 97 == 0;
+            r = feed(*a, sim.update(false, heartbeat));
+            if (!r.error.empty() || !a->synced()) {
+                FAIL("seed " + std::to_string(seed) + " step " + std::to_string(step) + ": " + r.error);
+            }
+            if (heartbeat) CHECK(!r.book_updated);
+            CHECK_EQ(okx.lastSeqId(), sim.seq());
+            if (step % 25 == 0) {
+                CHECK_BOOK(a->book(), sim.state().bidLevels(), sim.state().askLevels());
+                CHECK_EQ(okx.checksumString(), okxChecksumString(sim.state().bidLevels(25), sim.state().askLevels(25)));
+                CHECK_EQ(okx.textEntries(BookSide::Bid), static_cast<std::size_t>(a->book().getBidCount()));
+                CHECK_EQ(okx.textEntries(BookSide::Ask), static_cast<std::size_t>(a->book().getAskCount()));
+            }
+        }
+        CHECK_BOOK(a->book(), sim.state().bidLevels(), sim.state().askLevels());
+        CHECK_EQ(a->stats().checksum_failures, 0u);
+        CHECK_EQ(a->stats().gaps, 0u);
+        CHECK_EQ(a->stats().resyncs, 0u);
+        CHECK_GT(a->stats().deltas, 700u);
+        CHECK(okx.checksumEnabled());
+        // 一个错误的校验和必须被发现
+        r = feed(*a, sim.update(true));
+        CHECK_EQ(a->stats().checksum_failures, 1u);
+        CHECK(!a->synced());
+        REQUIRE_EQ(r.send.size(), 2u);
+        CHECK_EQ(r.send[0], std::string(kOkxUnsubscribe));
+        CHECK_EQ(r.send[1], std::string(kOkxSubscribe));
+    }
+}
+
+TEST_CASE("okx: the checksum uses the exact strings received, also after a level is replaced") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    Levels bids = {{"100.5", "1.50"}, {"100", "2"}};
+    Levels asks = {{"101", "0.10000000"}, {"101.5", "3"}};
+    AdapterResult r = feed(*a, okxBooks("snapshot", bids, asks, -1, 1, okxChecksum(bids, asks)));
+    REQUIRE(r.error.empty());
+    CHECK_EQ(okx.checksumString(), std::string("100.5:1.50:101:0.10000000:100:2:101.5:3"));
+    // 数值不变、写法改变：簿不变（book_updated = false），但校验串必须用新写法
+    bids[0] = {"100.50", "1.5"};
+    r = feed(*a, okxBooks("update", {bids[0]}, {}, 1, 2, okxChecksum(bids, asks)));
+    CHECK(r.error.empty());
+    CHECK(!r.book_updated);
+    CHECK_EQ(okx.checksumString(), std::string("100.50:1.5:101:0.10000000:100:2:101.5:3"));
+    // 若适配器重新格式化 double，会与这里不一致
+    asks[0] = {"101", "0.1"};
+    r = feed(*a, okxBooks("update", {}, {asks[0]}, 2, 3, okxChecksum(bids, asks)));
+    CHECK(r.error.empty());
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    // 删除后再插入同一价格：使用新字符串
+    r = feed(*a, okxBooks("update", {{"100", "0"}}, {}, 3, 4, okxChecksum({bids[0]}, asks)));
+    CHECK(r.error.empty());
+    bids = {{"100.50", "1.5"}, {"100.0", "9"}};
+    r = feed(*a, okxBooks("update", {{"100.0", "9"}}, {}, 4, 5, okxChecksum(bids, asks)));
+    CHECK(r.error.empty());
+    CHECK_EQ(okx.checksumString(), std::string("100.50:1.5:101:0.1:100.0:9:101.5:3"));
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    CHECK(a->synced());
+}
+
+TEST_CASE("okx: a wrong checksum on a snapshot disables verification (safety valve)") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    const Levels bids = {{"3366.1", "7"}, {"3366", "6"}};
+    const Levels asks = {{"3366.8", "9"}, {"3368", "8"}};
+    AdapterResult r = feed(*a, okxBooks("snapshot", bids, asks, -1, 100, 12345));
+    CHECK(contains(r.error, "checksum verification disabled"));
+    CHECK(r.book_updated);
+    CHECK(r.send.empty());
+    CHECK(!r.reconnect);
+    CHECK(a->synced());  // 继续运行
+    CHECK(!okx.checksumEnabled());
+    CHECK_EQ(a->stats().checksum_failures, 1u);
+    CHECK_BOOK(a->book(), bids, asks);
+    // 之后错误的校验和不再触发重同步
+    r = feed(*a, okxBooks("update", {{"3366.1", "8"}}, {}, 100, 101, 999));
+    CHECK(r.error.empty());
+    CHECK(r.book_updated);
+    CHECK(a->synced());
+    CHECK_EQ(a->book().getBids()[0].quantity, 8.0);
+    // 适配器余下的生命周期内保持关闭（包括重连之后）
+    a->onConnected();
+    r = feed(*a, okxBooks("snapshot", bids, asks, -1, 5, 777));
+    CHECK(r.error.empty());
+    CHECK(!okx.checksumEnabled());
+    CHECK_EQ(a->stats().checksum_failures, 1u);
+    CHECK_EQ(a->stats().resyncs, 0u);
+}
+
+TEST_CASE("okx: a wrong checksum after an update triggers unsubscribe + subscribe") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    const Levels bids = {{"3366.1", "7"}, {"3366", "6"}};
+    const Levels asks = {{"3366.8", "9"}, {"3368", "8"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 100, okxChecksum(bids, asks)));
+    REQUIRE(a->synced());
+    AdapterResult r = feed(*a, okxBooks("update", {{"3366.1", "8"}}, {}, 100, 101, okxChecksum(bids, asks)));
+    CHECK(contains(r.error, "checksum mismatch"));
+    CHECK(r.book_updated);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    REQUIRE_EQ(r.send.size(), 2u);
+    CHECK_EQ(r.send[0], std::string(kOkxUnsubscribe));
+    CHECK_EQ(r.send[1], std::string(kOkxSubscribe));
+    CHECK_EQ(a->stats().checksum_failures, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    CHECK_EQ(a->stats().gaps, 0u);
+    // 重订阅期间的增量被忽略；新快照恢复同步
+    r = feed(*a, okxBooks("update", {{"3366.1", "1"}}, {}, 101, 102, std::nullopt));
+    CHECK(!r.book_updated);
+    CHECK(r.send.empty());
+    feed(*a, R"({"event":"unsubscribe","arg":{"channel":"books","instId":"BTC-USDT"},"connId":"a4d3ae55"})");
+    feed(*a, R"({"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDT"},"connId":"a4d3ae55"})");
+    r = feed(*a, okxBooks("snapshot", bids, asks, -1, 500, okxChecksum(bids, asks)));
+    CHECK(a->synced());
+    CHECK(r.error.empty());
+    CHECK_BOOK(a->book(), bids, asks);
+}
+
+TEST_CASE("okx: a sequence gap triggers unsubscribe + subscribe; updates are ignored until the next snapshot") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    // 未同步时的增量被忽略
+    AdapterResult r = feed(*a, okxBooks("update", {{"1", "1"}}, {}, 1, 2, std::nullopt));
+    CHECK(!r.book_updated);
+    CHECK(a->book().empty());
+    CHECK_EQ(a->stats().ignored, 1u);
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "1"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 10, okxChecksum(bids, asks)));
+    r = feed(*a, okxBooks("update", {{"100", "2"}}, {}, 10, 11, okxChecksum({{"100", "2"}}, asks)));
+    CHECK(r.book_updated);
+    r = feed(*a, okxBooks("update", {{"100", "3"}}, {}, 12, 13, okxChecksum({{"100", "3"}}, asks)));  // 缺 11 -> 12
+    CHECK(contains(r.error, "gap"));
+    CHECK(r.book_updated);
+    REQUIRE_EQ(r.send.size(), 2u);
+    CHECK_EQ(r.send[0], okx.unsubscribeMessage());
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(a->stats().gaps, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    r = feed(*a, okxBooks("update", {{"100", "4"}}, {}, 13, 14, std::nullopt));
+    CHECK(!r.book_updated);
+    CHECK(r.send.empty());
+    CHECK_EQ(a->stats().gaps, 1u);
+}
+
+TEST_CASE("okx: heartbeat updates pass the continuity check without changing the book") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "1"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 10, okxChecksum(bids, asks)));
+    for (int i = 0; i < 3; ++i) {
+        const AdapterResult r = feed(*a, okxBooks("update", {}, {}, 10, 10, okxChecksum(bids, asks)));
+        CHECK(!r.book_updated);
+        CHECK(r.error.empty());
+        CHECK(a->synced());
+    }
+    const AdapterResult r = feed(*a, okxBooks("update", {{"100", "5"}}, {}, 10, 11, okxChecksum({{"100", "5"}}, asks)));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->stats().gaps, 0u);
+    CHECK_EQ(a->stats().deltas, 1u);
+}
+
+TEST_CASE("okx: a sequence reset (seqId < prevSeqId) is accepted when prevSeqId matches") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "1"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 5000, okxChecksum(bids, asks)));
+    AdapterResult r = feed(*a, okxBooks("update", {{"100", "2"}}, {}, 5000, 3, okxChecksum({{"100", "2"}}, asks)));
+    CHECK(r.book_updated);
+    CHECK(r.error.empty());
+    CHECK_EQ(okx.lastSeqId(), 3);
+    r = feed(*a, okxBooks("update", {{"100", "3"}}, {}, 3, 4, okxChecksum({{"100", "3"}}, asks)));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->stats().gaps, 0u);
+}
+
+TEST_CASE("okx: pong, subscribe, error and notice events") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    AdapterResult r = feed(*a, "pong");
+    CHECK(!r.book_updated && r.error.empty() && !r.reconnect);
+    r = feed(*a, R"({"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDT"},"connId":"a4d3ae55"})");
+    CHECK(r.error.empty() && !r.reconnect);
+    r = feed(*a, R"({"event":"channel-conn-count","channel":"books","connCount":"2","connId":"abcd1234"})");
+    CHECK(r.error.empty());
+    r = feed(*a, R"({"event":"error","code":"60018","msg":"Wrong URL or channel:books,instId:BTC-USD doesn't exist.","connId":"a4d3ae55"})");
+    CHECK(contains(r.error, "60018"));
+    CHECK(contains(r.error, "doesn't exist"));
+    CHECK(!r.reconnect);
+    r = feed(*a, R"({"event":"error","code":60012,"msg":"Illegal request"})");  // 数字 code 也能展示
+    CHECK(contains(r.error, "60012"));
+    r = feed(*a, R"({"event":"notice","code":"64008","msg":"The connection will soon be closed for a service upgrade. Please reconnect.","connId":"a4d3ae55"})");
+    CHECK(r.reconnect);
+    CHECK(contains(r.error, "64008"));
+    // 其他频道的推送被忽略，即使 data 的形状与订单簿完全不同（K 线是数组的数组）
+    r = feed(*a, R"({"arg":{"channel":"tickers","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","last":"9999.99"}]})");
+    CHECK(!r.book_updated && r.error.empty());
+    r = feed(*a, R"({"arg":{"channel":"candle1m","instId":"BTC-USDT"},"data":[["1597026383085","8533.02","8553.74","8527.17","8548.26","45247","529.5858061"]]})");
+    CHECK(!r.book_updated && r.error.empty());
+    CHECK_EQ(a->stats().ignored, 8u);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    // 但结构损坏的 JSON 仍是格式错误，订单簿频道里形状不对的 data 也是；
+    // data 出现在 arg 之前时（交易所从不这样发）只能按订单簿严格解析
+    r = feed(*a, R"({"arg":{"channel":"candle1m"},"data":[["1","2"],["3"})");
+    CHECK(!r.error.empty());
+    r = feed(*a, R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[["1","2"]]})");
+    CHECK(!r.error.empty());
+    r = feed(*a, R"({"data":[["1","2"]],"arg":{"channel":"candle1m","instId":"BTC-USDT"}})");
+    CHECK(!r.error.empty());
+    CHECK_EQ(a->stats().parse_errors, 3u);
+}
+
+
+TEST_CASE("okx: resync without a derivable unsubscribe frame requests a reconnect") {
+    for (const char* sub : {"", R"({"method":"subscribe"})"}) {
+        AdapterConfig cfg = makeConfig(Exchange::OKX);
+        cfg.subscribe_msg = sub;
+        auto a = makeAdapter(Exchange::OKX, cfg);
+        CHECK(static_cast<OkxAdapter&>(*a).unsubscribeMessage().empty());
+        a->onConnected();
+        const Levels bids = {{"100", "1"}};
+        const Levels asks = {{"101", "1"}};
+        feed(*a, okxBooks("snapshot", bids, asks, -1, 10, okxChecksum(bids, asks)));
+        const AdapterResult r = feed(*a, okxBooks("update", {}, {}, 11, 12, std::nullopt));
+        CHECK(r.reconnect);
+        CHECK(r.send.empty());
+        CHECK(!a->synced());
+    }
+}
+
+TEST_CASE("okx: verify_checksum = false ignores checksums") {
+    AdapterConfig cfg = makeConfig(Exchange::OKX);
+    cfg.verify_checksum = false;
+    auto a = makeAdapter(Exchange::OKX, cfg);
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    CHECK(!okx.checksumEnabled());
+    AdapterResult r = feed(*a, okxBooks("snapshot", {{"100", "1"}}, {{"101", "1"}}, -1, 1, 1));
+    CHECK(r.error.empty());
+    r = feed(*a, okxBooks("update", {{"100", "2"}}, {}, 1, 2, 2));
+    CHECK(r.error.empty());
+    CHECK(r.book_updated);
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 0u);  // 不维护原始字符串
+    CHECK(okx.checksumString().empty());
+}
+
+TEST_CASE("okx: level strings too long to store disable verification instead of failing") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    const std::string long_size = "1.000000000000000000000000000000000001";  // 38 字节
+    const Levels bids = {{"100", long_size}};
+    const Levels asks = {{"101", "1"}};
+    const AdapterResult r = feed(*a, okxBooks("snapshot", bids, asks, -1, 1, okxChecksum(bids, asks)));
+    CHECK(contains(r.error, "checksum verification disabled"));
+    CHECK(!okx.checksumEnabled());
+    CHECK(a->synced());
+    CHECK_EQ(a->book().getBidCount(), 1);
+}
+
+TEST_CASE("okx: a crossed book after an update triggers a resync") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "1"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 1, okxChecksum(bids, asks)));
+    const AdapterResult r = feed(*a, okxBooks("update", {{"101.5", "1"}}, {}, 1, 2, std::nullopt));
+    CHECK_EQ(a->stats().crossed_books, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(r.send.size(), 2u);
+}
+
+TEST_CASE("okx: no snapshot after resubscribing eventually requests a reconnect") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    bool reconnect = false;
+    std::size_t n = 0;
+    for (; n < 2 * OkxAdapter::kMaxUnsyncedUpdates && !reconnect; ++n) {
+        const AdapterResult r = feed(*a, okxBooks("update", {{"1", "1"}}, {}, 1, 2, std::nullopt));
+        reconnect = r.reconnect;
+    }
+    CHECK(reconnect);
+    CHECK_EQ(n, OkxAdapter::kMaxUnsyncedUpdates + 1);
+}
+
+TEST_CASE("okx: multiple data entries in one message are applied in order") {
+    auto a = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    a->onConnected();
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "1"}};
+    feed(*a, okxBooks("snapshot", bids, asks, -1, 1, okxChecksum(bids, asks)));
+    const std::string msg = std::string("{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"update\",\"data\":[") +
+                            "{\"asks\":[],\"bids\":[[\"100\",\"2\",\"0\",\"1\"]],\"ts\":\"5\",\"checksum\":" +
+                            std::to_string(okxChecksum({{"100", "2"}}, asks)) + ",\"prevSeqId\":1,\"seqId\":2}," +
+                            "{\"asks\":[],\"bids\":[[\"99\",\"3\",\"0\",\"1\"]],\"ts\":\"6\",\"checksum\":" +
+                            std::to_string(okxChecksum({{"100", "2"}, {"99", "3"}}, asks)) + ",\"prevSeqId\":2,\"seqId\":3}]}";
+    const AdapterResult r = feed(*a, msg);
+    CHECK(r.error.empty());
+    CHECK(r.book_updated);
+    CHECK_EQ(r.exchange_ts_ms, 5);
+    CHECK_BOOK(a->book(), Levels({{"100", "2"}, {"99", "3"}}), asks);
+    CHECK_EQ(static_cast<OkxAdapter&>(*a).lastSeqId(), 3);
+}
+
+// ============================================================================
+// Bybit
+// ============================================================================
+
+const Levels kBybitBids = {{"30247.20", "30.028"}, {"30245.40", "0.224"}, {"30242.10", "1.593"}};
+const Levels kBybitAsks = {{"30248.70", "0.5"}, {"30249.30", "0.892"}, {"30249.50", "1.778"}};
+
+TEST_CASE("bybit: snapshot and delta from the documentation") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    auto& by = static_cast<BybitAdapter&>(*a);
+    a->onConnected();
+    AdapterResult r = feed(*a, bybitBook("snapshot", 177400506, kBybitBids, kBybitAsks, 1672304484978));
+    CHECK(r.book_updated);
+    CHECK(a->synced());
+    CHECK_EQ(r.exchange_ts_ms, 1672304484978);
+    CHECK_BOOK(a->book(), kBybitBids, kBybitAsks);
+    CHECK_EQ(by.lastUpdateId(), 177400506u);
+    // 文档中的 delta（u = 177400507）
+    r = feed(*a, bybitBook("delta", 177400507,
+                           {{"30247.20", "30.028"}, {"30245.40", "0.224"}, {"30242.10", "1.593"}, {"30240.30", "1.305"},
+                            {"30240.00", "0"}},
+                           {{"30248.70", "0"}, {"30249.30", "0.892"}, {"30249.50", "1.778"}, {"30249.60", "0"},
+                            {"30251.90", "2.947"}, {"30252.20", "0.659"}, {"30252.50", "4.591"}},
+                           1687940967466));
+    CHECK(r.book_updated);
+    CHECK_EQ(r.exchange_ts_ms, 1687940967466);
+    const Levels bids = {{"30247.20", "30.028"}, {"30245.40", "0.224"}, {"30242.10", "1.593"}, {"30240.30", "1.305"}};
+    const Levels asks = {{"30249.30", "0.892"}, {"30249.50", "1.778"}, {"30251.90", "2.947"}, {"30252.20", "0.659"},
+                         {"30252.50", "4.591"}};
+    CHECK_BOOK(a->book(), bids, asks);
+    CHECK_EQ(a->book().getUpdateId(), 177400507u);
+    CHECK_EQ(a->stats().snapshots, 1u);
+    CHECK_EQ(a->stats().deltas, 1u);
+}
+
+TEST_CASE("bybit: a delta with u == 1 replaces the book (service restart)") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    feed(*a, bybitBook("snapshot", 500, kBybitBids, kBybitAsks));
+    const Levels bids = {{"100", "1"}};
+    const Levels asks = {{"101", "2"}};
+    AdapterResult r = feed(*a, bybitBook("delta", 1, bids, asks));
+    CHECK(r.book_updated);
+    CHECK(r.send.empty());
+    CHECK_BOOK(a->book(), bids, asks);
+    CHECK_EQ(static_cast<BybitAdapter&>(*a).lastUpdateId(), 1u);
+    r = feed(*a, bybitBook("delta", 2, {{"100", "3"}}, {}));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->stats().gaps, 0u);
+    CHECK_EQ(a->stats().snapshots, 2u);
+}
+
+TEST_CASE("bybit: stale deltas are ignored") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    feed(*a, bybitBook("snapshot", 100, kBybitBids, kBybitAsks));
+    feed(*a, bybitBook("delta", 101, {{"30247.20", "1"}}, {}));
+    for (std::uint64_t u : {101u, 100u, 50u}) {
+        const AdapterResult r = feed(*a, bybitBook("delta", u, {{"30247.20", "99"}}, {}));
+        CHECK(!r.book_updated);
+        CHECK(r.send.empty());
+    }
+    CHECK_EQ(a->book().getBids()[0].quantity, 1.0);
+    CHECK_EQ(a->stats().ignored, 3u);
+    CHECK(a->synced());
+}
+
+TEST_CASE("bybit: a gap triggers unsubscribe + subscribe and deltas are ignored until the next snapshot") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    AdapterResult r = feed(*a, bybitBook("delta", 7, {{"1", "1"}}, {}));  // 未同步
+    CHECK(!r.book_updated);
+    feed(*a, bybitBook("snapshot", 100, kBybitBids, kBybitAsks));
+    feed(*a, bybitBook("delta", 101, {{"30247.20", "1"}}, {}));
+    r = feed(*a, bybitBook("delta", 103, {{"30247.20", "2"}}, {}));
+    CHECK(r.book_updated);
+    REQUIRE_EQ(r.send.size(), 2u);
+    CHECK_EQ(r.send[0], std::string(kBybitUnsubscribe));
+    CHECK_EQ(r.send[1], std::string(kBybitSubscribe));
+    CHECK(contains(r.error, "gap"));
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    CHECK_EQ(a->stats().gaps, 1u);
+    CHECK_EQ(a->stats().resyncs, 1u);
+    r = feed(*a, bybitBook("delta", 104, {{"30247.20", "3"}}, {}));
+    CHECK(!r.book_updated);
+    CHECK(r.send.empty());
+    feed(*a, R"({"success":true,"ret_msg":"","conn_id":"7188110e","req_id":"3","op":"unsubscribe"})");
+    feed(*a, R"({"success":true,"ret_msg":"subscribe","conn_id":"7188110e","op":"subscribe"})");
+    r = feed(*a, bybitBook("snapshot", 200, kBybitBids, kBybitAsks));
+    CHECK(a->synced());
+    CHECK_BOOK(a->book(), kBybitBids, kBybitAsks);
+    CHECK(static_cast<BybitAdapter&>(*a).strictSequence());
+}
+
+TEST_CASE("bybit: three first-delta gaps in a row disable the strict +1 check") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    auto& by = static_cast<BybitAdapter&>(*a);
+    a->onConnected();
+    for (int strike = 1; strike <= 3; ++strike) {
+        const std::uint64_t base = static_cast<std::uint64_t>(strike) * 100;
+        feed(*a, bybitBook("snapshot", base, kBybitBids, kBybitAsks));
+        const AdapterResult r = feed(*a, bybitBook("delta", base + 5, {{"30247.20", "1"}}, {}));
+        CHECK_EQ(r.send.size(), 2u);
+        CHECK(!a->synced());
+        if (strike < 3) {
+            CHECK(by.strictSequence());
+            CHECK(!contains(r.error, "disabled"));
+        } else {
+            CHECK(!by.strictSequence());
+            CHECK(contains(r.error, "strict +1 sequence check disabled"));
+        }
+    }
+    CHECK_EQ(a->stats().resyncs, 3u);
+    feed(*a, bybitBook("snapshot", 400, kBybitBids, kBybitAsks));
+    AdapterResult r = feed(*a, bybitBook("delta", 405, {{"30247.20", "1"}}, {}));  // 不再要求 +1
+    CHECK(r.book_updated);
+    CHECK(r.error.empty());
+    CHECK(r.send.empty());
+    r = feed(*a, bybitBook("delta", 405, {{"30247.20", "2"}}, {}));  // 过期检查保留
+    CHECK(!r.book_updated);
+    r = feed(*a, bybitBook("delta", 420, {{"30247.20", "3"}}, {}));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->book().getBids()[0].quantity, 3.0);
+    r = feed(*a, bybitBook("delta", 421, {{"30260", "1"}}, {}));  // 交叉检查保留
+    CHECK_EQ(a->stats().crossed_books, 1u);
+    CHECK_EQ(r.send.size(), 2u);
+    CHECK(!a->synced());
+    CHECK_EQ(a->stats().gaps, 3u);
+}
+
+TEST_CASE("bybit: a good first delta or a later gap resets the strike counter") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    auto& by = static_cast<BybitAdapter&>(*a);
+    a->onConnected();
+    auto firstDeltaGap = [&](std::uint64_t base) {
+        feed(*a, bybitBook("snapshot", base, kBybitBids, kBybitAsks));
+        feed(*a, bybitBook("delta", base + 2, {}, {}));
+    };
+    firstDeltaGap(100);
+    firstDeltaGap(200);  // 两次
+    feed(*a, bybitBook("snapshot", 300, kBybitBids, kBybitAsks));
+    feed(*a, bybitBook("delta", 301, {}, {}));  // 快照后第一条正常 → 清零
+    firstDeltaGap(400);
+    firstDeltaGap(500);
+    CHECK(by.strictSequence());
+    feed(*a, bybitBook("snapshot", 600, kBybitBids, kBybitAsks));
+    feed(*a, bybitBook("delta", 601, {}, {}));
+    feed(*a, bybitBook("delta", 605, {}, {}));  // 后续 delta 的缺口 → 清零
+    firstDeltaGap(700);
+    firstDeltaGap(800);
+    CHECK(by.strictSequence());
+    firstDeltaGap(900);
+    CHECK(!by.strictSequence());
+    CHECK_EQ(a->stats().gaps, 8u);
+}
+
+TEST_CASE("bybit: acks, pongs and failures") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    for (const char* msg :
+         {R"({"success":true,"ret_msg":"subscribe","conn_id":"2324d924-aa4d-45b0-a858-7b8be29ab52b","op":"subscribe"})",
+          R"({"req_id":"test","op":"pong","args":["1675418560633"],"conn_id":"cfcb4ocsvfriu23r3er0-1b"})",
+          R"({"success":true,"ret_msg":"pong","conn_id":"db3158a0-8960-44b9-a9de-ac350ee13158","request":{"op":"ping","args":null}})",
+          R"({"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1,"data":[{"p":"1"}]})"}) {
+        const AdapterResult r = feed(*a, msg);
+        CHECK(!r.book_updated && r.error.empty() && !r.reconnect);
+    }
+    const AdapterResult r = feed(*a, R"({"success":false,"ret_msg":"error:handler not found","conn_id":"5e079fdd","op":"subscribe"})");
+    CHECK(contains(r.error, "handler not found"));
+    CHECK(contains(r.error, "subscribe"));
+    CHECK_EQ(a->stats().ignored, 5u);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    const AdapterResult broken = feed(*a, R"({"topic":"publicTrade.BTCUSDT","type":"snapshot","data":[{"p":"1"})");
+    CHECK(!broken.error.empty());
+    CHECK_EQ(a->stats().parse_errors, 1u);
+}
+
+TEST_CASE("bybit: a crossed book after a snapshot or delta triggers a resync") {
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    AdapterResult r = feed(*a, bybitBook("snapshot", 10, {{"101", "1"}}, {{"100", "1"}}));
+    CHECK_EQ(a->stats().crossed_books, 1u);
+    CHECK_EQ(r.send.size(), 2u);
+    CHECK(!a->synced());
+    CHECK(a->book().empty());
+    feed(*a, bybitBook("snapshot", 20, kBybitBids, kBybitAsks));
+    r = feed(*a, bybitBook("delta", 21, {}, {{"30200", "1"}}));
+    CHECK_EQ(a->stats().crossed_books, 2u);
+    CHECK_EQ(a->stats().resyncs, 2u);
+    CHECK_EQ(r.send.size(), 2u);
+}
+
+TEST_CASE("bybit: resync without a subscribe message requests a reconnect; stuck resubscribe reconnects") {
+    AdapterConfig cfg = makeConfig(Exchange::BYBIT);
+    cfg.subscribe_msg.clear();
+    auto a = makeAdapter(Exchange::BYBIT, cfg);
+    a->onConnected();
+    feed(*a, bybitBook("snapshot", 10, kBybitBids, kBybitAsks));
+    AdapterResult r = feed(*a, bybitBook("delta", 12, {}, {}));
+    CHECK(r.reconnect);
+    CHECK(r.send.empty());
+    bool reconnect = false;
+    for (std::size_t i = 0; i <= BybitAdapter::kMaxUnsyncedUpdates && !reconnect; ++i) {
+        r = feed(*a, bybitBook("delta", 13 + i, {}, {}));
+        reconnect = r.reconnect;
+    }
+    CHECK(reconnect);
+}
+
+TEST_CASE("bybit: randomized delta stream with drops tracks the exchange book exactly") {
+    std::mt19937_64 rng(77);
+    BookModel ex;
+    std::int64_t mid = 3000000;
+    for (std::int64_t t = 1; t <= 50; ++t) {
+        ex.bids[mid - t] = {fixedTicks(mid - t, 2), randomSize(rng)};
+        ex.asks[mid + t] = {fixedTicks(mid + t, 2), randomSize(rng)};
+    }
+    auto a = makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT));
+    a->onConnected();
+    std::uint64_t u = 1000;
+    feed(*a, bybitBook("snapshot", u, ex.bidLevels(), ex.askLevels()));
+    int compared = 0;
+    for (int step = 0; step < 3000; ++step) {
+        Levels b, as;
+        const int k = 1 + static_cast<int>(rng() % 5);
+        for (int i = 0; i < k; ++i) {
+            const bool bid = (rng() & 1u) != 0;
+            auto& side = bid ? ex.bids : ex.asks;
+            const std::int64_t tick = bid ? ex.bestAskTick() - 1 - static_cast<std::int64_t>(rng() % 60)
+                                          : ex.bestBidTick() + 1 + static_cast<std::int64_t>(rng() % 60);
+            if ((rng() % 3 == 0 && side.count(tick) != 0) || side.size() > 120) {
+                side.erase(tick);
+                (bid ? b : as).push_back({fixedTicks(tick, 2), "0"});
+            } else if (side.size() > 1 || side.count(tick) == 0) {
+                side[tick] = {fixedTicks(tick, 2), randomSize(rng)};
+                (bid ? b : as).push_back(side[tick]);
+            }
+        }
+        // 同一 delta 里同一价格出现多次：交易所给出最终值；这里按最后一次写入去重
+        auto dedup = [](Levels& v) {
+            std::map<std::string, std::string> last;
+            Levels out;
+            for (auto it = v.rbegin(); it != v.rend(); ++it) {
+                if (last.emplace(it->first, it->second).second) out.push_back(*it);
+            }
+            v.assign(out.rbegin(), out.rend());
+        };
+        dedup(b);
+        dedup(as);
+        ++u;
+        if (rng() % 100 == 0) continue;  // 丢失
+        const AdapterResult r = feed(*a, bybitBook("delta", u, b, as));
+        if (!r.send.empty()) {  // 重订阅：交易所回推当前快照
+            ++u;
+            feed(*a, bybitBook("snapshot", u, ex.bidLevels(), ex.askLevels()));
+        }
+        if (a->synced()) {
+            std::string wb, wa;
+            if (!sideEquals(a->book().getBids(), ex.bidLevels(), wb) || !sideEquals(a->book().getAsks(), ex.askLevels(), wa)) {
+                FAIL("step " + std::to_string(step) + ": " + wb + wa);
+            }
+            ++compared;
+        }
+    }
+    CHECK_GT(compared, 2900);
+    CHECK_GT(a->stats().gaps, 10u);
+    CHECK_EQ(a->stats().parse_errors, 0u);
+    CHECK(static_cast<BybitAdapter&>(*a).strictSequence());
+}
+
+// ============================================================================
+// 所有适配器：格式错误、截断、变异、超大消息、零分配
+// ============================================================================
+
+// 把适配器带到"已同步、簿非空"的状态，返回一条之后可以正常应用的有效消息生成器
+struct SyncedAdapter {
+    std::unique_ptr<ExchangeAdapter> adapter;
+    std::function<std::string(int)> next_valid;  // 第 i 条后续有效增量/快照
+};
+
+SyncedAdapter makeSynced(Exchange ex) {
+    SyncedAdapter s;
+    s.adapter = makeAdapter(ex, makeConfig(ex));
+    s.adapter->onConnected();
+    auto* a = s.adapter.get();
+    if (ex == Exchange::BINANCE) {
+        feed(*a, binanceDiff(1, 1, {}, {}));
+        restSnapshot(*a, binanceDepth(1, kBinBids, kBinAsks));
+        auto id = std::make_shared<std::uint64_t>(1);
+        s.next_valid = [id](int i) {
+            ++*id;
+            return binanceDiff(*id, *id, {{"65000.10", std::to_string(1 + i % 7)}}, {{"65000.30", std::to_string(1 + i % 5)}});
+        };
+    } else if (ex == Exchange::OKX) {
+        const Levels bids = {{"100", "1"}, {"99.5", "2"}};
+        const Levels asks = {{"101", "1"}, {"101.5", "2"}};
+        feed(*a, okxBooks("snapshot", bids, asks, -1, 1, okxChecksum(bids, asks)));
+        auto seq = std::make_shared<std::int64_t>(1);
+        s.next_valid = [seq, bids, asks](int i) {
+            Levels b = bids;
+            b[0].second = std::to_string(2 + i % 9);  // 与快照（"1"）及相邻两条都不同
+            const std::int64_t prev = *seq;
+            ++*seq;
+            return okxBooks("update", {b[0]}, {}, prev, *seq, okxChecksum(b, asks));
+        };
+    } else {
+        feed(*a, bybitBook("snapshot", 1, kBybitBids, kBybitAsks));
+        auto u = std::make_shared<std::uint64_t>(1);
+        s.next_valid = [u](int i) {
+            ++*u;
+            return bybitBook("delta", *u, {{"30247.20", std::to_string(1 + i % 9)}}, {});
+        };
+    }
+    REQUIRE(s.adapter->synced());
+    return s;
+}
+
+// 处理一条任意输入：不得抛异常；之后簿必须有效且不交叉
+void feedChecked(ExchangeAdapter& a, std::string_view payload, int& violations) {
+    AdapterResult r;
+    try {
+        a.onMessage(payload, r);
+    } catch (...) {
+        ++violations;
+        ::hft_test::reportFailure(__FILE__, __LINE__, "onMessage threw");
+        return;
+    }
+    std::string why;
+    if (!a.book().validate(&why) || a.book().isCrossed()) {
+        ++violations;
+        ::hft_test::reportFailure(__FILE__, __LINE__, "invalid book after a message: " + why);
+    }
+}
+
+TEST_CASE("adapters: malformed, mistyped and non-JSON messages count as parse errors and leave the book alone") {
+    const std::vector<std::string> common = {
+        "", "   ", "{", "}", "[", "]", "{]", "nul", "null", "true", "42", "\"str\"", "[1,2,3]", "{\"a\":}",
+        "{\"a\" 1}", "{,}", "{\"a\":1,}", "\xff\xfe\xfd", "{\"a\":\"\xff\"}", "garbage", "PONG", "pong ", "{\"a\":1} x",
+        "{\"a\":1}{\"b\":2}", std::string(5000, '[') + std::string(5000, ']')};
+    const std::vector<std::string> binance = {
+        R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":2,"u":2,"b":[["65000.10","1"]]})",
+        R"({"e":"depthUpdate","E":1,"U":"abc","u":2,"b":[],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":-2,"b":[],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2.5,"b":[],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":5,"u":3,"b":[],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":{"p":"1"},"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["65000.10"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[[65000.10,1]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["abc","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["-1","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["0","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["1","-1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["nan","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["1","inf"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["1e999","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["1.0x","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[[" 1","1"]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[[]],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":["65000.10"],"a":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[],"a":[],"b":[]})",
+        R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[],"bids":[],"a":[]})",
+        R"({"e":"depthUpdate","E":"x","U":2,"u":2,"b":[],"a":[]})",
+        R"({"e":5,"U":2,"u":2,"b":[],"a":[]})",
+        R"({"lastUpdateId":"x","bids":[],"asks":[]})",
+        R"({"lastUpdateId":1,"bids":[]})",
+        R"({"lastUpdateId":1,"bids":[],"asks":[],"U":1})",
+        R"({"stream":"x","data":[1,2]})",
+        R"({"stream":"x","data":{"lastUpdateId":1,"bids":[],"asks":[]},"data":{}})",
+        R"({"U":1})"};
+    const std::vector<std::string> okx = {
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":{"bids":[]}})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[1]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"prevSeqId":1,"seqId":2}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"bids":[],"seqId":2}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"bids":[],"prevSeqId":"x","seqId":2}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"bids":[],"prevSeqId":1,"seqId":2.5}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"bids":[],"prevSeqId":1,"seqId":2,"checksum":"abc"}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[["101","x","0","1"]],"bids":[],"prevSeqId":1,"seqId":2}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"asks":[],"bids":[],"bids":[],"prevSeqId":1,"seqId":2}]})",
+        R"({"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"asks":[],"bids":[]}]})",
+        R"({"arg":"books","data":[]})",
+        R"({"arg":{"channel":5},"data":[]})",
+        R"({"data":[{"asks":[],"bids":[]}]})",
+        R"({"arg":{"channel":"books"},"action":7,"data":[]})",
+        R"({"event":5})",
+        R"({"arg":{"channel":"books5","instId":"BTC-USDT"},"data":[{"asks":[["1","1","0","1"]],"bids":[["1","1","0",]]}]})"};
+    const std::vector<std::string> bybit = {
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":[]})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":{"b":[],"a":[],"u":"x"}})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":{"a":[],"u":2}})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":{"b":[["1"]],"a":[],"u":2}})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":"x","data":{"b":[],"a":[],"u":2}})",
+        R"({"topic":"orderbook.50.BTCUSDT","ts":1,"data":{"b":[],"a":[],"u":2}})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":5,"data":{"b":[],"a":[],"u":2}})",
+        R"({"topic":7,"type":"delta","data":{"b":[],"a":[],"u":2}})",
+        R"({"success":"true","op":"subscribe"})",
+        R"({"data":{"b":[],"a":[],"u":2}})",
+        R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":{"b":[],"a":[],"u":2,"u":3}})"};
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        SyncedAdapter s = makeSynced(ex);
+        ExchangeAdapter& a = *s.adapter;
+        const OrderBook before = a.book();
+        std::vector<std::string> corpus = common;
+        const auto& specific = ex == Exchange::BINANCE ? binance : ex == Exchange::OKX ? okx : bybit;
+        corpus.insert(corpus.end(), specific.begin(), specific.end());
+        for (const std::string& msg : corpus) {
+            const std::uint64_t errors_before = a.stats().parse_errors;
+            AdapterResult r;
+            a.onMessage(msg, r);
+            if (a.stats().parse_errors != errors_before + 1) {
+                ::hft_test::reportFailure(__FILE__, __LINE__,
+                                          std::string(exchangeName(ex)) + ": not counted as a parse error: " +
+                                              msg.substr(0, 120));
+            }
+            CHECK(!r.book_updated);
+            CHECK(!r.error.empty());
+            CHECK(r.send.empty());
+            CHECK(a.synced());
+        }
+        CHECK(sameLevels(a.book(), before));
+        // 结构合法、只是在无关字段里藏着怪东西的 JSON：结果不限（忽略或格式错误），但不能崩溃、不能改簿
+        for (const std::string& msg : {"{\"x\":" + std::string(3000, '[') + std::string(3000, ']') + "}",
+                                       std::string("{\"a\":\"\0\"}", 9), std::string("{\"a\":\"\\uD800\"}")}) {
+            AdapterResult r;
+            a.onMessage(msg, r);
+            CHECK(!r.book_updated);
+            CHECK(a.synced());
+        }
+        CHECK(sameLevels(a.book(), before));
+        // 之后的有效消息照常应用（被丢弃的消息没有推进序列号）
+        const AdapterResult r = feed(a, s.next_valid(0));
+        CHECK(r.error.empty());
+        CHECK(a.synced());
+        CHECK_EQ(a.stats().gaps, 0u);
+    }
+}
+
+TEST_CASE("adapters: a fatal JSON error inside a nested array aborts the message (no use of an abandoned document)") {
+    // 回归用例：嵌套档位数组里的尾随逗号是 simdjson 的致命错误，文档被废弃后不能再访问（曾导致空指针访问）
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        SyncedAdapter s = makeSynced(ex);
+        const char* msg = ex == Exchange::BINANCE
+                              ? R"({"e":"depthUpdate","E":1,"U":2,"u":2,"b":[["1","1",]],"a":[]})"
+                              : ex == Exchange::OKX
+                                    ? R"({"arg":{"channel":"books5","instId":"BTC-USDT"},"data":[{"asks":[["1","1","0","1"]],"bids":[["1","1","0",]]}]})"
+                                    : R"({"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1,"data":{"b":[["1","1",]],"a":[],"u":2}})";
+        const AdapterResult r = feed(*s.adapter, msg);
+        CHECK(!r.error.empty());
+        CHECK_EQ(s.adapter->stats().parse_errors, 1u);
+        CHECK(s.adapter->synced());
+    }
+}
+
+TEST_CASE("adapters: every truncated prefix of a valid message is rejected atomically and the stream continues") {
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        SyncedAdapter s = makeSynced(ex);
+        ExchangeAdapter& a = *s.adapter;
+        for (int i = 0; i < 4; ++i) {
+            const std::string msg = s.next_valid(i);
+            const OrderBook before = a.book();
+            for (std::size_t k = 0; k < msg.size(); ++k) {
+                const std::uint64_t errors_before = a.stats().parse_errors;
+                const AdapterResult r = feed(a, std::string_view(msg).substr(0, k));
+                if (a.stats().parse_errors != errors_before + 1 || r.book_updated || !a.synced()) {
+                    FAIL(std::string(exchangeName(ex)) + ": prefix of length " + std::to_string(k) + " not rejected");
+                }
+                if (!sameLevels(a.book(), before)) FAIL("truncated message modified the book");
+            }
+            const AdapterResult r = feed(a, msg);
+            CHECK(r.error.empty());
+            CHECK(r.book_updated);
+            CHECK(a.synced());
+        }
+        CHECK_EQ(a.stats().gaps, 0u);
+        CHECK_EQ(a.stats().resyncs, 0u);
+    }
+}
+
+TEST_CASE("adapters: random byte mutations never throw, crash or leave an invalid book") {
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        SyncedAdapter s = makeSynced(ex);
+        std::mt19937_64 rng(static_cast<std::uint64_t>(ex) + 1234);
+        int violations = 0;
+        std::uint64_t mutated_errors = 0;
+        const char alphabet[] = "{}[]\",:0123456789.-eE abcdefnrtul\\";
+        for (int iter = 0; iter < 6000 && violations < 3; ++iter) {
+            ExchangeAdapter& a = *s.adapter;  // s 可能在循环末尾被替换，每轮重新取引用
+            std::string msg = s.next_valid(iter);
+            const int mutations = 1 + static_cast<int>(rng() % 4);
+            for (int m = 0; m < mutations && !msg.empty(); ++m) {
+                const std::size_t pos = rng() % msg.size();
+                switch (rng() % 6) {
+                    case 0: msg[pos] = static_cast<char>(rng()); break;
+                    case 1: msg[pos] = alphabet[rng() % (sizeof(alphabet) - 1)]; break;
+                    case 2: msg.erase(pos, 1 + rng() % 8); break;
+                    case 3: msg.insert(pos, 1, alphabet[rng() % (sizeof(alphabet) - 1)]); break;
+                    case 4: msg.resize(pos); break;
+                    default: msg.insert(pos, msg.substr(pos, rng() % 16)); break;
+                }
+            }
+            const std::uint64_t errors_before = a.stats().parse_errors;
+            feedChecked(a, msg, violations);
+            mutated_errors += a.stats().parse_errors - errors_before;
+            if (ex == Exchange::BINANCE && !a.synced()) {
+                // 变异可能制造缺口：提供一个新快照让流继续
+                AdapterResult r;
+                a.onRestSnapshot(binanceDepth(static_cast<BinanceAdapter&>(a).firstBufferedId(), kBinBids, kBinAsks), r);
+            }
+            if (ex != Exchange::BINANCE && !a.synced() && iter % 50 == 0) {
+                s = makeSynced(ex);
+            }
+        }
+        CHECK_GT(mutated_errors, 1000u);  // 大部分变异确实被识别为格式错误
+        // REST 响应体同样不会崩溃
+        if (ex == Exchange::BINANCE) {
+            auto b = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+            b->onConnected();
+            feed(*b, binanceDiff(1, 1, {}, {}));
+            const std::string body = binanceDepth(1, kBinBids, kBinAsks);
+            for (int iter = 0; iter < 3000; ++iter) {
+                std::string m = body;
+                const std::size_t pos = rng() % m.size();
+                m[pos] = alphabet[rng() % (sizeof(alphabet) - 1)];
+                if (iter % 3 == 0) m.resize(rng() % m.size());
+                AdapterResult r;
+                try {
+                    b->onRestSnapshot(m, r);
+                } catch (...) {
+                    FAIL("onRestSnapshot threw");
+                }
+                CHECK(b->book().validate());
+                if (b->synced()) {
+                    b->onConnected();
+                    feed(*b, binanceDiff(1, 1, {}, {}));
+                }
+            }
+        }
+        CHECK_EQ(violations, 0);
+    }
+}
+
+TEST_CASE("adapters: huge messages are bounded, valid large books are truncated to the depth limit") {
+    // 超过 16 MiB：不复制、不解析
+    const std::string huge(adapter_detail::kMaxMessageBytes + 1, ' ');
+    for (Exchange ex : {Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT}) {
+        SyncedAdapter s = makeSynced(ex);
+        const AdapterResult r = feed(*s.adapter, huge);
+        CHECK(contains(r.error, std::to_string(huge.size())));
+        CHECK_EQ(s.adapter->stats().parse_errors, 1u);
+        CHECK(s.adapter->synced());
+    }
+    // 2 万档的有效部分深度快照：接受，每侧裁到 kMaxBookLevels
+    Levels bids, asks;
+    for (int i = 0; i < 20000; ++i) {
+        bids.push_back({fixedTicks(10000000 - i, 2), "1.5"});
+        asks.push_back({fixedTicks(10000001 + i, 2), "2.5"});
+    }
+    auto a = makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE));
+    a->onConnected();
+    AdapterResult r = feed(*a, binanceDepth(1, bids, asks));
+    CHECK(r.book_updated);
+    CHECK_EQ(a->book().getBidCount(), static_cast<int>(adapter_detail::kMaxBookLevels));
+    CHECK_EQ(a->book().getAskCount(), static_cast<int>(adapter_detail::kMaxBookLevels));
+    CHECK(a->book().validate());
+    CHECK_EQ(a->book().getBids()[0].price, 100000.0);
+    // OKX 大快照：裁剪时同步删除原始字符串，校验和仍然正确
+    auto o = makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX));
+    auto& okx = static_cast<OkxAdapter&>(*o);
+    o->onConnected();
+    Levels ob, oa;
+    for (int i = 0; i < 6000; ++i) {
+        ob.push_back({okxPrice(1000000 - i), "1"});
+        oa.push_back({okxPrice(1000001 + i), "2"});
+    }
+    r = feed(*o, okxBooks("snapshot", ob, oa, -1, 1, okxChecksum(ob, oa)));
+    CHECK(r.error.empty());
+    CHECK(okx.checksumEnabled());
+    CHECK_EQ(o->book().getBidCount(), static_cast<int>(adapter_detail::kMaxBookLevels));
+    CHECK_EQ(okx.textEntries(BookSide::Bid), adapter_detail::kMaxBookLevels);
+    CHECK_EQ(okx.textEntries(BookSide::Ask), adapter_detail::kMaxBookLevels);
+    // 档位数组元素超过上限：格式错误
+    std::string many = "{\"lastUpdateId\":2,\"bids\":[";
+    for (std::size_t i = 0; i <= adapter_detail::kMaxLevelsPerArray; ++i) {
+        if (i != 0) many += ',';
+        many += "[\"1\",\"1\"]";
+    }
+    many += "],\"asks\":[]}";
+    r = feed(*a, many);
+    CHECK_EQ(a->stats().parse_errors, 1u);
+    CHECK_EQ(a->book().getBidCount(), static_cast<int>(adapter_detail::kMaxBookLevels));
+}
+
+TEST_CASE("adapters: no heap allocation per message once warmed up") {
+    const std::string pad(64 * 1024, 'x');  // 预热用的大消息：把缓冲区与 simdjson parser 撑到足够大
+    struct Stream {
+        std::string name;
+        std::unique_ptr<ExchangeAdapter> adapter;
+        std::vector<std::string> warmup, measured;
+    };
+    std::vector<Stream> streams;
+    std::mt19937_64 rng(42);
+    // Binance 部分深度
+    {
+        Stream s{"binance depth20", makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE)), {}, {}};
+        s.adapter->onConnected();
+        s.warmup.push_back(R"({"result":null,"id":1,"pad":")" + pad + "\"}");
+        for (int i = 0; i < 400; ++i) {
+            Levels b, a;
+            const std::int64_t mid = 6500000 + static_cast<std::int64_t>(rng() % 1000);
+            for (int k = 0; k < 20; ++k) {
+                b.push_back({fixedTicks(mid - k, 2), fixedTicks(1 + static_cast<std::int64_t>(rng() % 100000000), 8)});
+                a.push_back({fixedTicks(mid + 1 + k, 2), fixedTicks(1 + static_cast<std::int64_t>(rng() % 100000000), 8)});
+            }
+            (i < 200 ? s.warmup : s.measured).push_back(binanceDepth(static_cast<std::uint64_t>(100 + i), b, a));
+        }
+        streams.push_back(std::move(s));
+    }
+    // Binance 增量深度（已同步）
+    {
+        Stream s{"binance diff", makeAdapter(Exchange::BINANCE, makeConfig(Exchange::BINANCE)), {}, {}};
+        s.adapter->onConnected();
+        BinanceSim sim(5);
+        BinanceSim::Event first = sim.next();
+        AdapterResult r = feed(*s.adapter, first.json);
+        REQUIRE(r.need_rest_snapshot);
+        restSnapshot(*s.adapter, sim.snapshotAt(first.last));
+        REQUIRE(s.adapter->synced());
+        s.warmup.push_back(R"({"result":null,"id":1,"pad":")" + pad + "\"}");
+        for (int i = 0; i < 2000; ++i) (i < 1000 ? s.warmup : s.measured).push_back(sim.next().json);
+        streams.push_back(std::move(s));
+    }
+    // OKX books（含校验和）
+    {
+        Stream s{"okx books", makeAdapter(Exchange::OKX, makeConfig(Exchange::OKX)), {}, {}};
+        s.adapter->onConnected();
+        OkxSim sim(9);
+        feed(*s.adapter, sim.snapshot());
+        REQUIRE(s.adapter->synced());
+        s.warmup.push_back(R"({"event":"subscribe","pad":")" + pad + "\"}");
+        for (int i = 0; i < 2000; ++i) (i < 1000 ? s.warmup : s.measured).push_back(sim.update());
+        streams.push_back(std::move(s));
+    }
+    // Bybit delta
+    {
+        Stream s{"bybit delta", makeAdapter(Exchange::BYBIT, makeConfig(Exchange::BYBIT)), {}, {}};
+        s.adapter->onConnected();
+        feed(*s.adapter, bybitBook("snapshot", 1, kBybitBids, kBybitAsks));
+        s.warmup.push_back(R"({"success":true,"ret_msg":"subscribe","op":"subscribe","pad":")" + pad + "\"}");
+        for (int i = 0; i < 2000; ++i) {
+            const std::string px = fixedTicks(3024000 - static_cast<std::int64_t>(rng() % 40), 2);
+            const std::string qty = (rng() % 4 == 0) ? "0" : fixedTicks(1 + static_cast<std::int64_t>(rng() % 100000), 3);
+            (i < 1000 ? s.warmup : s.measured).push_back(bybitBook("delta", static_cast<std::uint64_t>(2 + i), {{px, qty}}, {}));
+        }
+        streams.push_back(std::move(s));
+    }
+    for (Stream& s : streams) {
+        AdapterResult out;
+        for (const std::string& m : s.warmup) {
+            out.reset();
+            s.adapter->onMessage(m, out);
+        }
+        const AdapterStats before = s.adapter->stats();
+        g_alloc_count.store(0);
+        g_count_allocs.store(true);
+        for (const std::string& m : s.measured) {
+            out.reset();
+            s.adapter->onMessage(m, out);
+        }
+        g_count_allocs.store(false);
+        const std::uint64_t allocs = g_alloc_count.load();
+        if (allocs != 0) {
+            ::hft_test::reportFailure(__FILE__, __LINE__,
+                                      s.name + ": " + std::to_string(allocs) + " heap allocations in " +
+                                          std::to_string(s.measured.size()) + " messages");
+        }
+        const AdapterStats& after = s.adapter->stats();
+        CHECK_EQ(after.parse_errors, before.parse_errors);
+        CHECK_EQ(after.resyncs, before.resyncs);
+        CHECK_EQ(after.checksum_failures, 0u);
+        CHECK(after.book_updates > before.book_updates + s.measured.size() / 2);
+        CHECK(s.adapter->synced());
+    }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) { return hft_test::runAll(argc, argv); }

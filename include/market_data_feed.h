@@ -19,6 +19,7 @@
 #include <openssl/err.h>
 
 #include "simdjson.h"
+#include "exchanges/exchange_adapter.h"
 #include "orderbook.h"
 #include "latency_tracker.h"
 
@@ -35,11 +36,7 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-// 支持的交易所枚举
-enum class Exchange {
-    BINANCE,
-    OKX
-};
+// 支持的交易所枚举 Exchange 已移至 exchanges/exchange_adapter.h
 
 // 行情订阅配置
 struct FeedConfig {
