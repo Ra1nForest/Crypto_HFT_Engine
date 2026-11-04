@@ -17,6 +17,10 @@ set(HFT_SANITIZE "" CACHE STRING "Sanitizers to enable, e.g. address,undefined o
 if(HFT_SANITIZE)
     add_compile_options(-fsanitize=${HFT_SANITIZE} -fno-omit-frame-pointer -g -O1)
     add_link_options(-fsanitize=${HFT_SANITIZE})
+    # GCC 对 Boost.Asio 内部的 atomic_thread_fence 给出 -Wtsan 警告（并非本项目代码），TSan 构建时关闭
+    if(HFT_SANITIZE MATCHES "thread" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-tsan)
+    endif()
 endif()
 
 # 依赖
