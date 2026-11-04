@@ -1,6 +1,6 @@
-build/
+build*/
 logs/
-third_party/
+third_party
 .vscode/
 *.o
 *.out
