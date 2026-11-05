@@ -89,7 +89,8 @@ public:
     // - 不超过 kBatchThreshold 条：直接逐档 upsert（顶部附近的少量更新这样最快，返回值也与逐档调用一致）。
     // - 更多条：按价格排序（下标作次序键，std::sort 原地进行、不分配内存）、同价只保留最后一条，再与现有档位
     //   做一次线性归并：O(档数 + n log n)，取代逐档插入/删除各自 O(档数) 的 memmove
-    //   （1000 档的簿上每档约 0.7 µs、5000 档约 3 µs；一条 Binance 100 ms 增量常有上百档变化）。
+    //   （逐档 upsert 时每个变化在 1000 档的簿上约 0.7 µs、5000 档约 4.5 µs，插入/删除/改量各占 1/3，
+    //   见 benchmark/market_data_benchmark.cpp 第 4 节；一条 Binance 100 ms 增量常有上百档变化）。
     //   此时返回"最终状态是否与之前不同"：先改后又改回原值的档位不算变化（逐档调用会报告变化）。
     // levels 不得指向本簿自身的存储；qty_of(level) 取出数量（适配器的原始档位类型字段名不同）。
     template <class Level, class QtyOf>

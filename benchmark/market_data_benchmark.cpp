@@ -10,6 +10,9 @@
 //      旧流程使用的是升级后的 OrderBook（尾部快路径），因此差异只来自消息处理方式。
 // 注意：机器上的 CPU 由多个进程共享，单次运行的绝对值可能有 ±50% 的波动；比较请看同一次运行内的相对值。
 //   3. OrderBook upsert 微基准：400 档簿上的顶部更新（原地改量、顶部插入/删除、随机档位、旧式整簿重建）
+//   4. 一条增量应用到深簿：逐档 setLevel vs 批量 applyLevels（最优在前 / 打乱两种顺序）。生成器保持簿深度等于标签、
+//      插入/删除/改量各约 1/3，实测的平均深度与变化构成打印在每行旁边。
+// 自检（簿不一致、深度或构成偏离标签等）失败时打印 "!!"，程序以非零状态退出。
 // 用法：./build/market_data_benchmark [--quick]
 //
 
@@ -25,6 +28,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -282,6 +286,129 @@ std::string okxQty(std::mt19937_64& rng) {
 }
 
 std::string bybitQty(std::mt19937_64& rng) { return fixedTicks(1 + static_cast<std::int64_t>(rng() % 5000000), 6); }
+
+// ---------------------------------------------------------------------------
+// 自检：失败时打印 "!!"，程序最后以非零状态退出
+// ---------------------------------------------------------------------------
+int g_check_failures = 0;
+
+void check(bool ok, const std::string& what) {
+    if (ok) return;
+    ++g_check_failures;
+    std::printf("  !! %s\n", what.c_str());
+}
+
+// 两个簿的档位逐位相同
+bool sameBook(const OrderBook& x, const OrderBook& y) {
+    auto eq = [](const std::vector<PriceLevel>& a, const std::vector<PriceLevel>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i].price != b[i].price || a[i].quantity != b[i].quantity) return false;
+        }
+        return true;
+    };
+    return eq(x.getBids(), y.getBids()) && eq(x.getAsks(), y.getAsks());
+}
+
+// 实测的变化构成：把变化逐档 setLevel 到参考簿上，按档位数的变化分类；同时累计每条消息之前的簿深度
+struct ChangeMix {
+    std::uint64_t inserts = 0, deletes = 0, qty_changes = 0, noops = 0;
+    double depth_sum = 0;       // 每条消息之前的每侧平均档位数之和
+    std::size_t messages = 0;
+
+    std::uint64_t total() const { return inserts + deletes + qty_changes + noops; }
+    double pct(std::uint64_t x) const {
+        return total() == 0 ? 0.0 : 100.0 * static_cast<double>(x) / static_cast<double>(total());
+    }
+    double meanDepth() const { return messages == 0 ? 0.0 : depth_sum / static_cast<double>(messages); }
+};
+
+void applyClassified(OrderBook& book, BookSide side, const std::vector<PriceLevel>& levels, ChangeMix& mix) {
+    for (const PriceLevel& l : levels) {
+        const int before = side == BookSide::Bid ? book.getBidCount() : book.getAskCount();
+        const bool changed = book.setLevel(side, l.price, l.quantity);
+        const int after = side == BookSide::Bid ? book.getBidCount() : book.getAskCount();
+        if (after > before) {
+            ++mix.inserts;
+        } else if (after < before) {
+            ++mix.deletes;
+        } else if (changed) {
+            ++mix.qty_changes;
+        } else {
+            ++mix.noops;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 第 4 节的工作负载：深度平稳的增量生成器
+// ---------------------------------------------------------------------------
+// 交易所侧的买盘有 2 × depth 个价位槽（价格 65000 - 0.25 × s），开始时偶数槽有档位，即起始簿为
+// 65000 - 0.5 × i（i < depth）。每个变化以各 1/3 的概率删除一个已有档位、在一个空槽插入新档位、改一个已有档位的数量，
+// 目标在整个簿上均匀抽取；档位数偏离 depth 时插入/删除改为往回拉，所以深度保持在 depth ± 1，构成仍是各约 1/3。
+// 同一价格在一条消息里最多出现一次（与交易所的增量一致）。每条消息给出两种顺序：最优在前（Binance / OKX / Bybit
+// 的发送顺序）与随机打乱。
+struct DeepWorkload {
+    OrderBook start;
+    std::vector<std::vector<PriceLevel>> best_first;
+    std::vector<std::vector<PriceLevel>> shuffled;
+};
+
+DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_t msgs, std::uint64_t seed) {
+    const std::size_t slots = 2 * depth;
+    const auto price = [](std::size_t s) { return 65000.0 - 0.25 * static_cast<double>(s); };
+    std::mt19937_64 r(seed);
+    std::vector<std::size_t> present, absent, where(slots);
+    DeepWorkload w;
+    w.start.reserve(slots);
+    for (std::size_t s = 0; s < slots; ++s) {
+        std::vector<std::size_t>& pool = s % 2 == 0 ? present : absent;
+        where[s] = pool.size();
+        pool.push_back(s);
+        if (s % 2 == 0) w.start.updateBid(price(s), 1.0 + static_cast<double>(s / 2));
+    }
+    // 把槽 s 从 from 移到 to（与末尾交换后删除，O(1)）
+    auto move = [&](std::vector<std::size_t>& from, std::vector<std::size_t>& to, std::size_t s) {
+        const std::size_t i = where[s];
+        from[i] = from.back();
+        where[from[i]] = i;
+        from.pop_back();
+        where[s] = to.size();
+        to.push_back(s);
+    };
+    std::vector<std::size_t> stamp(slots, SIZE_MAX);  // 槽最近一次被改动的消息序号
+    w.best_first.resize(msgs);
+    w.shuffled.resize(msgs);
+    for (std::size_t m = 0; m < msgs; ++m) {
+        std::vector<PriceLevel>& batch = w.best_first[m];
+        batch.reserve(changes);
+        for (std::size_t k = 0; k < changes; ++k) {
+            unsigned op = static_cast<unsigned>(r() % 3);  // 0 删除，1 插入，2 改量
+            if (op != 2) {
+                if (present.size() > depth) op = 0;
+                if (present.size() < depth) op = 1;
+            }
+            const std::vector<std::size_t>& pool = op == 1 ? absent : present;
+            std::size_t s = 0;
+            do {
+                s = pool[r() % pool.size()];
+            } while (stamp[s] == m);
+            stamp[s] = m;
+            if (op == 0) {
+                move(present, absent, s);
+                batch.push_back({price(s), 0.0});
+            } else {
+                if (op == 1) move(absent, present, s);
+                batch.push_back({price(s), 1.0 + static_cast<double>(r() % 100) / 10.0});
+            }
+        }
+        std::vector<PriceLevel>& shuffled = w.shuffled[m];
+        shuffled = batch;
+        for (std::size_t i = shuffled.size(); i > 1; --i) std::swap(shuffled[i - 1], shuffled[r() % i]);  // Fisher-Yates
+        std::sort(batch.begin(), batch.end(), [](const PriceLevel& a, const PriceLevel& b) { return a.price > b.price; });
+    }
+    return w;
+}
 
 }  // namespace
 
@@ -727,61 +854,76 @@ int main(int argc, char** argv) {
 
     // ======================= 4. 一条增量消息应用到深簿：逐档 setLevel vs 批量 applyLevels =======================
     // 增量消息（Binance 100 ms diff、OKX books update）的档位变化分布在整个深度上：逐档 upsert 每次插入/删除
-    // 都要 memmove 半个簿；applyLevels 排序 + 一次线性归并。两种方式应用完全相同的消息序列，最终簿必须逐位相同。
+    // 都要 memmove 半个簿；applyLevels 一次线性归并（输入不是最优在前时先排序）。三种方式应用完全相同的变化，
+    // 最终簿必须逐位相同。生成器见 makeDeepWorkload：深度平稳在标签值上，插入/删除/改量各约 1/3；
+    // 每行旁边打印实测的平均深度与变化构成，偏离标签时自检失败。最深一档的标签等于适配器的簿上限 kMaxBookLevels。
     std::printf("\n4. One diff message applied to a deep book: per-level setLevel vs batched applyLevels (us/msg)\n");
-    std::printf("  %-30s %12s %12s %9s  %s\n", "book depth x changes per msg", "setLevel", "applyLevels", "speedup",
-                "same book");
+    std::printf("   Depth-stationary generator: each change deletes an existing level, inserts a new one or changes a\n"
+                "   level's quantity (1/3 each, uniform over the book); depth held at the label +-1; each price at most\n"
+                "   once per message. applyLevels runs on the batch sorted best-first (exchange order) and shuffled.\n");
+    std::printf("  %-26s %10s %19s %10s %10s %10s %10s %10s  %s\n", "book depth x changes/msg", "mean depth",
+                "ins/del/qty/noop %", "setLevel", "best-first", "shuffled", "x best-1st", "x shuffled", "same book");
     {
         struct Case {
-            int depth;
-            int changes;
+            std::size_t depth;
+            std::size_t changes;
         };
         const Case cases[] = {{50, 7}, {400, 30}, {1000, 30}, {1000, 130}, {5000, 130}, {5000, 300}};
         for (const Case& c : cases) {
-            const int msgs = quick ? 200 : 2000;
-            // 预生成消息：约 1/3 删除已有档位、1/3 新增档位（半档偏移）、1/3 改量，深度均匀分布
-            std::mt19937_64 r(11);
-            std::vector<std::vector<PriceLevel>> batches(static_cast<std::size_t>(msgs));
-            for (auto& batch : batches) {
-                batch.resize(static_cast<std::size_t>(c.changes));
-                for (PriceLevel& l : batch) {
-                    const int lvl = static_cast<int>(r() % static_cast<std::uint64_t>(c.depth));
-                    const unsigned kind = static_cast<unsigned>(r() % 3);
-                    l.price = 65000.0 - 0.5 * lvl - (kind == 1 ? 0.25 : 0.0);
-                    l.quantity = kind == 0 ? 0.0 : 1.0 + static_cast<double>(r() % 100) / 10.0;
-                }
-            }
-            auto run = [&](bool batched, OrderBook& book) {
-                book.clear();
-                for (int i = 0; i < c.depth; ++i) book.updateBid(65000.0 - 0.5 * i, 1.0 + i);
+            const std::size_t msgs = quick ? 200 : 2000;
+            const DeepWorkload w = makeDeepWorkload(c.depth, c.changes, msgs, 11);
+            // mode 0：逐档 setLevel（最优在前的顺序）；1：applyLevels（最优在前）；2：applyLevels（打乱）
+            auto run = [&](int mode, OrderBook& book) {
+                book = w.start;
+                book.reserve(2 * c.depth);
                 LevelBatchScratch scratch;
+                const auto& batches = mode == 2 ? w.shuffled : w.best_first;
                 std::int64_t total = 0;
                 for (const auto& batch : batches) {
                     const std::int64_t t0 = hft::nowNs();
-                    if (batched) {
-                        book.applyLevels(BookSide::Bid, batch.data(), batch.size(), scratch);
-                    } else {
+                    if (mode == 0) {
                         for (const PriceLevel& l : batch) book.setLevel(BookSide::Bid, l.price, l.quantity);
+                    } else {
+                        book.applyLevels(BookSide::Bid, batch.data(), batch.size(), scratch);
                     }
                     total += hft::nowNs() - t0;
                 }
                 doNotOptimize(book.getBids()[0].quantity);
                 return static_cast<double>(total) / static_cast<double>(msgs) / 1000.0;
             };
-            OrderBook seq_book, batch_book;
-            const double seq_us = run(false, seq_book);
-            const double batch_us = run(true, batch_book);
-            const auto& x = seq_book.getBids();
-            const auto& y = batch_book.getBids();
-            bool same = x.size() == y.size();
-            for (std::size_t i = 0; same && i < x.size(); ++i) {
-                same = x[i].price == y[i].price && x[i].quantity == y[i].quantity;
+            OrderBook seq_book, sorted_book, shuffled_book;
+            const double seq_us = run(0, seq_book);
+            const double sorted_us = run(1, sorted_book);
+            const double shuffled_us = run(2, shuffled_book);
+            // 不计时的核对：实测深度与变化构成
+            ChangeMix mix;
+            OrderBook ref = w.start;
+            for (const auto& batch : w.best_first) {
+                mix.depth_sum += ref.getBidCount();
+                ++mix.messages;
+                applyClassified(ref, BookSide::Bid, batch, mix);
             }
+            const bool same = sameBook(seq_book, sorted_book) && sameBook(seq_book, shuffled_book) && sameBook(seq_book, ref);
             char label[64];
-            std::snprintf(label, sizeof label, "%d levels x %d changes", c.depth, c.changes);
-            std::printf("  %-30s %12.2f %12.2f %8.1fx  %s\n", label, seq_us, batch_us, seq_us / batch_us,
-                        same ? "yes" : "NO");
+            std::snprintf(label, sizeof label, "%zu levels x %zu changes", c.depth, c.changes);
+            char shares[48];
+            std::snprintf(shares, sizeof shares, "%.1f/%.1f/%.1f/%.1f", mix.pct(mix.inserts), mix.pct(mix.deletes),
+                          mix.pct(mix.qty_changes), mix.pct(mix.noops));
+            std::printf("  %-26s %10.1f %19s %10.2f %10.2f %10.2f %9.1fx %9.1fx  %s\n", label, mix.meanDepth(), shares,
+                        seq_us, sorted_us, shuffled_us, seq_us / sorted_us, seq_us / shuffled_us, same ? "yes" : "NO");
+            check(same, std::string(label) + ": the three apply methods produced different books");
+            const double depth = static_cast<double>(c.depth);
+            check(std::abs(mix.meanDepth() - depth) <= std::max(1.0, 0.02 * depth),
+                  std::string(label) + ": mean depth is not the labelled depth");
+            for (std::uint64_t part : {mix.inserts, mix.deletes, mix.qty_changes}) {
+                check(std::abs(mix.pct(part) - 100.0 / 3.0) <= 5.0,
+                      std::string(label) + ": change mix is not about 1/3 insert, 1/3 delete, 1/3 quantity change");
+            }
         }
+    }
+    if (g_check_failures != 0) {
+        std::printf("\n%d self-check(s) failed\n", g_check_failures);
+        return 1;
     }
     return 0;
 }
