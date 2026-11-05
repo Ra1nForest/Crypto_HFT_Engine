@@ -1828,6 +1828,63 @@ TEST_CASE("okx: books5 and bbo-tbt pushes replace the book") {
     CHECK_EQ(a->stats().parse_errors, 0u);
 }
 
+// books5 推送，可选地带一个 checksum 字段（真实的 books5 / bbo-tbt 不带）
+std::string okxBooks5WithChecksum(const Levels& bids, const Levels& asks, std::int64_t checksum) {
+    return "{\"arg\":{\"channel\":\"books5\",\"instId\":\"BTC-USDT\"},\"data\":[{\"asks\":" + levelsJson(asks, true) +
+           ",\"bids\":" + levelsJson(bids, true) + ",\"ts\":\"1626537446491\",\"checksum\":" + std::to_string(checksum) +
+           "}]}";
+}
+
+TEST_CASE("okx: books5 and bbo-tbt pushes keep no level strings unless an entry carries a checksum") {
+    // 全量推送频道不带 checksum：校验串用不上，每条推送都不应清空、重填原始字符串表（校验本身保持开启）
+    AdapterConfig cfg = makeConfig(Exchange::OKX);
+    cfg.subscribe_msg = kOkxBooks5Subscribe;
+    auto a = makeAdapter(Exchange::OKX, cfg);
+    auto& okx = static_cast<OkxAdapter&>(*a);
+    a->onConnected();
+    const Levels bids = {{"31738.2", "0.67557666"}, {"31738", "0.02466947"}, {"31736.3", "0.01705046"}};
+    const Levels asks = {{"31738.3", "0.05973179"}, {"31738.5", "0.11035404"}, {"31739.6", "0.01"}};
+    AdapterResult r = feed(*a, okxBooks5(bids, asks));
+    CHECK(r.book_updated);
+    CHECK(r.error.empty());
+    CHECK_BOOK(a->book(), bids, asks);
+    CHECK(okx.checksumEnabled());
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 0u);
+    CHECK_EQ(okx.textEntries(BookSide::Ask), 0u);
+    CHECK(okx.checksumString().empty());
+    r = feed(*a, R"({"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["36232.2","1.8826134","0","17"]],"bids":[["36232.1","0.00572212","0","2"]],"ts":"1651826598363"}]})");
+    CHECK(r.book_updated);
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 0u);
+    CHECK_EQ(okx.textEntries(BookSide::Ask), 0u);
+    // 32 字节以上的档位字符串在全量推送里无关紧要：不触发"关闭校验"的安全阀
+    const std::string long_size = "1.000000000000000000000000000000000001";
+    r = feed(*a, okxBooks5({{"100", long_size}}, {{"101", "1"}}));
+    CHECK(r.error.empty());
+    CHECK(okx.checksumEnabled());
+    // 同一适配器先收到 books 快照（增量频道，维护字符串），再收到 books5 推送：旧字符串被清掉
+    r = feed(*a, okxBooks("snapshot", bids, asks, -1, 10, okxChecksum(bids, asks)));
+    CHECK(r.error.empty());
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 3u);
+    CHECK_EQ(okx.textEntries(BookSide::Ask), 3u);
+    const Levels bids2 = {{"31738.1", "1"}};
+    const Levels asks2 = {{"31738.4", "2"}};
+    r = feed(*a, okxBooks5(bids2, asks2));
+    CHECK_BOOK(a->book(), bids2, asks2);
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 0u);
+    CHECK_EQ(okx.textEntries(BookSide::Ask), 0u);
+    // 全量推送若真的带 checksum，照常维护字符串并校验；不符时与快照一样触发安全阀
+    r = feed(*a, okxBooks5WithChecksum(bids, asks, okxChecksum(bids, asks)));
+    CHECK(r.error.empty());
+    CHECK_EQ(okx.textEntries(BookSide::Bid), 3u);
+    CHECK_EQ(okx.checksumString(), okxChecksumString(bids, asks));
+    CHECK_EQ(a->stats().checksum_failures, 0u);
+    r = feed(*a, okxBooks5WithChecksum(bids, asks, okxChecksum(bids, asks) ^ 1));
+    CHECK(contains(r.error, "checksum verification disabled"));
+    CHECK_EQ(a->stats().checksum_failures, 1u);
+    CHECK(!okx.checksumEnabled());
+    CHECK_EQ(a->stats().parse_errors, 0u);
+}
+
 // OKX 交易所模拟：400 档簿，随机更新，校验和由逐位 CRC 独立计算
 class OkxSim {
 public:

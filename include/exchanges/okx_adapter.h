@@ -24,14 +24,16 @@
 // - 纯文本 "pong" → 忽略；{"event":"subscribe"/"unsubscribe"/...} → 忽略；
 //   {"event":"error","code":..,"msg":..} → error（订阅问题，不重连）；{"event":"notice",..}（服务升级通知）→ reconnect。
 // - 无 action 字段的推送（books5 / bbo-tbt）：{"arg":{"channel":"books5",..},"data":[{"asks":..,"bids":..,"ts":"ms"}]}
-//   → 替换整簿，已同步，exchange_ts_ms = data[0].ts。
+//   → 替换整簿，已同步，exchange_ts_ms = data[0].ts。这两个频道不带 checksum，因此不维护原始字符串表
+//   （每次推送都整簿替换，维护它只是白白清空、重填两张 2048 桶的表）；万一某条推送带了 checksum，照常校验。
 // - books 增量："action":"snapshot" → 替换整簿，seq = seqId，已同步；"action":"update" → 未同步时忽略；
 //   prevSeqId != 上一条 seqId → 缺口（gaps++、resyncs++、清空、未同步、send = {unsubscribe, subscribe}）；
 //   否则逐档 upsert（size "0" 删除），seq = seqId。心跳更新（bids/asks 为空且 prevSeqId == seqId）通过衔接检查但不改变簿；
 //   序列重置（seqId < prevSeqId）只要 prevSeqId 衔接即接受。
 // - checksum（verify_checksum 开启且消息带该字段）：取前 25 档，按 bid0px:bid0sz:ask0px:ask0sz:bid1px:... 交错拼接，
 //   一侧不足 25 档时继续拼另一侧剩余档位，':' 连接，CRC32 按有符号 int32 与 checksum 比较。
-//   拼接使用每档收到的**原始字符串**（每侧一个 hft::FlatHashMap<价格位模式, LevelText>，每次档位变化同步更新）。
+//   拼接使用每档收到的**原始字符串**（每侧一个 hft::FlatHashMap<价格位模式, LevelText>，每次档位变化同步更新；
+//   只在增量频道或条目自带 checksum 时维护）。
 //   更新后不符 → checksum_failures++，按缺口方式重同步。
 //   安全阀：刚收到的**快照**本身校验不符，说明是我们的拼接方式（而不是数据）有误 → 设置 error
 //   （"checksum verification disabled: ..."），在适配器余下的生命周期内关闭校验，继续运行。
@@ -66,14 +68,15 @@ public:
     bool checksumEnabled() const noexcept { return verify_; }
     std::int64_t lastSeqId() const noexcept { return seq_; }
     const std::string& unsubscribeMessage() const noexcept { return unsubscribe_msg_; }
-    // 当前簿的校验串（与计算 checksum 用的完全一致；校验关闭后不再维护原始字符串，返回空串）
+    // 当前簿的校验串（与计算 checksum 用的完全一致）。不维护原始字符串时返回空串：
+    // 校验关闭之后，以及全量推送频道（books5 / bbo-tbt，推送不带 checksum）
     std::string checksumString() const {
         char buf[kChecksumBufSize];
         std::size_t len = 0;
         if (!verify_ || !buildChecksumString(buf, len)) return std::string();
         return std::string(buf, len);
     }
-    // 原始字符串表的条目数（应与簿的档位数一致）
+    // 原始字符串表的条目数（维护时与簿的档位数一致；不维护时为 0）
     std::size_t textEntries(BookSide side) const noexcept {
         return side == BookSide::Bid ? bid_text_.size() : ask_text_.size();
     }
@@ -310,12 +313,24 @@ private:
 
     // 全量快照（books 的 snapshot，或 books5/bbo-tbt 的每次推送）。返回是否继续处理同一消息的后续条目。
     bool applySnapshot(const Entry& e, AdapterResult& out) {
-        if (verify_ && !textsFit(e)) disableChecksum(out, "a level string is longer than 32 bytes");
+        // 原始字符串只在用得上时维护：增量频道（之后的 update 要用它们校验），或本条目自带 checksum
+        const bool keep_texts = verify_ && (incremental_ || (e.seen & kChecksum) != 0);
+        if (keep_texts && !textsFit(e)) disableChecksum(out, "a level string is longer than 32 bytes");
         book_.clear();
+        // 表为空时 clear() 是 O(1)；不维护字符串时也要清，丢掉之前 books 快照留下的条目
         bid_text_.clear();
         ask_text_.clear();
-        for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setLevel(BookSide::Bid, bids_[i]);
-        for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setLevel(BookSide::Ask, asks_[i]);
+        if (keep_texts && verify_) {  // verify_ 可能刚被 disableChecksum 关闭
+            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setLevel(BookSide::Bid, bids_[i]);
+            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setLevel(BookSide::Ask, asks_[i]);
+        } else {
+            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) {
+                book_.setLevel(BookSide::Bid, bids_[i].price, bids_[i].qty);
+            }
+            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) {
+                book_.setLevel(BookSide::Ask, asks_[i].price, asks_[i].qty);
+            }
+        }
         trimBook();
         seq_ = (e.seen & kSeq) != 0 ? e.seq : 0;
         book_.setUpdateId(seq_ > 0 ? static_cast<std::uint64_t>(seq_) : 0);
