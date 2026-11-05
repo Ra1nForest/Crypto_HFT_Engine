@@ -627,6 +627,133 @@ TEST_CASE("orderbook: garbage input through the public API always leaves a valid
     CHECK(why.empty());
 }
 
+TEST_CASE("orderbook: applyLevels batch merge equals sequential setLevel (randomized, both sides)") {
+    // 随机簿 + 随机批次（同价重复、删除不存在的档位、非有限值、深浅各处），批量应用的最终状态必须与逐档
+    // setLevel 逐位相同；小批次（<= kBatchThreshold）返回值与逐档一致，大批次返回"最终状态是否改变"。
+    std::mt19937_64 rng(20261105);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    LevelBatchScratch scratch;
+    int big_batches = 0, small_batches = 0, unchanged_big = 0;
+    for (int round = 0; round < 3000; ++round) {
+        const BookSide side = (round & 1) ? BookSide::Ask : BookSide::Bid;
+        OrderBook seq_book, batch_book;
+        const int depth = static_cast<int>(rng() % 600);
+        const double base = 1000.0;
+        for (int i = 0; i < depth; ++i) {
+            const double p = base + static_cast<double>(rng() % 1200) * 0.5;
+            const double q = 1.0 + static_cast<double>(rng() % 7);
+            seq_book.setLevel(side, p, q);
+            batch_book.setLevel(side, p, q);
+        }
+        REQUIRE(sameLevels(seq_book, batch_book));
+        const OrderBook before = seq_book;
+        // 批次大小覆盖阈值两侧：0..kBatchThreshold+2 与更大的批次
+        std::size_t n = (rng() % 4 == 0) ? rng() % (OrderBook::kBatchThreshold + 3) : rng() % 300;
+        std::vector<PriceLevel> batch;
+        for (std::size_t i = 0; i < n; ++i) {
+            double p = base + static_cast<double>(rng() % 1300) * 0.5 - 25.0;
+            double q = static_cast<double>(rng() % 5);  // 0 = 删除（约 1/5）
+            if (rng() % 40 == 0) p = (rng() & 1u) ? nan : inf;
+            if (rng() % 40 == 0) q = (rng() & 1u) ? nan : -inf;
+            if (!batch.empty() && rng() % 6 == 0) p = batch[rng() % batch.size()].price;  // 同价重复
+            batch.push_back({p, q});
+        }
+        bool seq_changed = false;
+        for (const PriceLevel& l : batch) seq_changed |= seq_book.setLevel(side, l.price, l.quantity);
+        const bool batch_changed = batch_book.applyLevels(side, batch.data(), batch.size(), scratch);
+        if (!sameLevels(seq_book, batch_book)) {
+            FAIL("round " + std::to_string(round) + ": batch result differs from sequential setLevel");
+        }
+        std::string why;
+        if (!batch_book.validate(&why)) FAIL("round " + std::to_string(round) + ": " + why);
+        if (n <= OrderBook::kBatchThreshold) {
+            ++small_batches;
+            CHECK_EQ(batch_changed, seq_changed);
+        } else {
+            ++big_batches;
+            const bool final_differs = !sameLevels(before, batch_book);
+            CHECK_EQ(batch_changed, final_differs);
+            if (!batch_changed) ++unchanged_big;
+            if (batch_changed) CHECK(seq_changed);  // 最终有变化 ⇒ 逐档过程中必有变化
+        }
+    }
+    CHECK_GT(big_batches, 1500);
+    CHECK_GT(small_batches, 300);
+    std::printf("    %d big + %d small batches, %d big batches left the book unchanged\n", big_batches,
+                small_batches, unchanged_big);
+}
+
+TEST_CASE("orderbook: applyLevels handles edge batches (empty book, all deletes, duplicates, top inserts)") {
+    LevelBatchScratch scratch;
+    OrderBook b;
+    // 空簿 + 大批次：新建整侧（乱序输入）
+    std::vector<PriceLevel> batch;
+    for (int i = 0; i < 20; ++i) batch.push_back({100.0 + ((i * 7) % 20), 1.0 + i});
+    CHECK(b.applyLevels(BookSide::Ask, batch.data(), batch.size(), scratch));
+    REQUIRE_EQ(b.getAskCount(), 20);
+    CHECK_EQ(b.getAsks()[0].price, 100.0);
+    CHECK_EQ(b.getAsks()[19].price, 119.0);
+    CHECK(b.validate());
+    // 同一价格多次更新：最后一条生效（包括"先删后加"与"先加后删"）
+    std::vector<PriceLevel> dup;
+    for (int i = 0; i < 10; ++i) dup.push_back({200.0 + i, 1.0});
+    dup.push_back({100.0, 0.0});
+    dup.push_back({100.0, 9.0});   // 100：删后再加 → 9
+    dup.push_back({101.0, 5.0});
+    dup.push_back({101.0, 0.0});   // 101：改后再删 → 不存在
+    CHECK(b.applyLevels(BookSide::Ask, dup.data(), dup.size(), scratch));
+    CHECK_EQ(b.getAsks()[0].price, 100.0);
+    CHECK_EQ(b.getAsks()[0].quantity, 9.0);
+    CHECK_EQ(b.getAsks()[1].price, 102.0);
+    CHECK_EQ(b.getAskCount(), 29);
+    CHECK(b.validate());
+    // 只删除不存在的档位、或把数量设回原值：大批次报告"未变化"且不改动簿
+    const OrderBook before = b;
+    std::vector<PriceLevel> noop;
+    for (int i = 0; i < 12; ++i) noop.push_back({500.0 + i, 0.0});
+    noop.push_back({100.0, 9.0});
+    CHECK(!b.applyLevels(BookSide::Ask, noop.data(), noop.size(), scratch));
+    CHECK(sameLevels(b, before));
+    // 全部删除
+    std::vector<PriceLevel> wipe;
+    for (const PriceLevel& l : b.getAsks()) wipe.push_back({l.price, 0.0});
+    CHECK(b.applyLevels(BookSide::Ask, wipe.data(), wipe.size(), scratch));
+    CHECK_EQ(b.getAskCount(), 0);
+    // 买盘：在顶部之上批量插入新的最优价
+    for (int i = 0; i < 50; ++i) b.updateBid(1000.0 - i, 1.0);
+    std::vector<PriceLevel> top;
+    for (int i = 1; i <= 15; ++i) top.push_back({1000.0 + i, 2.0});
+    CHECK(b.applyLevels(BookSide::Bid, top.data(), top.size(), scratch));
+    CHECK_EQ(b.getBidCount(), 65);
+    CHECK_EQ(b.getBestBid().price, 1015.0);
+    CHECK(b.validate());
+}
+
+TEST_CASE("orderbook: applyLevels does not allocate once the scratch and book have grown") {
+    LevelBatchScratch scratch;
+    OrderBook b;
+    std::mt19937_64 rng(7);
+    for (int i = 0; i < 1000; ++i) b.updateBid(60000.0 - i * 0.01, 1.0);
+    std::vector<PriceLevel> batch(130);
+    // 一轮：130 档随机深度的变化（约 1/3 删除）后补回到约 1000 档
+    auto step = [&] {
+        for (PriceLevel& l : batch) {
+            l.price = 60000.0 - static_cast<double>(rng() % 1000) * 0.01;
+            l.quantity = static_cast<double>(rng() % 3);
+        }
+        b.applyLevels(BookSide::Bid, batch.data(), batch.size(), scratch);
+        while (b.getBidCount() < 1000) b.updateBid(60000.0 - static_cast<double>(rng() % 1000) * 0.01, 1.0);
+    };
+    for (int warm = 0; warm < 300; ++warm) step();  // 预热：簿与工作区两块存储的容量都长到稳态
+    g_alloc_count.store(0);
+    g_count_allocs.store(true);
+    for (int i = 0; i < 1000; ++i) step();
+    g_count_allocs.store(false);
+    CHECK_EQ(g_alloc_count.load(), 0u);
+    CHECK(b.validate());
+}
+
 // ============================================================================
 // BookSnapshot
 // ============================================================================

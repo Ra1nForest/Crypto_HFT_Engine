@@ -272,8 +272,9 @@ private:
             return;
         }
         bool changed = false;
-        for (const RawLevel& l : bids_) changed |= book_.setLevel(BookSide::Bid, l.price, l.qty);
-        for (const RawLevel& l : asks_) changed |= book_.setLevel(BookSide::Ask, l.price, l.qty);
+        const auto qty = [](const RawLevel& l) { return l.qty; };
+        changed |= book_.applyLevels(BookSide::Bid, bids_.data(), bids_.size(), batch_, qty);
+        changed |= book_.applyLevels(BookSide::Ask, asks_.data(), asks_.size(), batch_, qty);
         trimBook();
         book_.setUpdateId(u);
         last_u_ = u;

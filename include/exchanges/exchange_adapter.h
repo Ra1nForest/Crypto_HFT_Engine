@@ -108,6 +108,7 @@ protected:
     }
 
     OrderBook book_;
+    LevelBatchScratch batch_;   // book_.applyLevels 的工作区（增量消息批量应用，稳态零分配）
     AdapterStats stats_;
     AdapterConfig cfg_;
 };

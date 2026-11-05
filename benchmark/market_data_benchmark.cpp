@@ -724,5 +724,64 @@ int main(int argc, char** argv) {
             std::printf("  %-58s %8.1f ns/op\n", "BookSnapshot assignFrom(20 levels) + copyTo", ns);
         }
     }
+
+    // ======================= 4. 一条增量消息应用到深簿：逐档 setLevel vs 批量 applyLevels =======================
+    // 增量消息（Binance 100 ms diff、OKX books update）的档位变化分布在整个深度上：逐档 upsert 每次插入/删除
+    // 都要 memmove 半个簿；applyLevels 排序 + 一次线性归并。两种方式应用完全相同的消息序列，最终簿必须逐位相同。
+    std::printf("\n4. One diff message applied to a deep book: per-level setLevel vs batched applyLevels (us/msg)\n");
+    std::printf("  %-30s %12s %12s %9s  %s\n", "book depth x changes per msg", "setLevel", "applyLevels", "speedup",
+                "same book");
+    {
+        struct Case {
+            int depth;
+            int changes;
+        };
+        const Case cases[] = {{50, 7}, {400, 30}, {1000, 30}, {1000, 130}, {5000, 130}, {5000, 300}};
+        for (const Case& c : cases) {
+            const int msgs = quick ? 200 : 2000;
+            // 预生成消息：约 1/3 删除已有档位、1/3 新增档位（半档偏移）、1/3 改量，深度均匀分布
+            std::mt19937_64 r(11);
+            std::vector<std::vector<PriceLevel>> batches(static_cast<std::size_t>(msgs));
+            for (auto& batch : batches) {
+                batch.resize(static_cast<std::size_t>(c.changes));
+                for (PriceLevel& l : batch) {
+                    const int lvl = static_cast<int>(r() % static_cast<std::uint64_t>(c.depth));
+                    const unsigned kind = static_cast<unsigned>(r() % 3);
+                    l.price = 65000.0 - 0.5 * lvl - (kind == 1 ? 0.25 : 0.0);
+                    l.quantity = kind == 0 ? 0.0 : 1.0 + static_cast<double>(r() % 100) / 10.0;
+                }
+            }
+            auto run = [&](bool batched, OrderBook& book) {
+                book.clear();
+                for (int i = 0; i < c.depth; ++i) book.updateBid(65000.0 - 0.5 * i, 1.0 + i);
+                LevelBatchScratch scratch;
+                std::int64_t total = 0;
+                for (const auto& batch : batches) {
+                    const std::int64_t t0 = hft::nowNs();
+                    if (batched) {
+                        book.applyLevels(BookSide::Bid, batch.data(), batch.size(), scratch);
+                    } else {
+                        for (const PriceLevel& l : batch) book.setLevel(BookSide::Bid, l.price, l.quantity);
+                    }
+                    total += hft::nowNs() - t0;
+                }
+                doNotOptimize(book.getBids()[0].quantity);
+                return static_cast<double>(total) / static_cast<double>(msgs) / 1000.0;
+            };
+            OrderBook seq_book, batch_book;
+            const double seq_us = run(false, seq_book);
+            const double batch_us = run(true, batch_book);
+            const auto& x = seq_book.getBids();
+            const auto& y = batch_book.getBids();
+            bool same = x.size() == y.size();
+            for (std::size_t i = 0; same && i < x.size(); ++i) {
+                same = x[i].price == y[i].price && x[i].quantity == y[i].quantity;
+            }
+            char label[64];
+            std::snprintf(label, sizeof label, "%d levels x %d changes", c.depth, c.changes);
+            std::printf("  %-30s %12.2f %12.2f %8.1fx  %s\n", label, seq_us, batch_us, seq_us / batch_us,
+                        same ? "yes" : "NO");
+        }
+    }
     return 0;
 }

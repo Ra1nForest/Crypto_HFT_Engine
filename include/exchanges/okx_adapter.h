@@ -381,8 +381,14 @@ private:
         }
         if (verify_ && !textsFit(e)) disableChecksum(out, "a level string is longer than 32 bytes");
         bool changed = false;
-        for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) changed |= setLevel(BookSide::Bid, bids_[i]);
-        for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) changed |= setLevel(BookSide::Ask, asks_[i]);
+        // 簿：批量排序 + 归并（见 OrderBook::applyLevels）；原始字符串表按消息顺序逐档同步（同价以后者为准）
+        const auto qty = [](const RawLevel& l) { return l.qty; };
+        changed |= book_.applyLevels(BookSide::Bid, bids_.data() + e.bid_begin, e.bid_end - e.bid_begin, batch_, qty);
+        changed |= book_.applyLevels(BookSide::Ask, asks_.data() + e.ask_begin, e.ask_end - e.ask_begin, batch_, qty);
+        if (verify_) {
+            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setText(BookSide::Bid, bids_[i]);
+            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setText(BookSide::Ask, asks_[i]);
+        }
         trimBook();
         seq_ = e.seq;
         book_.setUpdateId(seq_ > 0 ? static_cast<std::uint64_t>(seq_) : 0);
@@ -415,7 +421,12 @@ private:
     // 设置一档并同步原始字符串（数量 0 删除）。返回簿是否变化。
     bool setLevel(BookSide side, const RawLevel& l) {
         const bool changed = book_.setLevel(side, l.price, l.qty);
-        if (!verify_) return changed;
+        if (verify_) setText(side, l);
+        return changed;
+    }
+
+    // 同步一档的原始字符串（数量 0 删除）；只在校验开启时调用
+    void setText(BookSide side, const RawLevel& l) {
         TextMap& texts = side == BookSide::Bid ? bid_text_ : ask_text_;
         const std::uint64_t key = adapter_detail::priceKey(l.price);
         if (!(l.qty > 0.0)) {
@@ -427,7 +438,6 @@ private:
             std::memcpy(t.text + l.px.size() + 1, l.sz.data(), l.sz.size());
             t.len = static_cast<std::uint8_t>(l.px.size() + 1 + l.sz.size());
         }
-        return changed;
     }
 
     // 条目中所有字符串都能原样存进 LevelText

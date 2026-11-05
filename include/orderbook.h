@@ -23,6 +23,18 @@ struct PriceLevel {
 // 买卖方向
 enum class BookSide { Bid, Ask };
 
+// OrderBook::applyLevels 的可复用工作区（由调用者持有，例如每个行情适配器一个）。
+// 两个 vector 的容量随使用增长后保持不变，稳态下批量更新零分配。不要在多个线程间共享。
+struct LevelBatchScratch {
+    struct Item {
+        double price;
+        double quantity;
+        std::uint32_t seq;  // 在本批中的原始顺序：同价多条更新时以后出现者为准
+    };
+    std::vector<Item> items;
+    std::vector<PriceLevel> merged;
+};
+
 // L2 订单簿：
 // - 买盘严格递减、卖盘严格递增，下标 0 为最优档（显示模块与套利检测依赖 getBids()[0] 为买一）。
 // - updateBid/updateAsk/setLevel 为 upsert：二分查找价格；数量 <= 0 删除该档；价格或数量不是有限值时忽略
@@ -32,6 +44,7 @@ enum class BookSide { Bid, Ask };
 // - 价格相等用 double 精确比较：相同的交易所字符串经 from_chars（正确舍入）解析出相同的 double。
 // - 设计取舍：扁平 vector 让顶部读取与整簿拷贝极快、缓存友好；代价是在顶部插入/删除新档位需要
 //   memmove 整个一侧（400 档约 6.4 KB，百纳秒级）。修改已有档位的数量不移动内存。
+//   一条增量消息有很多档位变化时用 applyLevels：排序后一次线性归并，避免逐档 memmove（深簿上快一个数量级）。
 // - 非线程安全：由持有者自行同步（行情线程私有，或在锁内拷贝）。
 class OrderBook {
 public:
@@ -69,6 +82,40 @@ public:
     bool setLevel(BookSide side, double price, double quantity) {
         if (side == BookSide::Bid) return upsert<true>(bids_, price, quantity);
         return upsert<false>(asks_, price, quantity);
+    }
+
+    // 批量 upsert：一次性应用一条增量消息中某一侧的全部档位，最终状态与"按顺序逐档 setLevel"完全相同
+    // （同一价格以后出现者为准；数量 <= 0 删除；价格或数量非有限值的条目忽略）。
+    // - 不超过 kBatchThreshold 条：直接逐档 upsert（顶部附近的少量更新这样最快，返回值也与逐档调用一致）。
+    // - 更多条：按价格排序（下标作次序键，std::sort 原地进行、不分配内存）、同价只保留最后一条，再与现有档位
+    //   做一次线性归并：O(档数 + n log n)，取代逐档插入/删除各自 O(档数) 的 memmove
+    //   （1000 档的簿上每档约 0.7 µs、5000 档约 3 µs；一条 Binance 100 ms 增量常有上百档变化）。
+    //   此时返回"最终状态是否与之前不同"：先改后又改回原值的档位不算变化（逐档调用会报告变化）。
+    // levels 不得指向本簿自身的存储；qty_of(level) 取出数量（适配器的原始档位类型字段名不同）。
+    template <class Level, class QtyOf>
+    bool applyLevels(BookSide side, const Level* levels, std::size_t n, LevelBatchScratch& scratch,
+                     QtyOf qty_of) {
+        if (n <= kBatchThreshold) {
+            bool changed = false;
+            for (std::size_t i = 0; i < n; ++i) changed |= setLevel(side, levels[i].price, qty_of(levels[i]));
+            return changed;
+        }
+        std::vector<LevelBatchScratch::Item>& items = scratch.items;
+        items.clear();
+        items.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const double price = levels[i].price;
+            const double qty = qty_of(levels[i]);
+            if (!std::isfinite(price) || !std::isfinite(qty)) continue;  // 与 setLevel 一致：忽略
+            items.push_back({price, qty, static_cast<std::uint32_t>(i)});
+        }
+        if (side == BookSide::Bid) return mergeBatch<true>(bids_, scratch);
+        return mergeBatch<false>(asks_, scratch);
+    }
+
+    // PriceLevel 数组的便捷重载
+    bool applyLevels(BookSide side, const PriceLevel* levels, std::size_t n, LevelBatchScratch& scratch) {
+        return applyLevels(side, levels, n, scratch, [](const PriceLevel& l) { return l.quantity; });
     }
 
     // 用 levels[0, n) 整体替换某一侧（应为最优在前的有序档位；levels 不得指向本簿自身的存储）。
@@ -186,9 +233,56 @@ public:
         }
     }
 
+    // applyLevels 改走排序 + 归并的批量阈值（条数）
+    static constexpr std::size_t kBatchThreshold = 8;
+
 private:
     // upsert 头部顺序查找的档数（之后改用二分查找）
     static constexpr std::size_t kLinearProbe = 8;
+
+    // 批量归并实现：scratch.items 为已过滤的有效更新（原始顺序）。kBid = true 表示买盘（降序）。
+    template <bool kBid>
+    static bool mergeBatch(std::vector<PriceLevel>& v, LevelBatchScratch& scratch) {
+        std::vector<LevelBatchScratch::Item>& items = scratch.items;
+        if (items.empty()) return false;
+        // 最优在前；同价按原始顺序，这样每个同价段的最后一条就是生效的那条
+        std::sort(items.begin(), items.end(),
+                  [](const LevelBatchScratch::Item& a, const LevelBatchScratch::Item& b) {
+                      if (a.price != b.price) return better<kBid>(a.price, b.price);
+                      return a.seq < b.seq;
+                  });
+        std::vector<PriceLevel>& out = scratch.merged;
+        out.clear();
+        out.reserve(v.size() + items.size());
+        bool changed = false;
+        std::size_t i = 0;  // 现有档位游标
+        for (std::size_t j = 0; j < items.size();) {
+            std::size_t last = j;
+            while (last + 1 < items.size() && items[last + 1].price == items[j].price) ++last;
+            const LevelBatchScratch::Item& up = items[last];
+            j = last + 1;
+            // 比该价格更优的现有档位原样保留
+            while (i < v.size() && better<kBid>(v[i].price, up.price)) out.push_back(v[i++]);
+            const bool remove = !(up.quantity > 0.0);
+            if (i < v.size() && v[i].price == up.price) {
+                if (remove) {
+                    changed = true;  // 删除已有档位
+                } else {
+                    if (v[i].quantity != up.quantity) changed = true;
+                    out.push_back({up.price, up.quantity});
+                }
+                ++i;
+            } else if (!remove) {
+                out.push_back({up.price, up.quantity});  // 新档位
+                changed = true;
+            }
+            // 删除不存在的档位：无事发生
+        }
+        if (!changed) return false;
+        out.insert(out.end(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+        v.swap(out);  // 旧存储留在 scratch 中供下次复用
+        return true;
+    }
 
     // a 是否比 b 更优：买盘价格越高越优，卖盘价格越低越优
     template <bool kBid>

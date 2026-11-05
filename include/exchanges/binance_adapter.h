@@ -412,8 +412,10 @@ private:
                        const Level* asks, std::size_t na, bool& changed) {
         if (final_id <= local_id_) return Outcome::Stale;
         if (first_id > local_id_ + 1) return Outcome::Gap;
-        for (std::size_t i = 0; i < nb; ++i) changed |= book_.setLevel(BookSide::Bid, bids[i].price, qtyOf(bids[i]));
-        for (std::size_t i = 0; i < na; ++i) changed |= book_.setLevel(BookSide::Ask, asks[i].price, qtyOf(asks[i]));
+        // 一条事件常有上百档变化：批量排序 + 归并，避免逐档 memmove（见 OrderBook::applyLevels）
+        const auto qty = [](const Level& l) { return qtyOf(l); };
+        changed |= book_.applyLevels(BookSide::Bid, bids, nb, batch_, qty);
+        changed |= book_.applyLevels(BookSide::Ask, asks, na, batch_, qty);
         trimBook();
         local_id_ = final_id;
         book_.setUpdateId(final_id);
