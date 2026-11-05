@@ -9,6 +9,7 @@
 #include "logger.h"
 #include "text_util.h"
 
+#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
@@ -24,14 +25,21 @@
 
 namespace {
 
-// 信号处理函数只调用 async-signal-safe 的函数（clock_gettime、write、_Exit），
-// 与主循环之间只通过无锁原子量通信。
+// 信号处理函数只调用 async-signal-safe 的函数（clock_gettime、write、sigaction、sigemptyset、sigaddset、
+// pthread_sigmask、raise、_Exit），与主循环之间只通过无锁原子量通信。处理函数都在主线程上运行：
+// feed 线程创建时屏蔽了这些信号（见 MonitorApp::startFeeds）。
 std::atomic<bool> g_stop{false};                // 请求优雅退出（MonitorApp::run 的 stop 标志）
 std::atomic<std::int64_t> g_first_stop_ns{-1};  // 第一次 SIGINT / SIGTERM 的 CLOCK_MONOTONIC 时刻；-1 = 还没有
-std::atomic<bool> g_tui_active{false};          // 终端界面运行中（强制退出时需要恢复光标）
+std::atomic<CursorState> g_cursor{CursorState::Visible};  // 终端界面的光标（MonitorApp 维护，见 RunOptions::cursor_state）
+std::atomic<bool> g_redraw{false};              // SIGCONT 之后下一帧整屏重画（MonitorApp 取走，见 RunOptions::redraw）
+std::atomic<bool> g_handle_tstp{false};         // 接管了 SIGTSTP（启动时被忽略则不接管）
 
-static_assert(std::atomic<bool>::is_always_lock_free && std::atomic<std::int64_t>::is_always_lock_free,
+static_assert(std::atomic<bool>::is_always_lock_free && std::atomic<std::int64_t>::is_always_lock_free &&
+                  std::atomic<CursorState>::is_always_lock_free,
               "signal handlers require lock-free atomics");
+
+// 光标可能处于隐藏状态（Hidden，或显示序列还没写完的 Restoring）：停止 / 强制退出之前要写显示序列
+bool cursorMayBeHidden() noexcept { return g_cursor.load(std::memory_order_seq_cst) != CursorState::Visible; }
 
 // 同一次 Ctrl+C 可能到达两次：终端把 SIGINT 发给整个前台进程组，timeout 之类的包装程序收到后又转发一次
 // （第一次已被处理，两次不会合并）。第一次之后这么久之内的 SIGINT / SIGTERM 视为同一次请求。
@@ -74,7 +82,7 @@ void onStopSignal(int sig) {
         errno = saved_errno;
         return;
     }
-    if (g_tui_active.load(std::memory_order_relaxed)) {
+    if (cursorMayBeHidden()) {
         // 与 MonitorApp::restoreCursor 相同：显示光标并换行
         writeAll(STDOUT_FILENO, Display::kShowCursor, sizeof(Display::kShowCursor) - 1);
         writeAll(STDOUT_FILENO, "\n", 1);
@@ -84,9 +92,59 @@ void onStopSignal(int sig) {
     std::_Exit(128 + sig);
 }
 
+// SIGHUP（终端窗口关闭、SSH 断开）：与 SIGTERM 一样优雅退出（日志刷新、最终报告），但从不强制退出：
+// 一次挂断常常带来两个 SIGHUP（shell 转发给作业一次，内核向前台进程组再发一次）。
+void onHangup(int) { g_stop.store(true, std::memory_order_release); }
+
+// SIGTSTP（Ctrl+Z）：终端界面隐藏了光标时先恢复它，再按默认动作停止进程：重置为 SIG_DFL 并重新发出。
+// 处理函数执行期间 SIGTSTP 被阻塞，所以 raise 的信号先挂起（与期间又按的 Ctrl+Z 合并成一个），解除阻塞时
+// 进程才停止，直到 SIGCONT（onContinue 重新接管 SIGTSTP）。
+void onTerminalStop(int) {
+    const int saved_errno = errno;
+    if (cursorMayBeHidden()) writeAll(STDOUT_FILENO, Display::kShowCursor, sizeof(Display::kShowCursor) - 1);
+    struct sigaction dfl {};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    ::sigaction(SIGTSTP, &dfl, nullptr);
+    ::raise(SIGTSTP);
+    sigset_t tstp;
+    sigemptyset(&tstp);
+    sigaddset(&tstp, SIGTSTP);
+    ::pthread_sigmask(SIG_UNBLOCK, &tstp, nullptr);
+    errno = saved_errno;
+}
+
+// SIGCONT（fg、bg、kill -CONT）：重新接管 SIGTSTP；终端界面再次隐藏光标，并让下一帧清屏后整屏重画
+// （停止期间 shell 可能改写了屏幕）。
+void onContinue(int) {
+    const int saved_errno = errno;
+    if (g_handle_tstp.load(std::memory_order_relaxed)) installHandler(SIGTSTP, onTerminalStop);
+    if (g_cursor.load(std::memory_order_seq_cst) == CursorState::Hidden) {  // Restoring 时不能再隐藏
+        writeAll(STDOUT_FILENO, Display::kHideCursor, sizeof(Display::kHideCursor) - 1);
+        g_redraw.store(true, std::memory_order_seq_cst);
+    }
+    errno = saved_errno;
+}
+
+// 启动时被忽略（SIG_IGN，由父进程继承而来）的信号保持忽略：nohup 让 SIGHUP 被忽略，
+// 没有作业控制的 shell 让后台进程忽略 SIGTSTP
+bool ignoredAtStartup(int sig) noexcept {
+    struct sigaction old {};
+    return ::sigaction(sig, nullptr, &old) == 0 && old.sa_handler == SIG_IGN;
+}
+
 void installSignalHandlers() {
     installHandler(SIGINT, onStopSignal);
     installHandler(SIGTERM, onStopSignal);
+    if (!ignoredAtStartup(SIGHUP)) installHandler(SIGHUP, onHangup);
+    if (!ignoredAtStartup(SIGTSTP)) {
+        g_handle_tstp.store(true, std::memory_order_relaxed);
+        installHandler(SIGTSTP, onTerminalStop);
+    }
+    installHandler(SIGCONT, onContinue);
+    // 写已关闭的管道时返回 EPIPE 而不是被 SIGPIPE 杀死：例如 "| tee" 随终端一起被挂断后，
+    // 优雅退出仍能把最终报告写进日志文件
+    ::signal(SIGPIPE, SIG_IGN);
 }
 
 void printBanner() {
@@ -136,17 +194,15 @@ int main(int argc, char** argv) {
     opt.duration_s = cli.duration_s;
     opt.busy_poll = cli.busy_poll;
     opt.out = stdout;
+    opt.cursor_state = &g_cursor;
+    opt.redraw = &g_redraw;
     const char* no_color = std::getenv("NO_COLOR");
     opt.color = no_color == nullptr || no_color[0] == '\0';
 
     try {
         MonitorApp app(cfg, logger, opt);
-        g_tui_active.store(!cli.headless, std::memory_order_relaxed);
-        const int rc = app.run(g_stop);
-        g_tui_active.store(false, std::memory_order_relaxed);
-        return rc;
+        return app.run(g_stop);
     } catch (const std::exception& e) {
-        g_tui_active.store(false, std::memory_order_relaxed);
         std::fprintf(stderr, "Fatal: %s\n", e.what());
         logger.warn(std::string("Fatal: ") + e.what());
         return 1;

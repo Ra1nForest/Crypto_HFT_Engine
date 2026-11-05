@@ -74,9 +74,10 @@ inline std::string usageText(const std::string& program) {
            "                        lowest queue latency (microseconds), but one CPU core stays at 100%\n"
            "  -h, --help            show this help and exit\n"
            "\n"
-           "Ctrl+C or SIGTERM stops the monitor gracefully and prints the final report. A repeated Ctrl+C or\n"
-           "SIGTERM within 1 s counts as the same request (wrappers such as timeout forward it); a later one\n"
-           "exits immediately. Logs are appended to logs/arb_<date>.log under the current directory.\n";
+           "Ctrl+C, SIGTERM or SIGHUP stops the monitor gracefully and prints the final report. A repeated\n"
+           "Ctrl+C or SIGTERM within 1 s counts as the same request (wrappers such as timeout forward it); a\n"
+           "later one exits immediately. Ctrl+Z restores the cursor before the monitor stops. Logs are appended\n"
+           "to logs/arb_<date>.log under the current directory.\n";
 }
 
 namespace app_detail {
@@ -205,6 +206,13 @@ private:
 // 监控程序
 // ---------------------------------------------------------------------------
 
+// 终端界面的光标状态（与信号处理函数共享，见 RunOptions::cursor_state）
+enum class CursorState : int {
+    Visible = 0,    // 光标显示着：终端界面未运行，或显示序列已经写完
+    Hidden = 1,     // 终端界面运行中：写隐藏序列之前就进入此状态
+    Restoring = 2,  // 正在写显示序列：写完（并 fflush）之后才回到 Visible
+};
+
 // 运行参数（测试可替换输出流）
 struct RunOptions {
     bool headless = false;
@@ -212,6 +220,14 @@ struct RunOptions {
     std::FILE* out = stdout;      // 画面 / 状态行 / 最终报告的输出（headless 时日志行也回显到这里）
     bool color = true;            // 终端界面与最终报告的 ANSI 颜色（main 在设置了 NO_COLOR 时关闭；headless 总是无色）
     bool busy_poll = false;       // --busy-poll：没有数据时用 hft::cpuRelax() 自旋检查队列，而不是等待唤醒
+    // 与信号处理函数共享的状态（main 指向自己的全局原子量；为空则不使用）。处理函数在主线程上运行，
+    // 只需保证这里的读写不与前后的输出重排（seq_cst）：
+    // - cursor_state：见 CursorState。处理函数在停止进程（SIGTSTP）或强制退出之前，只要状态不是 Visible 就写
+    //   显示序列（Restoring 时显示序列可能还没写出去，例如输出被 Ctrl+S 阻塞；多写一次无害）；SIGCONT 之后只在
+    //   Hidden 时重新隐藏光标（Restoring 时不能再隐藏，否则会盖掉随后写出的显示序列）。
+    // - redraw：处理函数（SIGCONT 之后）置位；下一帧渲染时取走，清屏后整屏重画。
+    std::atomic<CursorState>* cursor_state = nullptr;
+    std::atomic<bool>* redraw = nullptr;
 };
 
 // 监控程序：
@@ -235,7 +251,8 @@ struct RunOptions {
 //      队列延迟降到微秒级，代价是主线程一直占满一个核（适合独占、绑核的部署）。
 // - 停止：stop 标志（信号）或 duration 到期 → 对所有 feed 调用 stop()（踢断阻塞的读写 / 握手 / 退避等待）并 join，
 //   然后输出最终报告（stdout 与日志）。
-// - feed 线程在屏蔽 SIGINT/SIGTERM 的情况下创建：信号只投递给主线程，feed 线程里阻塞的系统调用不会被打断。
+// - feed 线程在屏蔽 SIGINT/SIGTERM/SIGHUP/SIGTSTP/SIGCONT 的情况下创建：这些信号只投递给主线程，
+//   feed 线程里阻塞的系统调用不会被打断。
 // - feed 的日志回调写入线程安全的 Logger；FeedConfig::log_to_stderr 总是关闭（终端模式下 stderr 会破坏画面，
 //   headless 模式由 Logger 把同样的行回显到 out）。
 class MonitorApp {
@@ -320,8 +337,9 @@ public:
         std::int64_t next_tick = start_ns_;
         std::int64_t next_status = start_ns_ + kStatusIntervalNs;
         if (!opt_.headless) {
-            writeOut(Display::kHideCursor);
+            setCursorState(CursorState::Hidden);  // 先改状态再隐藏（见 RunOptions::cursor_state）
             cursor_hidden_ = true;
+            writeOut(Display::kHideCursor);
         }
 
         const char* reason = "stop requested";
@@ -429,9 +447,15 @@ private:
     void restoreCursor() noexcept {
         if (!cursor_hidden_) return;
         cursor_hidden_ = false;
+        setCursorState(CursorState::Restoring);  // 显示序列写完之后才是 Visible（见 RunOptions::cursor_state）
         std::fwrite(Display::kShowCursor, 1, sizeof(Display::kShowCursor) - 1, opt_.out);
         std::fputc('\n', opt_.out);
         std::fflush(opt_.out);
+        setCursorState(CursorState::Visible);
+    }
+
+    void setCursorState(CursorState s) noexcept {
+        if (opt_.cursor_state != nullptr) opt_.cursor_state->store(s, std::memory_order_seq_cst);
     }
 
     // 一行进度信息：写日志并输出到 out（headless 时日志行本来就回显到 out，不再重复输出）
@@ -484,7 +508,8 @@ private:
         logger_.log("Mode: " + mode);
     }
 
-    // 启动 feed 线程。线程创建期间屏蔽 SIGINT/SIGTERM：新线程继承信号掩码，信号因此只投递给主线程。
+    // 启动 feed 线程。线程创建期间屏蔽 SIGINT/SIGTERM/SIGHUP/SIGTSTP/SIGCONT：新线程继承信号掩码，这些信号
+    // 因此只由主线程处理（处理函数与主线程共享光标状态，见 RunOptions::cursor_state）。
     // 发布回调（必须在 run() 之前设置）：快照入队后唤醒等待中的主循环；忙等模式不需要。
     bool startFeeds() {
         for (auto& f : feeds_) {
@@ -493,8 +518,7 @@ private:
         }
         sigset_t block, previous;
         sigemptyset(&block);
-        sigaddset(&block, SIGINT);
-        sigaddset(&block, SIGTERM);
+        for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGCONT}) sigaddset(&block, sig);
         const bool masked = ::pthread_sigmask(SIG_BLOCK, &block, &previous) == 0;
         std::string error;
         try {
@@ -610,6 +634,8 @@ private:
     }
 
     void renderFrame(std::int64_t now) {
+        // 进程被停止后又继续（SIGCONT）：停止期间 shell 可能改写了屏幕，这一帧先清屏再整屏重画
+        if (opt_.redraw != nullptr && opt_.redraw->exchange(false, std::memory_order_seq_cst)) frame_shown_ = false;
         const std::vector<VenueView> views = collectViews();
         FrameOptions fo;
         fo.levels = cfg_.display.levels;

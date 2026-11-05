@@ -2787,15 +2787,17 @@ std::uint64_t procSignalMask(pid_t pid, const std::string& field) {
 
 bool maskHas(std::uint64_t mask, int sig) { return ((mask >> (sig - 1)) & 1u) != 0; }
 
-// crypto_hft_engine 子进程：stdout 与 stderr 合并到一个 PipeReader，工作目录 cwd（日志写到 cwd/logs），
-// 放在自己的进程组里。
+// crypto_hft_engine 子进程：stdout 与 stderr 合并到一个 PipeReader，工作目录 cwd（日志写到 cwd/logs）。
+// 子进程放进自己的进程组：孤儿进程组里作业控制信号（SIGTSTP）的默认动作会被内核丢弃，而新进程组的父进程
+// （测试程序）在同一会话的另一个进程组里，所以它不是孤儿进程组。
 class EngineProcess {
 public:
     struct Options {
         std::vector<std::string> args;
         std::string cwd;
         int pipe_capacity = 4096;
-        bool prefill = false;  // 启动前写满管道（且不读）：子进程的第一次输出（启动横幅）就阻塞
+        bool prefill = false;        // 启动前写满管道（且不读）：子进程的第一次输出（启动横幅）就阻塞
+        bool ignore_hangup = false;  // 像 nohup 一样以忽略 SIGHUP 的状态启动
     };
 
     explicit EngineProcess(const Options& o) : out_(o.pipe_capacity, !o.prefill) {
@@ -2817,7 +2819,8 @@ public:
         if (pid_ == 0) {
             // 子进程：exec 之前只调用 async-signal-safe 的函数
             ::setpgid(0, 0);
-            for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGCONT, SIGPIPE}) ::signal(sig, SIG_DFL);
+            for (int sig : {SIGINT, SIGTERM, SIGTSTP, SIGCONT, SIGPIPE}) ::signal(sig, SIG_DFL);
+            ::signal(SIGHUP, o.ignore_hangup ? SIG_IGN : SIG_DFL);
             sigset_t none;
             sigemptyset(&none);
             ::sigprocmask(SIG_SETMASK, &none, nullptr);
@@ -2872,7 +2875,21 @@ public:
         return st;
     }
 
+    // 等到子进程停止（WIFSTOPPED）或继续运行（WIFCONTINUED）
+    bool waitStopped(int timeout_ms) { return waitState(WUNTRACED, timeout_ms); }
+    bool waitContinued(int timeout_ms) { return waitState(WCONTINUED, timeout_ms); }
+
 private:
+    bool waitState(int flag, int timeout_ms) {
+        return waitFor(
+            [&] {
+                int st = 0;
+                if (::waitpid(pid_, &st, flag | WNOHANG) != pid_) return false;
+                return flag == WUNTRACED ? WIFSTOPPED(st) : WIFCONTINUED(st);
+            },
+            timeout_ms, 2);
+    }
+
     PipeReader out_;
     pid_t pid_ = -1;
     bool reaped_ = false;
@@ -3019,6 +3036,79 @@ TEST_CASE("main: a second SIGINT more than 1 s after the first still exits at on
         CHECK(contains(text, std::string(Display::kShowCursor) + "\n[Signal] second signal received"));
         CHECK(!contains(text, "Final Report"));
     }
+}
+
+TEST_CASE("main: SIGHUP (even twice, 1.2 s apart) shuts down gracefully with the final report on stdout and in the log") {
+    // 终端关闭 / SSH 断开时的 SIGHUP 与 SIGTERM 一样优雅退出；挂断常常带来两个 SIGHUP，从不触发强制退出
+    EngineSandbox box(200);
+    EngineProcess::Options o = box.options({"--headless", "--duration", "30"});
+    o.prefill = true;
+    EngineProcess p(o);
+    REQUIRE(p.waitCaught(SIGHUP, 10000));
+    REQUIRE(p.signalTaken(SIGHUP, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    REQUIRE(p.signalTaken(SIGHUP, 5000));
+    p.output().setReading(true);
+    const int status = p.waitExit(30000);
+    const std::string text = p.output().text();
+    checkChildExit(status, 0, text);
+    CHECK(contains(text, "Shutting down (stop requested after"));
+    CHECK(contains(text, "═══ Final Report ═══"));
+    CHECK(!contains(text, "second signal received"));
+    const std::string log = box.logs();
+    CHECK(contains(log, "[INFO] === Final Report ==="));
+    CHECK(contains(log, "[SUMMARY] SUMMARY | Signals: 0"));
+    CHECK(contains(log, "=== Crypto HFT Engine v2.0 Stopped ==="));
+}
+
+TEST_CASE("main: a SIGHUP that was ignored at startup (nohup) stays ignored") {
+    EngineSandbox box(200);
+    EngineProcess::Options o = box.options({"--headless", "--duration", "1.5"});
+    o.ignore_hangup = true;
+    EngineProcess p(o);
+    REQUIRE(p.output().waitForText("Started 3 market data feeds", 10000));
+    CHECK(!maskHas(procSignalMask(p.pid(), "SigCgt"), SIGHUP));
+    CHECK(maskHas(procSignalMask(p.pid(), "SigIgn"), SIGHUP));
+    ::kill(p.pid(), SIGHUP);
+    const int status = p.waitExit(15000);
+    checkChildExit(status, 0, p.output().text());
+    CHECK(contains(p.output().text(), "Shutting down (duration elapsed after"));
+}
+
+TEST_CASE("main: Ctrl+Z restores the cursor before the process stops; SIGCONT hides it again and forces a full redraw") {
+    EngineSandbox box(200);
+    EngineProcess p(box.options({"--duration", "30"}));
+    REQUIRE(p.output().waitForText("Feed Performance", 10000));
+    std::string text = p.output().text();
+    REQUIRE(contains(text, Display::kHideCursor));
+    CHECK_EQ(countOf(text, "\033[2J"), 1u);  // 只有第一帧清屏
+    // Ctrl+Z：停止之前恢复光标
+    REQUIRE(p.signalTaken(SIGTSTP, 5000));
+    REQUIRE(p.waitStopped(5000));
+    CHECK(mock_exchange::waitFor([&] { return cursorVisibleAtEnd(p.output().text()); }, 2000, 5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // 停止期间没有任何输出
+    text = p.output().text();
+    CHECK(cursorVisibleAtEnd(text));
+    const std::size_t stopped_at = text.size();
+    // fg：重新隐藏光标，下一帧清屏后整屏重画
+    REQUIRE(::kill(p.pid(), SIGCONT) == 0);
+    REQUIRE(p.waitContinued(5000));
+    CHECK(p.output().waitForText(Display::kHideCursor, 5000, stopped_at));
+    CHECK(p.output().waitForText("\033[2J", 5000, stopped_at));
+    CHECK(p.output().waitForText("Feed Performance", 5000, stopped_at));
+    // 第二次 Ctrl+Z 同样有效（SIGCONT 重新接管了 SIGTSTP）
+    REQUIRE(p.signalTaken(SIGTSTP, 5000));
+    REQUIRE(p.waitStopped(5000));
+    CHECK(mock_exchange::waitFor([&] { return cursorVisibleAtEnd(p.output().text()); }, 2000, 5));
+    REQUIRE(::kill(p.pid(), SIGCONT) == 0);
+    REQUIRE(p.waitContinued(5000));
+    // 最后 Ctrl+C：优雅退出，光标恢复
+    REQUIRE(p.signalTaken(SIGINT, 5000));
+    const int status = p.waitExit(15000);
+    text = p.output().text();
+    checkChildExit(status, 0, text);
+    CHECK(cursorVisibleAtEnd(text));
+    CHECK(contains(text, "Final Report"));
 }
 
 }  // namespace
