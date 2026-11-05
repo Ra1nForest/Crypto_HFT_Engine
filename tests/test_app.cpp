@@ -14,7 +14,9 @@
 #include "cli_util.h"
 #include "config.h"
 #include "display.h"
+#include "hft/common.h"
 #include "hft/crc32.h"
+#include "hft/spsc_queue.h"
 #include "hft/timing.h"
 #include "logger.h"
 #include "mock_exchange_server.h"
@@ -25,6 +27,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1871,6 +1874,21 @@ TEST_CASE("cli: errors for unknown options, missing values, bad durations and po
     CHECK(!parse({"--configs", "x"}, o, err));
 }
 
+TEST_CASE("cli: --busy-poll is parsed and documented in --help") {
+    CliOptions o;
+    std::string err;
+    REQUIRE(parse({}, o, err));
+    CHECK(!o.busy_poll);
+    REQUIRE(parse({"--busy-poll", "--headless"}, o, err));
+    CHECK(o.busy_poll);
+    CHECK(o.headless);
+    CHECK(!parse({"--busy-poll=1"}, o, err));
+    CHECK(contains(err, "unknown option \"--busy-poll=1\""));
+    const std::string usage = usageText("crypto_hft_engine");
+    CHECK(contains(usage, "[--busy-poll]"));
+    CHECK(contains(usage, "\n  --busy-poll  "));
+}
+
 TEST_CASE("cli: cli_util::parseUnsigned shared by exchange_sim and mock_exchange") {
     std::uint64_t v = 7;
     CHECK(cli_util::parseUnsigned("0", v));
@@ -2424,6 +2442,260 @@ TEST_CASE("app: a stale book drained after its venue left LIVE never pairs for a
     CHECK(contains(text, "Final Report"));
     CHECK_EQ(countOf(readFile(log_path), "[SIGNAL]"), 0u);
     CHECK(server.errors().empty());
+}
+
+// 调用线程自身的资源用量（CPU 时间与自愿上下文切换次数：每次睡眠 / 阻塞等待记一次）
+struct ThreadUsage {
+    double cpu_s = 0.0;
+    long voluntary_switches = 0;
+};
+
+ThreadUsage threadUsage() {
+    rusage u{};
+    ::getrusage(RUSAGE_THREAD, &u);
+    ThreadUsage t;
+    t.cpu_s = static_cast<double>(u.ru_utime.tv_sec + u.ru_stime.tv_sec) +
+              static_cast<double>(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
+    t.voluntary_switches = u.ru_nvcsw;
+    return t;
+}
+
+// 一个刚刚关闭的本地端口：连接会被拒绝
+std::string closedPort() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t len = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        ::close(fd);
+        throw std::runtime_error("bind failed");
+    }
+    ::close(fd);
+    return std::to_string(ntohs(addr.sin_port));
+}
+
+// 所有交易所都连不上、长时间退避：没有任何数据的空闲监控程序
+AppConfig idleAppConfig() {
+    AppConfig cfg = ConfigReader::getDefaults();
+    const std::string port = closedPort();
+    for (VenueConfig& v : cfg.venues) {
+        v.host = "127.0.0.1";
+        v.port = port;
+    }
+    cfg.connection.reconnect_initial_ms = 30000;
+    cfg.connection.reconnect_max_ms = 30000;
+    cfg.source = "<test>";
+    return cfg;
+}
+
+TEST_CASE("app: WakeSignal never loses a wakeup (ping-pong and burst stress with three producers)") {
+    constexpr int kProducers = 3;
+    constexpr std::int64_t kDeadlineNs = 2000000000;  // 丢失一次唤醒 = 消费者睡满这个期限
+    WakeSignal wake;
+    std::vector<std::unique_ptr<hft::SpscQueue<int>>> queues;
+    for (int p = 0; p < kProducers; ++p) queues.push_back(std::make_unique<hft::SpscQueue<int>>(64));
+    auto ready = [&] {
+        for (auto& q : queues) {
+            if (q->front() != nullptr) return true;
+        }
+        return false;
+    };
+    // 消费者：排空；没有数据时等待。timeouts = 等到期限（生产者一直有数据要送，任何一次到期都是丢失的唤醒）；
+    // slept = 真正睡过的等待（超过 30 µs，即进入了条件变量等待并被 notify 唤醒）
+    auto consume = [&](int total, std::vector<std::atomic<int>>& consumed, int& timeouts, int& slept,
+                       double& max_wait_ms) {
+        int done = 0;
+        while (done < total) {
+            bool any = false;
+            for (int p = 0; p < kProducers; ++p) {
+                while (queues[static_cast<std::size_t>(p)]->front() != nullptr) {
+                    queues[static_cast<std::size_t>(p)]->pop();
+                    consumed[static_cast<std::size_t>(p)].fetch_add(1, std::memory_order_release);
+                    ++done;
+                    any = true;
+                }
+            }
+            if (any) continue;
+            const std::int64_t t0 = hft::nowNs();
+            if (!wake.waitUntil(ready, t0 + kDeadlineNs)) ++timeouts;
+            const std::int64_t waited = hft::nowNs() - t0;
+            if (waited > 30000) ++slept;
+            max_wait_ms = std::max(max_wait_ms, static_cast<double>(waited) / 1e6);
+        }
+    };
+    // 生产者自旋等待时偶尔让出 CPU（测试线程数可能多于 CPU 数）
+    auto relax = [](int& spins) {
+        hft::cpuRelax();
+        if (++spins % 64 == 0) std::this_thread::yield();
+    };
+
+    // 1) 乒乓：每个生产者推入一个元素，等它被取走，随机停顿后再推下一个。消费者每轮都要重新宣布睡眠：
+    //    立即推入时命中"宣布睡眠 → 复查"与"入队 → 读 sleeping"的竞争窗口，停顿较长时走条件变量的睡眠与唤醒
+    {
+        constexpr int kRounds = 1500;
+        std::vector<std::atomic<int>> consumed(kProducers);
+        std::vector<std::thread> producers;
+        for (int p = 0; p < kProducers; ++p) {
+            producers.emplace_back([&, p] {
+                std::mt19937 rng(static_cast<unsigned>(p) + 1);
+                int spins = 0;
+                for (int i = 0; i < kRounds; ++i) {
+                    switch (rng() % 4) {
+                        case 0: break;  // 立即推入
+                        case 1:
+                            for (unsigned k = rng() % 512; k > 0; --k) hft::cpuRelax();
+                            break;
+                        case 2: std::this_thread::yield(); break;
+                        default: std::this_thread::sleep_for(std::chrono::microseconds(rng() % 100)); break;
+                    }
+                    while (!queues[static_cast<std::size_t>(p)]->tryPush(i)) relax(spins);
+                    wake.notify();
+                    while (consumed[static_cast<std::size_t>(p)].load(std::memory_order_acquire) <= i) relax(spins);
+                }
+            });
+        }
+        int timeouts = 0, slept = 0;
+        double max_wait_ms = 0.0;
+        consume(kProducers * kRounds, consumed, timeouts, slept, max_wait_ms);
+        for (std::thread& t : producers) t.join();
+        CHECK_EQ(timeouts, 0);
+        CHECK_LT(max_wait_ms, 1000.0);
+        CHECK_GT(slept, 0);  // 睡眠路径确实被走过
+    }
+    // 2) 突发：生产者尽快推入（队列满时重试），消费者大多在忙：notify 走无锁快路径
+    {
+        constexpr int kItems = 20000;
+        std::vector<std::atomic<int>> consumed(kProducers);
+        std::vector<std::thread> producers;
+        for (int p = 0; p < kProducers; ++p) {
+            producers.emplace_back([&, p] {
+                int spins = 0;
+                for (int i = 0; i < kItems; ++i) {
+                    while (!queues[static_cast<std::size_t>(p)]->tryPush(i)) relax(spins);
+                    wake.notify();
+                    if (i % 1000 == 999) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+            });
+        }
+        int timeouts = 0, slept = 0;
+        double max_wait_ms = 0.0;
+        consume(kProducers * kItems, consumed, timeouts, slept, max_wait_ms);
+        for (std::thread& t : producers) t.join();
+        CHECK_EQ(timeouts, 0);
+        CHECK_LT(max_wait_ms, 1000.0);
+        for (int p = 0; p < kProducers; ++p) CHECK_EQ(consumed[static_cast<std::size_t>(p)].load(), kItems);
+    }
+    // 3) 没有生产者：之前的 notify 可能留下一次多余的唤醒（消费者复查时已看到数据、没有进入等待），
+    //    之后必然等到期限返回 false
+    const bool spurious = wake.waitUntil(ready, hft::nowNs() + 20000000);
+    const std::int64_t t0 = hft::nowNs();
+    CHECK(!wake.waitUntil(ready, t0 + 20000000));
+    CHECK_GE(hft::nowNs() - t0, 20000000);
+    if (!spurious) CHECK(!wake.waitUntil(ready, hft::nowNs() + 1000000));
+}
+
+TEST_CASE("app: an idle main loop blocks until a feed publishes or a timer is due instead of polling") {
+    // 修复前：没有数据时每轮 sleep_for(200 µs)，每秒约 3300 次唤醒（4 vCPU 虚拟机上约 10% 个核）。
+    // 现在：只在 tick（refresh_ms = 200）与等待上限（50 ms）时醒来，每秒约 20 次
+    AppConfig cfg = idleAppConfig();
+    TempPath logs("test_app_logs");
+    TempStream out;
+    Logger logger(logs.str(), false);
+    RunOptions opt;
+    opt.headless = true;
+    opt.duration_s = 1.5;
+    opt.out = out.f;
+    MonitorApp app(cfg, logger, opt);
+    std::atomic<bool> stop{false};
+    const ThreadUsage u0 = threadUsage();
+    const std::int64_t t0 = hft::nowNs();
+    CHECK_EQ(app.run(stop), 0);
+    const double wall_s = static_cast<double>(hft::nowNs() - t0) / 1e9;
+    const ThreadUsage u1 = threadUsage();
+    const double switches_per_s = static_cast<double>(u1.voluntary_switches - u0.voluntary_switches) / wall_s;
+    const double cpu_percent = 100.0 * (u1.cpu_s - u0.cpu_s) / wall_s;
+    CHECK_LT(switches_per_s, 200.0);
+    CHECK_LT(cpu_percent, 5.0);
+    CHECK_GE(app.ticks(), 7u);  // tick 照常按 refresh_ms 运行
+    for (std::size_t i = 0; i < app.venueCount(); ++i) CHECK_EQ(app.snapshotsApplied(i), 0u);
+}
+
+TEST_CASE("app: a published snapshot wakes the waiting main loop at once, far below the idle wait cap") {
+    // refresh_ms = 1000：tick 几乎不会恰好唤醒主循环；快照必须靠发布回调唤醒，否则要等到 50 ms 的上限
+    MockExchangeServer server;
+    std::atomic<bool> done{false};
+    server.setWebSocketScript([&](WsSession& ws) {
+        if (ws.target() != kBybitPath) return;
+        ws.expectText(kBybitSub);
+        for (std::uint64_t u = 1; u <= 40; ++u) {
+            const std::string bid = "100." + std::to_string(u % 10);
+            ws.send(bybitSnapshot({{bid, "1"}}, {{"101.0", "1"}}, u));
+            ws.sleepMs(23);  // 与 tick、等待上限都不同步
+        }
+        done.store(true);
+    });
+    AppConfig cfg = mockAppConfig(server);
+    cfg.venues[0].enabled = false;
+    cfg.venues[1].enabled = false;
+    cfg.display.refresh_ms = 1000;
+    TempPath logs("test_app_e2e_logs");
+    TempStream out;
+    Logger logger(logs.str(), false);
+    RunOptions opt;
+    opt.headless = true;
+    opt.out = out.f;
+    MonitorApp app(cfg, logger, opt);
+    REQUIRE_EQ(app.venueCount(), 1u);
+    CHECK_EQ(runApp(app, [&] { return done.load(); }, 100, 15000), 0);
+    const LatencyTracker& q = app.queueLatency(0);
+    CHECK_EQ(app.snapshotsApplied(0), 40u);
+    CHECK_EQ(q.count(), 40u);
+    // 唤醒失效时延迟在 0..50 ms 之间均匀分布（p50 约 25 ms）；正常唤醒是零点几毫秒
+    CHECK_LT(static_cast<double>(q.percentileNs(0.50)), 5e6);
+    CHECK_LT(static_cast<double>(q.percentileNs(0.90)), 20e6);
+}
+
+TEST_CASE("app: --busy-poll spins on the queues instead of sleeping and still processes every snapshot") {
+    MockExchangeServer server;
+    std::atomic<bool> done{false};
+    server.setWebSocketScript([&](WsSession& ws) {
+        if (ws.target() != kBybitPath) return;
+        ws.expectText(kBybitSub);
+        for (std::uint64_t u = 1; u <= 30; ++u) {
+            ws.send(bybitSnapshot({{"100.0", "1"}}, {{"101.0", "1"}}, u));
+            ws.sleepMs(10);
+        }
+        done.store(true);
+    });
+    AppConfig cfg = mockAppConfig(server);
+    cfg.venues[0].enabled = false;
+    cfg.venues[1].enabled = false;
+    TempPath logs("test_app_e2e_logs");
+    TempStream out;
+    std::string log_path;
+    {
+        Logger logger(logs.str(), false);
+        log_path = logger.path();
+        RunOptions opt;
+        opt.headless = true;
+        opt.busy_poll = true;
+        opt.out = out.f;
+        MonitorApp app(cfg, logger, opt);
+        const ThreadUsage u0 = threadUsage();
+        const std::int64_t t0 = hft::nowNs();
+        CHECK_EQ(runApp(app, [&] { return done.load() && app.feed(0).stats().published >= 30; }, 300, 15000), 0);
+        const double wall_s = static_cast<double>(hft::nowNs() - t0) / 1e9;
+        const ThreadUsage u1 = threadUsage();
+        CHECK_EQ(app.snapshotsApplied(0), 30u);
+        CHECK_LT(static_cast<double>(app.queueLatency(0).percentileNs(0.50)), 1e6);
+        // 自旋：主线程一直在运行（被抢占时除外），CPU 时间远高于事件驱动模式（约 0.2%）
+        CHECK_GT(100.0 * (u1.cpu_s - u0.cpu_s) / wall_s, 20.0);
+    }
+    CHECK(contains(readFile(log_path), "Mode: headless, refresh 20 ms, busy-poll"));
 }
 
 TEST_CASE("app: no enabled venue -> exit code 1 without starting anything") {

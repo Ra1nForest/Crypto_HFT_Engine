@@ -10,6 +10,7 @@
 #include "book_snapshot.h"
 #include "config.h"
 #include "display.h"
+#include "hft/common.h"
 #include "hft/timing.h"
 #include "latency_tracker.h"
 #include "logger.h"
@@ -27,6 +28,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +38,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -50,6 +53,7 @@ struct CliOptions {
     bool config_given = false;                // 显式给出了 --config：文件必须能读取并解析（见 main.cpp）
     bool headless = false;                    // --headless：不渲染终端界面，每秒一行状态
     double duration_s = 0.0;                  // --duration <seconds>：> 0 时到时自动停止；0 = 直到收到信号
+    bool busy_poll = false;                   // --busy-poll：主循环空闲时忙等（见 RunOptions::busy_poll）
     bool help = false;                        // --help / -h
 };
 
@@ -59,13 +63,15 @@ inline std::string usageText(const std::string& program) {
     return std::string(kAppVersion) +
            " - cross-exchange arbitrage monitor (Binance, OKX, Bybit)\n"
            "\n"
-           "Usage: " + prog + " [--config <path>] [--headless] [--duration <seconds>] [--help]\n"
+           "Usage: " + prog + " [--config <path>] [--headless] [--duration <seconds>] [--busy-poll] [--help]\n"
            "\n"
            "Options:\n"
            "  --config <path>       configuration file (default: config.json in the current directory;\n"
            "                        an explicitly given file must exist and contain valid JSON)\n"
            "  --headless            no terminal UI: print feed events, signals and one status line per second\n"
            "  --duration <seconds>  stop automatically after this many seconds (default: run until Ctrl+C)\n"
+           "  --busy-poll           spin on the feed queues instead of sleeping until a feed publishes:\n"
+           "                        lowest queue latency (microseconds), but one CPU core stays at 100%\n"
            "  -h, --help            show this help and exit\n"
            "\n"
            "Ctrl+C or SIGTERM stops the monitor gracefully and prints the final report (a second signal exits\n"
@@ -119,6 +125,8 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
             opt.help = true;
         } else if (arg == "--headless") {
             opt.headless = true;
+        } else if (arg == "--busy-poll") {
+            opt.busy_poll = true;
         } else if (is("--config")) {
             if (!app_detail::optionValue(argc, argv, i, "--config", opt.config_path, error)) return false;
             opt.config_given = true;
@@ -142,6 +150,57 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
 }
 
 // ---------------------------------------------------------------------------
+// 主循环的唤醒信号
+// ---------------------------------------------------------------------------
+
+// 多个生产者（feed 线程：快照入队之后 notify()）、一个消费者（主线程：没有数据时 waitUntil()）。
+// Dekker 式握手，不会丢失唤醒：
+// - 消费者：sleeping_ = true → seq_cst 栅栏 → 再检查一遍所有队列（ready()）→ 确实为空才在条件变量上等待；
+// - 生产者：元素入队（release 存写下标）→ seq_cst 栅栏 → 读 sleeping_，为 true 才加锁置位 pending_ 并 notify。
+// 两个栅栏在 seq_cst 全序 S 中必有先后：消费者的在前，生产者就读到 sleeping_ == true（或更新的值）；生产者的在前，
+// 消费者复查时就读到新的写下标（[atomics.order]：A 先于栅栏 X、栅栏 Y 先于 B、X 在 S 中先于 Y → B 看到 A 或更新的值）。
+// pending_ 在互斥锁内设置与检查：notify 落在"复查之后、开始等待之前"同样不会丢。
+// 消费者不在睡眠时（正在处理数据），notify() 只有一个栅栏与一次原子读：不加锁、不做系统调用。
+// 多余的唤醒（生产者读到的是消费者刚要清除的 true）无害：消费者多醒一次，排空后再等待。
+class WakeSignal {
+public:
+    // 生产者（任意线程）：新元素已经入队之后调用
+    void notify() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!sleeping_.load(std::memory_order_relaxed)) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    // 消费者（只能有一个线程）：ready() 在宣布睡眠之后复查是否已有数据；没有就等到 notify() 或 deadline_ns
+    // （hft::nowNs() 的时钟，即 steady_clock）。返回 true = 复查时已有数据或被唤醒，false = 到期。
+    template <class Ready>
+    bool waitUntil(Ready&& ready, std::int64_t deadline_ns) {
+        sleeping_.store(true, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        bool woken = ready();
+        if (!woken) {
+            const std::chrono::steady_clock::time_point deadline(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(deadline_ns)));
+            std::unique_lock<std::mutex> lock(mutex_);
+            woken = cv_.wait_until(lock, deadline, [this] { return pending_; });
+            pending_ = false;
+        }
+        sleeping_.store(false, std::memory_order_relaxed);
+        return woken;
+    }
+
+private:
+    std::atomic<bool> sleeping_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool pending_ = false;  // 受 mutex_ 保护
+};
+
+// ---------------------------------------------------------------------------
 // 监控程序
 // ---------------------------------------------------------------------------
 
@@ -151,6 +210,7 @@ struct RunOptions {
     double duration_s = 0.0;      // > 0：运行这么久后自动停止
     std::FILE* out = stdout;      // 画面 / 状态行 / 最终报告的输出（headless 时日志行也回显到这里）
     bool color = true;            // 终端界面与最终报告的 ANSI 颜色（main 在设置了 NO_COLOR 时关闭；headless 总是无色）
+    bool busy_poll = false;       // --busy-poll：没有数据时用 hft::cpuRelax() 自旋检查队列，而不是等待唤醒
 };
 
 // 监控程序：
@@ -165,7 +225,13 @@ struct RunOptions {
 //      终端模式下渲染一帧，每 spread_log_interval 次 tick 记录一次所有有序交易所对的价差（headless 模式没有渲染，
 //      按 tick 计数，频率相同），并刷新日志。tick 落后时不补跑（下一次从当前时刻起算）。
 //   3) headless 模式每秒输出一行状态。
-//   4) 本轮没有任何快照时睡眠 kIdleSleepUs（约 200 µs）：空闲时 CPU 占用很低，事件延迟不超过约 0.2 ms。
+//   4) 本轮没有任何快照时（默认）在 WakeSignal 上等待：feed 每次快照入队后通过发布回调 notify()，主线程立即醒来；
+//      否则等到下一个定时任务（tick / headless 状态行 / duration）到期，最长 kMaxIdleWaitNs。信号处理函数与测试线程
+//      只设置 stop 标志、不能唤醒等待，所以 stop 最迟在 kMaxIdleWaitNs 之后被发现。
+//      空闲时每秒只醒来约 1000 / min(refresh_ms, 50) 次，CPU 占用接近 0；有数据时，快照的队列延迟主要是一次线程唤醒
+//      （在 4 vCPU 的 KVM 虚拟机上实测 p50 约 0.1 ms、p99 约 0.2-0.4 ms，取决于内核与虚拟化）。
+//      --busy-poll（RunOptions::busy_poll）：改为用 hft::cpuRelax() 自旋检查队列，不睡眠、也不需要发布回调：
+//      队列延迟降到微秒级，代价是主线程一直占满一个核（适合独占、绑核的部署）。
 // - 停止：stop 标志（信号）或 duration 到期 → 对所有 feed 调用 stop()（踢断阻塞的读写 / 握手 / 退避等待）并 join，
 //   然后输出最终报告（stdout 与日志）。
 // - feed 线程在屏蔽 SIGINT/SIGTERM 的情况下创建：信号只投递给主线程，feed 线程里阻塞的系统调用不会被打断。
@@ -173,7 +239,7 @@ struct RunOptions {
 //   headless 模式由 Logger 把同样的行回显到 out）。
 class MonitorApp {
 public:
-    static constexpr int kIdleSleepUs = 200;
+    static constexpr std::int64_t kMaxIdleWaitNs = 50000000;  // 空闲等待的上限（stop 标志最迟这么久之后被发现）
     static constexpr std::size_t kMaxDrainPerVenue = 256;
     static constexpr std::int64_t kStatusIntervalNs = 1000000000;  // headless 状态行间隔
 
@@ -274,7 +340,15 @@ public:
                 printStatusLine(now);
                 next_status = nextDeadline(next_status, kStatusIntervalNs, now);
             }
-            if (!busy) std::this_thread::sleep_for(std::chrono::microseconds(kIdleSleepUs));
+            if (busy) continue;
+            if (opt_.busy_poll) {
+                hft::cpuRelax();
+                continue;
+            }
+            // 没有数据：等到有 feed 发布快照，或下一个定时任务到期（最长 kMaxIdleWaitNs）
+            std::int64_t wake_at = std::min({next_tick, deadline, now + kMaxIdleWaitNs});
+            if (opt_.headless) wake_at = std::min(wake_at, next_status);
+            wake_.waitUntil([this] { return anyQueued(); }, wake_at);
         }
 
         const double ran_s = static_cast<double>(hft::nowNs() - start_ns_) / 1e9;
@@ -404,14 +478,17 @@ private:
                     std::to_string(c.reconnect_max_ms) + " ms");
         std::string mode = opt_.headless ? "headless" : "terminal UI";
         mode += ", refresh " + std::to_string(cfg_.display.refresh_ms) + " ms";
+        if (opt_.busy_poll) mode += ", busy-poll";
         if (opt_.duration_s > 0.0) mode += ", duration " + config_detail::formatNumber(opt_.duration_s) + " s";
         logger_.log("Mode: " + mode);
     }
 
     // 启动 feed 线程。线程创建期间屏蔽 SIGINT/SIGTERM：新线程继承信号掩码，信号因此只投递给主线程。
+    // 发布回调（必须在 run() 之前设置）：快照入队后唤醒等待中的主循环；忙等模式不需要。
     bool startFeeds() {
         for (auto& f : feeds_) {
             f->setLogCallback([this](const std::string& line) { logger_.logFeed(line); });
+            if (!opt_.busy_poll) f->setPublishCallback([this] { wake_.notify(); });
         }
         sigset_t block, previous;
         sigemptyset(&block);
@@ -448,6 +525,14 @@ private:
             if (t.joinable()) t.join();
         }
         threads_.clear();
+    }
+
+    // 是否有队列非空（消费端操作，只在主线程调用；等待之前的复查）
+    bool anyQueued() {
+        for (auto& f : feeds_) {
+            if (f->queue().front() != nullptr) return true;
+        }
+        return false;
     }
 
     // 排空所有队列；返回本轮是否处理了快照
@@ -569,6 +654,7 @@ private:
     RunOptions opt_;
     const std::vector<const VenueConfig*> enabled_;   // 已启用的交易所，指向 cfg_.venues（下标 = venue id）
     ArbitrageDetector detector_;
+    WakeSignal wake_;                                              // feed 线程 notify，主线程等待（见 run()）
     std::vector<std::unique_ptr<MarketDataFeed>> feeds_;
     std::vector<std::thread> threads_;
     std::vector<OrderBook> books_;                                 // 主线程的本地簿（下标 = venue id）

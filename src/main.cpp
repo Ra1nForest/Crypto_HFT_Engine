@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     RunOptions opt;
     opt.headless = cli.headless;
     opt.duration_s = cli.duration_s;
+    opt.busy_poll = cli.busy_poll;
     opt.out = stdout;
     const char* no_color = std::getenv("NO_COLOR");
     opt.color = no_color == nullptr || no_color[0] == '\0';
