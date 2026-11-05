@@ -4,7 +4,17 @@
 // 不是另写的副本；"旧实现"一栏是升级前 market_data_feed.h 的处理流程（buffers_to_string + 每条消息构造
 // padded_string + 旧的 parseBinanceDepth），原样复制在本文件中作为对照。
 // 内容：
-//   1. 各适配器每条消息的处理耗时（p50/p99/均值，TSC 计时）：Binance depth20 / diff、OKX books 快照 / 增量（含校验和）、Bybit delta
+//   1. 各适配器每条消息的处理耗时（adapter.onMessage，TSC 逐条计时；精确的 p50/p90/p99、均值、超过 100 µs 的比例）
+//      a. 模拟交易所的行情流：与离线演示中监控程序收到的报文以同样的方式生成——tools/mock_market.h 的市场仿真驱动
+//         tools/mock_publishers.h 的发布状态机（种子、预热、窗口与推送周期同 tools/mock_exchange.h 的默认值）：
+//         Binance depth20 与 1000 档增量、OKX books 400 档增量与快照（含校验和）/ books5 / bbo-tbt、Bybit orderbook.50。
+//         增量平均上百档变化、分布在整个窗口上，大部分是插入与删除。引用"每条消息的耗时"时用这一组。
+//      b. 同一批增量只看簿的应用：逐档 setLevel（0ec0622 之前适配器的做法）vs 批量 applyLevels，A/B 交错计时，
+//         最终簿必须逐位相同；同时打印实测的簿深度、变化构成与"最优在前"的比例。
+//      c. 合成的小增量（原来的第 1 节，保留作微基准）：只改动最优 30 档，预热后几乎全是原地改量，
+//         碰不到插入/删除的 memmove，远低于真实行情的每条消息耗时，不要当作每条消息的成本引用。
+//      --cold：a 组再测一遍冷缓存（每条消息之前遍历一块大于 LLC 的缓冲区）。真实行情每 10-100 ms 才来一条，
+//      处理时缓存多半是冷的；默认的热缓存、背靠背计时是下限。
 //   2. 旧流程 vs 新流程：同一批 Binance depth20 消息，端到端耗时与每条消息的堆分配次数；以及只看缓冲区处理的耗时。
 //      两种流程在同一条消息上交替计时（A/B 交错，奇偶轮换先后），共享 CPU 上的噪声对两者影响相同。
 //      旧流程使用的是升级后的 OrderBook（尾部快路径），因此差异只来自消息处理方式。
@@ -12,8 +22,8 @@
 //   3. OrderBook upsert 微基准：400 档簿上的顶部更新（原地改量、顶部插入/删除、随机档位、旧式整簿重建）
 //   4. 一条增量应用到深簿：逐档 setLevel vs 批量 applyLevels（最优在前 / 打乱两种顺序）。生成器保持簿深度等于标签、
 //      插入/删除/改量各约 1/3，实测的平均深度与变化构成打印在每行旁边。
-// 自检（簿不一致、深度或构成偏离标签等）失败时打印 "!!"，程序以非零状态退出。
-// 用法：./build/market_data_benchmark [--quick]
+// 自检（行情流失去同步或校验和失败、簿不一致、深度或构成偏离标签等）失败时打印 "!!"，程序以非零状态退出。
+// 用法：./build/market_data_benchmark [--quick] [--cold]
 //
 
 #include "book_snapshot.h"
@@ -21,6 +31,7 @@
 #include "hft/crc32.h"
 #include "hft/latency_histogram.h"
 #include "hft/timing.h"
+#include "mock_publishers.h"  // tools/（CMake 为本目标加入的 include 目录）
 #include "orderbook.h"
 
 #include <boost/beast/core/buffers_to_string.hpp>
@@ -29,16 +40,19 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <new>
 #include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -103,7 +117,7 @@ std::string levelsJson(const Levels& levels, bool okx_extra = false) {
 std::string qty8(std::mt19937_64& rng) { return fixedTicks(1 + static_cast<std::int64_t>(rng() % 300000000), 8); }
 
 // ---------------------------------------------------------------------------
-// 计时：每条消息 rdtsc/rdtscp，结果按 TSC 频率换算为 ns 记入直方图
+// 第 2 节的计时：每条消息 rdtsc/rdtscp，结果按 TSC 频率换算为 ns 记入直方图
 // ---------------------------------------------------------------------------
 struct Result {
     const char* name;
@@ -114,24 +128,6 @@ struct Result {
     double mean;
     double allocs_per_msg;
 };
-
-template <class Fn>
-Result measure(const char* name, const std::vector<std::string>& msgs, double levels_per_msg, Fn&& fn) {
-    hft::LatencyHistogram hist;
-    const hft::TscClock& clock = hft::TscClock::instance();
-    double bytes = 0;
-    const std::uint64_t allocs0 = g_allocs;
-    for (const std::string& m : msgs) {
-        const std::uint64_t t0 = hft::rdtsc();
-        fn(m);
-        const std::uint64_t t1 = hft::rdtscp();
-        hist.record(static_cast<std::uint64_t>(std::max<std::int64_t>(0, clock.toNs(t1 - t0))));
-        bytes += static_cast<double>(m.size());
-    }
-    const double n = static_cast<double>(msgs.size());
-    return {name, msgs.size(), bytes / n, levels_per_msg, hist.percentile(0.50), hist.percentile(0.99), hist.mean(),
-            static_cast<double>(g_allocs - allocs0) / n};
-}
 
 // A/B 交替计时：同一条消息上紧挨着分别跑 A 与 B（奇偶轮换先后顺序），两者经历相同的机器状态，
 // 共享 CPU 上的噪声对比较的影响最小
@@ -410,6 +406,384 @@ DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_
     return w;
 }
 
+// ---------------------------------------------------------------------------
+// 第 1 节：逐条计时的统计（精确分位数：样本排序后按最近秩取值，单位 µs）
+// ---------------------------------------------------------------------------
+struct SampleStats {
+    std::size_t n = 0;
+    double p50 = 0, p90 = 0, p99 = 0, mean = 0;
+    double above_100us = 0;  // 超过 100 µs 的消息比例（0..1）
+};
+
+SampleStats summarize(std::vector<double> ns) {
+    SampleStats s;
+    s.n = ns.size();
+    if (ns.empty()) return s;
+    std::sort(ns.begin(), ns.end());
+    const auto rank = [&](double q) {
+        const double r = std::ceil(q * static_cast<double>(ns.size()));
+        const std::size_t i = std::clamp<std::size_t>(static_cast<std::size_t>(r), 1, ns.size());
+        return ns[i - 1] / 1000.0;
+    };
+    s.p50 = rank(0.50);
+    s.p90 = rank(0.90);
+    s.p99 = rank(0.99);
+    double sum = 0;
+    std::size_t above = 0;
+    for (const double x : ns) {
+        sum += x;
+        if (x > 100000.0) ++above;
+    }
+    s.mean = sum / static_cast<double>(ns.size()) / 1000.0;
+    s.above_100us = static_cast<double>(above) / static_cast<double>(ns.size());
+    return s;
+}
+
+double ticksToNs(std::uint64_t t0, std::uint64_t t1) {
+    return static_cast<double>(std::max<std::int64_t>(0, hft::TscClock::instance().toNs(t1 - t0)));
+}
+
+// 冷缓存模式：每条消息之前读改写一遍大于 LLC 的缓冲区，把被测代码的数据挤出各级缓存
+constexpr std::size_t kEvictBytes = std::size_t{64} << 20;
+
+void evictCaches(std::vector<unsigned char>& buf) {
+    if (buf.size() < kEvictBytes) buf.assign(kEvictBytes, 1);
+    unsigned sum = 0;
+    for (std::size_t i = 0; i < buf.size(); i += 64) {
+        buf[i] = static_cast<unsigned char>(buf[i] + 1);
+        sum += buf[i];
+    }
+    doNotOptimize(sum);
+}
+
+// ---------------------------------------------------------------------------
+// 报文里的买卖档位（预解析；数值与适配器完全相同：同一个 adapter_detail::parseLevels）
+// ---------------------------------------------------------------------------
+struct ParsedLevels {
+    std::vector<PriceLevel> bids, asks;
+};
+
+// 取出 Binance "b"/"a" 或 "bids"/"asks"、OKX data[].bids/asks、Bybit data.b/a，不做协议检查
+bool collectLevels(adapter_detail::od::object obj, std::vector<adapter_detail::RawLevel>& bids,
+                   std::vector<adapter_detail::RawLevel>& asks, bool top) {
+    namespace od = adapter_detail::od;
+    for (auto field_result : obj) {
+        od::field field;
+        if (std::move(field_result).get(field) != simdjson::SUCCESS) return false;
+        const std::string_view key = field.escaped_key();
+        od::value& v = field.value();
+        if (key == "b" || key == "bids") {
+            if (!adapter_detail::parseLevels(v, bids)) return false;
+        } else if (key == "a" || key == "asks") {
+            if (!adapter_detail::parseLevels(v, asks)) return false;
+        } else if (key == "data" && top) {
+            od::json_type type;
+            if (v.type().get(type) != simdjson::SUCCESS) return false;
+            if (type == od::json_type::array) {
+                od::array arr;
+                if (v.get_array().get(arr) != simdjson::SUCCESS) return false;
+                for (auto element : arr) {
+                    od::object inner;
+                    if (element.get_object().get(inner) != simdjson::SUCCESS) return false;
+                    if (!collectLevels(inner, bids, asks, false)) return false;
+                }
+            } else {
+                od::object inner;
+                if (v.get_object().get(inner) != simdjson::SUCCESS) return false;
+                if (!collectLevels(inner, bids, asks, false)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<ParsedLevels> parseMessages(const std::vector<std::string>& msgs) {
+    adapter_detail::JsonReader reader;
+    std::vector<adapter_detail::RawLevel> b, a;
+    std::vector<ParsedLevels> out;
+    out.reserve(msgs.size());
+    for (const std::string& m : msgs) {
+        b.clear();
+        a.clear();
+        adapter_detail::od::document doc;
+        adapter_detail::od::object obj;
+        const bool ok = reader.load(m, doc) == simdjson::SUCCESS && doc.get_object().get(obj) == simdjson::SUCCESS &&
+                        collectLevels(obj, b, a, true);
+        check(ok, "cannot extract the levels of a benchmark message");
+        ParsedLevels p;
+        for (const adapter_detail::RawLevel& l : b) p.bids.push_back({l.price, l.qty});
+        for (const adapter_detail::RawLevel& l : a) p.asks.push_back({l.price, l.qty});
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
+double averageLevels(const std::vector<ParsedLevels>& msgs, std::size_t begin, std::size_t end) {
+    double total = 0;
+    for (std::size_t i = begin; i < end; ++i) total += static_cast<double>(msgs[i].bids.size() + msgs[i].asks.size());
+    return end > begin ? total / static_cast<double>(end - begin) : 0.0;
+}
+
+// 与适配器相同：每侧超过 kMaxBookLevels 时裁掉远端档位
+void trimLikeAdapters(OrderBook& book) {
+    if (static_cast<std::size_t>(book.getBidCount()) > adapter_detail::kMaxBookLevels ||
+        static_cast<std::size_t>(book.getAskCount()) > adapter_detail::kMaxBookLevels) {
+        book.truncate(adapter_detail::kMaxBookLevels);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 模拟交易所的行情流：与离线演示中监控程序收到的报文以同样的方式生成
+// （tools/mock_market.h 的市场仿真 + tools/mock_publishers.h 的发布状态机，参数同 tools/mock_exchange.h 的默认值）
+// ---------------------------------------------------------------------------
+namespace sim = mock_exchange::sim;
+namespace pub = mock_exchange::pub;
+
+constexpr std::uint64_t kMockSeed = 1;     // tools/run_mock_demo.sh 默认的 --seed
+constexpr double kMockWarmupS = 5.0;       // MockExchangeOptions::warmup_s 的默认值
+// 推送周期（毫秒）：同 tools/mock_exchange.h 的 kBinanceFastMs、kOkxBooksMs、kOkxBboMs 与 kBybitPeriodsMs（50 档）
+constexpr int kMockBinanceMs = 100;
+constexpr int kMockOkxBooksMs = 100;
+constexpr int kMockOkxBboMs = 10;
+constexpr int kMockBybit50Ms = 20;
+constexpr int kMockOkxSnapshotMs = 500;    // 每 0.5 s 取一个 books 快照（新订阅时收到的那种），各不相同
+constexpr std::size_t kMockBybitCapture = 200;  // mock_exchange 取 Bybit 最深的 200 档窗口，各深度的发布者再取前 N 档
+
+struct MockStreams {
+    std::string binance_rest;                  // GET /api/v3/depth?limit=1000，在第一条增量之后取得
+    std::vector<std::string> binance_diffs;    // <symbol>@depth@100ms（第 0 条被 REST 快照覆盖）
+    std::vector<std::string> binance_depth20;  // <symbol>@depth20@100ms
+    std::string okx_snapshot;                  // books 订阅时的快照
+    std::vector<std::string> okx_updates;      // books 增量（带 checksum）
+    std::vector<std::string> okx_snapshots;    // 不同时刻的 books 快照
+    std::vector<std::string> okx_books5;       // books5 全量推送
+    std::vector<std::string> okx_bbo;          // bbo-tbt 全量推送
+    std::string bybit_snapshot;                // orderbook.50 订阅时的快照
+    std::vector<std::string> bybit_deltas;     // orderbook.50 delta
+};
+
+MockStreams generateMockStreams(double seconds) {
+    using sim::Side;
+    MockStreams s;
+    sim::Market market(sim::defaultMarketParams(), kMockSeed);
+    market.advance(kMockWarmupS);
+    const sim::Venue& vb = market.venue(0);
+    const sim::Venue& vo = market.venue(1);
+    const sim::Venue& vy = market.venue(2);
+    pub::BinanceDepthPublisher binance;  // 1000 档窗口
+    pub::OkxBooksPublisher books;        // 400 档窗口
+    pub::OkxTopPublisher books5("books5", 5);
+    pub::OkxTopPublisher bbo("bbo-tbt", 1);
+    pub::BybitBookPublisher bybit(50);
+    const std::int64_t t0_ms = 1700000000000;
+    // 预热结束时以当前深度初始化全部发布者（同 MockExchange::resetHubs）
+    binance.reset(vb.depth(Side::Buy, binance.window()), vb.depth(Side::Sell, binance.window()), vb.bookEvents());
+    {
+        const pub::Levels b = vo.depth(Side::Buy, books.window());
+        const pub::Levels a = vo.depth(Side::Sell, books.window());
+        const auto seq = static_cast<std::int64_t>(vo.bookEvents());
+        books.reset(b, a, seq, t0_ms);
+        books5.reset(b, a, seq);
+        bbo.reset(b, a, seq);
+    }
+    bybit.reset(vy.depth(Side::Buy, kMockBybitCapture), vy.depth(Side::Sell, kMockBybitCapture), vy.bookEvents());
+    s.okx_snapshot = books.snapshot(t0_ms);
+    s.bybit_snapshot = bybit.snapshot(t0_ms, t0_ms);
+    const double step_ms = market.stepSeconds() * 1000.0;
+    const auto every = [&](int period_ms) {
+        return static_cast<std::uint64_t>(std::max(1.0, std::round(static_cast<double>(period_ms) / step_ms)));
+    };
+    const std::uint64_t binance_every = every(kMockBinanceMs), books_every = every(kMockOkxBooksMs),
+                        bbo_every = every(kMockOkxBboMs), bybit_every = every(kMockBybit50Ms),
+                        snapshot_every = every(kMockOkxSnapshotMs);
+    const auto steps = static_cast<std::uint64_t>(std::llround(seconds * 1000.0 / step_ms));
+    std::string msg;
+    for (std::uint64_t k = 1; k <= steps; ++k) {
+        market.step();
+        const std::int64_t now = t0_ms + std::llround(static_cast<double>(k) * step_ms);
+        if (k % binance_every == 0) {
+            if (binance.publish(vb.depth(Side::Buy, binance.window()), vb.depth(Side::Sell, binance.window()),
+                                vb.bookEvents(), now, msg)) {
+                s.binance_diffs.push_back(msg);
+                // 客户端缓冲第一条增量后拉取 REST 快照（limit 同 tools/mock_config.json）
+                if (s.binance_diffs.size() == 1) s.binance_rest = binance.restSnapshot(1000);
+            }
+            s.binance_depth20.push_back(binance.partialDepth(20));
+        }
+        const bool books_due = k % books_every == 0;
+        const bool bbo_due = k % bbo_every == 0;
+        if (books_due || bbo_due) {
+            const pub::Levels b = vo.depth(Side::Buy, books.window());
+            const pub::Levels a = vo.depth(Side::Sell, books.window());
+            const auto seq = static_cast<std::int64_t>(vo.bookEvents());
+            if (books_due) {
+                if (books.publish(b, a, seq, now, msg)) s.okx_updates.push_back(msg);
+                if (books5.publish(b, a, seq, now, msg)) s.okx_books5.push_back(msg);
+            }
+            if (bbo_due && bbo.publish(b, a, seq, now, msg)) s.okx_bbo.push_back(msg);
+        }
+        if (k % snapshot_every == 0) s.okx_snapshots.push_back(books.snapshot(now));
+        if (k % bybit_every == 0 && bybit.publish(vy.depth(Side::Buy, kMockBybitCapture),
+                                                  vy.depth(Side::Sell, kMockBybitCapture), vy.bookEvents(), now, now,
+                                                  msg)) {
+            s.bybit_deltas.push_back(msg);
+        }
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// 第 1 节的一行：一段报文经真实适配器（onMessage）逐条计时
+// ---------------------------------------------------------------------------
+struct StreamRow {
+    std::string name;
+    SampleStats stats;
+    double bytes = 0;    // 平均每条字节数
+    double levels = 0;   // 平均每条档位数（两侧合计）
+    double allocs = 0;   // 平均每条堆分配次数
+};
+
+// msgs[begin, end) 逐条计时；evict 非空时每条之前冲掉缓存（冷缓存模式）
+StreamRow timeAdapter(ExchangeAdapter& a, const std::vector<std::string>& msgs, std::size_t begin, std::size_t end,
+                      std::vector<unsigned char>* evict) {
+    StreamRow row;
+    std::vector<double> ns;
+    ns.reserve(end - begin);
+    if (evict != nullptr) evictCaches(*evict);  // 先分配好缓冲区
+    AdapterResult out;
+    double bytes = 0;
+    std::uint64_t allocs = 0;
+    for (std::size_t i = begin; i < end; ++i) {
+        if (evict != nullptr) evictCaches(*evict);
+        const std::uint64_t a0 = g_allocs;
+        const std::uint64_t t0 = hft::rdtsc();
+        out.reset();
+        a.onMessage(msgs[i], out);
+        const std::uint64_t t1 = hft::rdtscp();
+        allocs += g_allocs - a0;
+        ns.push_back(ticksToNs(t0, t1));
+        bytes += static_cast<double>(msgs[i].size());
+    }
+    const double n = static_cast<double>(std::max<std::size_t>(1, end - begin));
+    row.stats = summarize(std::move(ns));
+    row.bytes = bytes / n;
+    row.allocs = static_cast<double>(allocs) / n;
+    return row;
+}
+
+// 适配器统计里不该出现的问题（缺口、重同步、校验和失败、格式错误、未同步）；空串 = 正常
+std::string adapterProblems(const ExchangeAdapter& a) {
+    const AdapterStats& s = a.stats();
+    std::string why;
+    if (!a.synced()) why += " not synced;";
+    if (s.parse_errors != 0) why += " parse_errors=" + std::to_string(s.parse_errors) + ";";
+    if (s.gaps != 0) why += " gaps=" + std::to_string(s.gaps) + ";";
+    if (s.resyncs != 0) why += " resyncs=" + std::to_string(s.resyncs) + ";";
+    if (s.checksum_failures != 0) why += " checksum_failures=" + std::to_string(s.checksum_failures) + ";";
+    if (a.exchange() == Exchange::OKX && !static_cast<const OkxAdapter&>(a).checksumEnabled()) {
+        why += " checksum verification disabled;";
+    }
+    return why;
+}
+
+void printStreamHeader() {
+    std::printf("  %-48s %6s %7s %7s %8s %8s %8s %8s %7s %8s\n", "scenario", "msgs", "bytes", "levels", "p50 us",
+                "p90 us", "p99 us", "mean us", ">100us", "allocs/m");
+}
+
+void printStreamRow(const StreamRow& r) {
+    std::printf("  %-48s %6zu %7.0f %7.1f %8.2f %8.2f %8.2f %8.2f %6.1f%% %8.2f\n", r.name.c_str(), r.stats.n, r.bytes,
+                r.levels, r.stats.p50, r.stats.p90, r.stats.p99, r.stats.mean, 100.0 * r.stats.above_100us, r.allocs);
+}
+
+// ---------------------------------------------------------------------------
+// 第 1b 节：同一批增量只看簿的应用——逐档 setLevel（0ec0622 之前的适配器）vs applyLevels，A/B 交错
+// ---------------------------------------------------------------------------
+struct ApplyComparison {
+    SampleStats per_level, batched;
+    ChangeMix mix;
+    double levels = 0;                 // 平均每条档位数
+    std::size_t batched_sides = 0;     // 超过 kBatchThreshold 档、走批量路径的一侧
+    std::size_t best_first_sides = 0;  // 其中已严格按最优在前排好的
+    bool same = false;
+};
+
+bool strictlyBestFirst(BookSide side, const std::vector<PriceLevel>& v) {
+    for (std::size_t i = 1; i < v.size(); ++i) {
+        const bool ordered = side == BookSide::Bid ? v[i - 1].price > v[i].price : v[i - 1].price < v[i].price;
+        if (!ordered) return false;
+    }
+    return true;
+}
+
+// start：起始快照；msgs[first, ...)：依次应用的增量，前 warm 条不计时
+ApplyComparison compareApply(const ParsedLevels& start, const std::vector<ParsedLevels>& msgs, std::size_t first,
+                             std::size_t warm) {
+    ApplyComparison c;
+    OrderBook per_level, batched, ref;  // ref：不计时的参考簿，用于分类变化与核对
+    for (OrderBook* b : {&per_level, &batched, &ref}) {
+        b->reserve(2048);
+        for (const PriceLevel& l : start.bids) b->setLevel(BookSide::Bid, l.price, l.quantity);
+        for (const PriceLevel& l : start.asks) b->setLevel(BookSide::Ask, l.price, l.quantity);
+        trimLikeAdapters(*b);
+    }
+    LevelBatchScratch scratch;
+    std::vector<double> t_per_level, t_batched;
+    t_per_level.reserve(msgs.size());
+    t_batched.reserve(msgs.size());
+    double levels = 0;
+    for (std::size_t i = first; i < msgs.size(); ++i) {
+        const ParsedLevels& m = msgs[i];
+        const bool timed = i >= first + warm;
+        if (timed) {
+            c.mix.depth_sum += static_cast<double>(ref.getBidCount() + ref.getAskCount()) / 2.0;
+            ++c.mix.messages;
+            levels += static_cast<double>(m.bids.size() + m.asks.size());
+            for (BookSide side : {BookSide::Bid, BookSide::Ask}) {
+                const std::vector<PriceLevel>& v = side == BookSide::Bid ? m.bids : m.asks;
+                if (v.size() <= OrderBook::kBatchThreshold) continue;
+                ++c.batched_sides;
+                if (strictlyBestFirst(side, v)) ++c.best_first_sides;
+            }
+        }
+        ChangeMix scratch_mix;
+        applyClassified(ref, BookSide::Bid, m.bids, timed ? c.mix : scratch_mix);
+        applyClassified(ref, BookSide::Ask, m.asks, timed ? c.mix : scratch_mix);
+        trimLikeAdapters(ref);
+        const auto runPerLevel = [&] {
+            const std::uint64_t t0 = hft::rdtsc();
+            for (const PriceLevel& l : m.bids) per_level.setLevel(BookSide::Bid, l.price, l.quantity);
+            for (const PriceLevel& l : m.asks) per_level.setLevel(BookSide::Ask, l.price, l.quantity);
+            trimLikeAdapters(per_level);
+            return ticksToNs(t0, hft::rdtscp());
+        };
+        const auto runBatched = [&] {
+            const std::uint64_t t0 = hft::rdtsc();
+            batched.applyLevels(BookSide::Bid, m.bids.data(), m.bids.size(), scratch);
+            batched.applyLevels(BookSide::Ask, m.asks.data(), m.asks.size(), scratch);
+            trimLikeAdapters(batched);
+            return ticksToNs(t0, hft::rdtscp());
+        };
+        double a = 0, b = 0;
+        if ((i & 1) == 0) {
+            a = runPerLevel();
+            b = runBatched();
+        } else {
+            b = runBatched();
+            a = runPerLevel();
+        }
+        if (timed) {
+            t_per_level.push_back(a);
+            t_batched.push_back(b);
+        }
+    }
+    c.levels = c.mix.messages == 0 ? 0.0 : levels / static_cast<double>(c.mix.messages);
+    c.per_level = summarize(std::move(t_per_level));
+    c.batched = summarize(std::move(t_batched));
+    c.same = sameBook(per_level, batched) && sameBook(per_level, ref);
+    return c;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -461,7 +835,18 @@ bool parseBinanceDepth(simdjson::ondemand::document& doc, OrderBook& orderbook_,
 }  // namespace legacy
 
 int main(int argc, char** argv) {
-    const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
+    bool quick = false;
+    bool cold = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quick") == 0) {
+            quick = true;
+        } else if (std::strcmp(argv[i], "--cold") == 0) {
+            cold = true;
+        } else {
+            std::fprintf(stderr, "usage: %s [--quick] [--cold]\n", argv[0]);
+            return 2;
+        }
+    }
     const std::size_t n = quick ? 2000 : 20000;
     std::mt19937_64 rng(20261104);
     hft::TscClock::instance();  // 先校准
@@ -471,30 +856,174 @@ int main(int argc, char** argv) {
     std::printf("  simdjson %s: stage-1 kernel %s (runtime dispatch), On-Demand inline kernel %s (compile flags)\n",
                 SIMDJSON_VERSION, simdjson::get_active_implementation()->name().c_str(),
                 simdjson::builtin_implementation()->name().c_str());
-    std::printf("  TSC: %.3f ns/tick, %zu messages per scenario\n", hft::TscClock::instance().nsPerTick(), n);
+    std::printf("  TSC: %.3f ns/tick, %zu messages per synthetic scenario\n", hft::TscClock::instance().nsPerTick(), n);
 
     // ======================= 1. 各适配器每条消息耗时 =======================
-    std::printf("\n1. Per-message processing (adapter.onMessage, TSC-timed, warmed up)\n");
-    printHeader();
-    std::vector<Result> results;
+    // 1a / 1b：模拟交易所的行情流（与离线演示中监控程序收到的报文相同），每个流的前 20% 只预热、不计时
+    const double mock_seconds = quick ? 30.0 : 180.0;
+    const MockStreams ms = generateMockStreams(mock_seconds);
+    const std::vector<ParsedLevels> p_binance_diffs = parseMessages(ms.binance_diffs);
+    const std::vector<ParsedLevels> p_binance_depth20 = parseMessages(ms.binance_depth20);
+    const std::vector<ParsedLevels> p_okx_updates = parseMessages(ms.okx_updates);
+    const std::vector<ParsedLevels> p_okx_snapshots = parseMessages(ms.okx_snapshots);
+    const std::vector<ParsedLevels> p_okx_books5 = parseMessages(ms.okx_books5);
+    const std::vector<ParsedLevels> p_okx_bbo = parseMessages(ms.okx_bbo);
+    const std::vector<ParsedLevels> p_bybit_deltas = parseMessages(ms.bybit_deltas);
 
-    // Binance depth20
-    {
-        auto a = makeAdapter(Exchange::BINANCE, config(Exchange::BINANCE));
-        a->onConnected();
-        const auto warm = binanceDepth20(2000, rng);
-        const auto msgs = binanceDepth20(n, rng);
-        AdapterResult out;
-        for (const auto& m : warm) {
-            out.reset();
-            a->onMessage(m, out);
+    struct MockCase {
+        const char* name;
+        Exchange ex;
+        const char* subscribe;                          // nullptr = config() 的默认订阅
+        const std::vector<std::string>* msgs;
+        const std::vector<ParsedLevels>* parsed;
+        std::size_t first;                              // 第一条要处理的报文（之前的已被 prime 覆盖）
+        std::function<void(ExchangeAdapter&)> prime;    // 进入已同步状态：订阅快照 / REST 快照
+    };
+    const auto feedOne = [](ExchangeAdapter& a, const std::string& m) {
+        AdapterResult r;
+        a.onMessage(m, r);
+    };
+    const char* const kOkxBooks5Sub = R"({"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT"}]})";
+    const char* const kOkxBboSub = R"({"op":"subscribe","args":[{"channel":"bbo-tbt","instId":"BTC-USDT"}]})";
+    const std::vector<MockCase> mock_cases = {
+        {"Binance depth20@100ms (20+20 snapshot)", Exchange::BINANCE, nullptr, &ms.binance_depth20,
+         &p_binance_depth20, 0, nullptr},
+        {"Binance diff@100ms (1000-level window)", Exchange::BINANCE, nullptr, &ms.binance_diffs, &p_binance_diffs, 1,
+         [&](ExchangeAdapter& a) {
+             feedOne(a, ms.binance_diffs[0]);  // 缓冲并请求快照；REST 快照覆盖这一条（u <= lastUpdateId）
+             AdapterResult r;
+             a.onRestSnapshot(ms.binance_rest, r);
+         }},
+        {"OKX books update (400 window, checksum)", Exchange::OKX, nullptr, &ms.okx_updates, &p_okx_updates, 0,
+         [&](ExchangeAdapter& a) { feedOne(a, ms.okx_snapshot); }},
+        {"OKX books snapshot (400+400, checksum)", Exchange::OKX, nullptr, &ms.okx_snapshots, &p_okx_snapshots, 0, nullptr},
+        {"OKX books5 push (5+5, no checksum)", Exchange::OKX, kOkxBooks5Sub, &ms.okx_books5, &p_okx_books5, 0, nullptr},
+        {"OKX bbo-tbt push (1+1, no checksum)", Exchange::OKX, kOkxBboSub, &ms.okx_bbo, &p_okx_bbo, 0, nullptr},
+        {"Bybit orderbook.50 delta", Exchange::BYBIT, nullptr, &ms.bybit_deltas, &p_bybit_deltas, 0,
+         [&](ExchangeAdapter& a) { feedOne(a, ms.bybit_snapshot); }},
+    };
+    // 一条比流中所有报文都大、会被适配器忽略的消息：先把 simdjson parser 与报文缓冲区撑到稳态容量
+    // （否则每遇到一条"史上最大"的报文都会扩容一次，allocs/m 量到的是预热而不是稳态）
+    const auto growBuffers = [&](ExchangeAdapter& a, const std::vector<std::string>& msgs) {
+        std::size_t largest = 0;
+        for (const std::string& m : msgs) largest = std::max(largest, m.size());
+        const std::string pad(largest + 1024, 'x');
+        switch (a.exchange()) {
+            case Exchange::BINANCE: feedOne(a, R"({"result":null,"id":1,"pad":")" + pad + "\"}"); break;
+            case Exchange::OKX: feedOne(a, R"({"event":"subscribe","pad":")" + pad + "\"}"); break;
+            case Exchange::BYBIT:
+                feedOne(a, R"({"success":true,"ret_msg":"subscribe","op":"subscribe","pad":")" + pad + "\"}");
+                break;
         }
-        results.push_back(measure("Binance depth20 (partial snapshot)", msgs, 40.0, [&](const std::string& m) {
-            out.reset();
-            a->onMessage(m, out);
-        }));
-        printResult(results.back());
+    };
+    // 一个流经真实适配器：prime 同步，再预热前 20%（不计时），其余（最多 max_timed 条）逐条计时
+    const auto runMock = [&](const MockCase& mc, std::vector<unsigned char>* evict, std::size_t max_timed) {
+        AdapterConfig cfg = config(mc.ex);
+        if (mc.subscribe != nullptr) cfg.subscribe_msg = mc.subscribe;
+        auto a = makeAdapter(mc.ex, cfg);
+        a->onConnected();
+        growBuffers(*a, *mc.msgs);
+        if (mc.prime) mc.prime(*a);
+        const std::vector<std::string>& msgs = *mc.msgs;
+        check(msgs.size() > mc.first, std::string(mc.name) + ": the mock stream produced no messages");
+        const std::size_t first = std::min(mc.first, msgs.size());
+        const std::size_t warm_end = first + (msgs.size() - first) / 5;
+        for (std::size_t i = first; i < warm_end; ++i) feedOne(*a, msgs[i]);
+        const std::size_t end = warm_end + std::min(max_timed, msgs.size() - warm_end);
+        StreamRow row = timeAdapter(*a, msgs, warm_end, end, evict);
+        row.name = std::string(evict != nullptr ? "cold: " : "") + mc.name;
+        row.levels = averageLevels(*mc.parsed, warm_end, end);
+        const std::string problems = adapterProblems(*a);
+        check(problems.empty(), row.name + ":" + problems);
+        return row;
+    };
+
+    std::printf("\n1. Per-message processing through the real adapters (adapter.onMessage, TSC-timed per message)\n");
+    std::printf("  1a. Mock-exchange streams = what the monitor receives in the offline demo (tools/mock_market.h driving\n"
+                "      tools/mock_publishers.h; seed %llu, %.0f s warm-up, %.0f s of market at the mock exchange's cadence:\n"
+                "      Binance and OKX every 100 ms, Bybit 50 every 20 ms, bbo-tbt every 10 ms). Warm caches, back to back;\n"
+                "      the first 20%% of each stream is applied untimed. These are the per-message costs to quote.\n"
+                "      allocs/m counts reusable buffers growing for a message larger than any before it (warm-up).\n",
+                static_cast<unsigned long long>(kMockSeed), kMockWarmupS, mock_seconds);
+    printStreamHeader();
+    for (const MockCase& mc : mock_cases) printStreamRow(runMock(mc, nullptr, SIZE_MAX));
+
+    // 1b：只看簿的应用。setLevel 一栏是 0ec0622 之前适配器应用增量的方式，applyLevels 是现在的方式
+    std::printf("\n  1b. Book apply only, the same mock diffs pre-parsed: per-level setLevel (how the adapters applied a diff\n"
+                "      before 0ec0622) vs OrderBook::applyLevels (now), A/B interleaved per message, books must end\n"
+                "      identical (us/msg). depth = mean levels per side; mix measured; sorted = share of the sides with more\n"
+                "      than %zu levels that arrive strictly best-first.\n",
+                OrderBook::kBatchThreshold);
+    std::printf("  %-28s %6s %7s %6s %19s | %31s | %31s | %7s %6s %4s\n", "stream", "msgs", "levels", "depth",
+                "ins/del/qty/noop %", "setLevel p50 / p90 / p99 / mean", "applyLevels p50 / p90 / p99 / mean", "speedup",
+                "sorted", "same");
+    {
+        struct ApplyCase {
+            const char* name;
+            const std::string* snapshot;
+            const std::vector<ParsedLevels>* msgs;
+            std::size_t first;
+        };
+        const ApplyCase apply_cases[] = {
+            {"Binance diff (1000 window)", &ms.binance_rest, &p_binance_diffs, 1},
+            {"OKX books update (400 window)", &ms.okx_snapshot, &p_okx_updates, 0},
+            {"Bybit orderbook.50 delta", &ms.bybit_snapshot, &p_bybit_deltas, 0},
+        };
+        for (const ApplyCase& ac : apply_cases) {
+            const std::vector<ParsedLevels> start = parseMessages({*ac.snapshot});
+            check(ac.msgs->size() > ac.first, std::string(ac.name) + ": the mock stream produced no messages");
+            const std::size_t warm = (ac.msgs->size() - std::min(ac.first, ac.msgs->size())) / 5;
+            const ApplyComparison c = compareApply(start[0], *ac.msgs, ac.first, warm);
+            char shares[48];
+            std::snprintf(shares, sizeof shares, "%.1f/%.1f/%.1f/%.1f", c.mix.pct(c.mix.inserts), c.mix.pct(c.mix.deletes),
+                          c.mix.pct(c.mix.qty_changes), c.mix.pct(c.mix.noops));
+            const double sorted = c.batched_sides == 0 ? 0.0
+                                                       : 100.0 * static_cast<double>(c.best_first_sides) /
+                                                             static_cast<double>(c.batched_sides);
+            std::printf("  %-28s %6zu %7.1f %6.0f %19s | %7.2f %7.2f %7.2f %7.2f | %7.2f %7.2f %7.2f %7.2f | %6.1fx %5.0f%% %4s\n",
+                        ac.name, c.per_level.n, c.levels, c.mix.meanDepth(), shares, c.per_level.p50, c.per_level.p90,
+                        c.per_level.p99, c.per_level.mean, c.batched.p50, c.batched.p90, c.batched.p99, c.batched.mean,
+                        c.per_level.mean / std::max(1e-9, c.batched.mean), sorted, c.same ? "yes" : "NO");
+            check(c.same, std::string(ac.name) + ": setLevel and applyLevels produced different books");
+        }
     }
+
+    if (cold) {
+        std::printf("\n  1a, cold caches: the same streams with %zu MiB (more than a typical LLC) walked before every message;\n"
+                    "      real feeds deliver a message every 10-100 ms, so processing usually starts cold. Up to 300 per stream.\n",
+                    kEvictBytes >> 20);
+        printStreamHeader();
+        std::vector<unsigned char> evict;
+        for (const MockCase& mc : mock_cases) printStreamRow(runMock(mc, &evict, 300));
+    }
+
+    // 1c：旧的第 1 节，保留作微基准
+    std::printf("\n  1c. Synthetic small diffs (the former section 1; micro-benchmarks, NOT per-message costs of real streams):\n"
+                "      changes only touch the best 30 levels and are in-place quantity changes once warmed up, so they never\n"
+                "      reach the insert/erase path that dominates real diffs. Book depth and qty share are measured.\n");
+    printStreamHeader();
+    // 一行微基准：计时后把同样的报文逐档重放到计时前的簿上，得到实测的簿深度与变化构成（写进行名）
+    const auto microRow = [&](const char* what, ExchangeAdapter& a, const std::vector<std::string>& msgs) {
+        const OrderBook before = a.book();
+        StreamRow row = timeAdapter(a, msgs, 0, msgs.size(), nullptr);
+        const std::vector<ParsedLevels> parsed = parseMessages(msgs);
+        ChangeMix mix;
+        OrderBook ref = before;
+        for (const ParsedLevels& p : parsed) {
+            applyClassified(ref, BookSide::Bid, p.bids, mix);
+            applyClassified(ref, BookSide::Ask, p.asks, mix);
+            trimLikeAdapters(ref);
+        }
+        row.levels = averageLevels(parsed, 0, parsed.size());
+        char label[96];
+        std::snprintf(label, sizeof label, "micro: %s (%d+%d book, %.0f%% qty)", what, before.getBidCount(),
+                      before.getAskCount(), mix.pct(mix.qty_changes));
+        row.name = label;
+        printStreamRow(row);
+        check(sameBook(ref, a.book()), row.name + ": the replay does not match the adapter's book");
+        const std::string problems = adapterProblems(a);
+        check(problems.empty(), row.name + ":" + problems);
+    };
 
     // Binance diff depth（已与 1000 档 REST 快照同步）
     {
@@ -510,12 +1039,11 @@ int main(int argc, char** argv) {
                    ",\"bids\":" + levelsJson(sideLevels(book.bids, true, 2, 1000, fixedTicks)) +
                    ",\"asks\":" + levelsJson(sideLevels(book.asks, false, 2, 1000, fixedTicks)) + "}";
         };
-        auto makeEvents = [&](std::size_t count, double& levels) {
+        auto makeEvents = [&](std::size_t count) {
             std::vector<std::string> out;
-            double total = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 std::map<std::pair<bool, std::int64_t>, std::string> agg;
-                const std::size_t k = 10 + rng() % 30;  // 100ms 增量通常十几到几十档
+                const std::size_t k = 10 + rng() % 30;
                 const std::uint64_t first = id + 1;
                 for (std::size_t c = 0; c < k; ++c) {
                     bool bid;
@@ -527,37 +1055,28 @@ int main(int argc, char** argv) {
                 }
                 Levels b, a;
                 for (const auto& kv : agg) (kv.first.first ? b : a).push_back({fixedTicks(kv.first.second, 2), kv.second});
-                total += static_cast<double>(b.size() + a.size());
                 out.push_back("{\"e\":\"depthUpdate\",\"E\":1700000000000,\"s\":\"BTCUSDT\",\"U\":" + std::to_string(first) +
                               ",\"u\":" + std::to_string(id) + ",\"b\":" + levelsJson(b) + ",\"a\":" + levelsJson(a) + "}");
             }
-            levels = total / static_cast<double>(count);
             return out;
         };
         auto a = makeAdapter(Exchange::BINANCE, config(Exchange::BINANCE));
         a->onConnected();
         AdapterResult out;
-        double warm_levels = 0, levels = 0;
-        const auto first = makeEvents(1, warm_levels);  // 第一条触发缓冲 + 快照请求
+        const auto first = makeEvents(1);  // 第一条触发缓冲 + 快照请求
         a->onMessage(first[0], out);
         out.reset();
         a->onRestSnapshot(snapshotNow(), out);  // 快照在第一条事件之后取得：L >= U，第一条被丢弃
-        if (!a->synced()) std::printf("  !! binance diff stream did not sync\n");
-        const auto warm = makeEvents(2000, warm_levels);
-        const auto msgs = makeEvents(n, levels);
+        const auto warm = makeEvents(2000);
+        const auto msgs = makeEvents(n);
         for (const auto& m : warm) {
             out.reset();
             a->onMessage(m, out);
         }
-        results.push_back(measure("Binance diff depth (synced, 1000-level book)", msgs, levels, [&](const std::string& m) {
-            out.reset();
-            a->onMessage(m, out);
-        }));
-        printResult(results.back());
-        if (!a->synced() || a->stats().gaps != 0) std::printf("  !! binance diff stream lost sync\n");
+        microRow("Binance diff", *a, msgs);
     }
 
-    // OKX books：400 档快照（含校验和）与增量（含校验和）
+    // OKX books 增量（含校验和）
     {
         SimBook book;
         const std::int64_t mid = 300000;
@@ -574,22 +1093,8 @@ int main(int argc, char** argv) {
                    ",\"ts\":\"1597026383085\",\"checksum\":" + okxChecksumOf(book) +
                    ",\"prevSeqId\":-1,\"seqId\":" + std::to_string(seq) + "}]}";
         };
-        auto a = makeAdapter(Exchange::OKX, config(Exchange::OKX));
-        a->onConnected();
-        AdapterResult out;
-        const std::vector<std::string> snaps(n / 10, snapshot());
-        for (int i = 0; i < 200; ++i) {
-            out.reset();
-            a->onMessage(snaps[0], out);
-        }
-        results.push_back(measure("OKX books snapshot (400+400, checksum)", snaps, 800.0, [&](const std::string& m) {
-            out.reset();
-            a->onMessage(m, out);
-        }));
-        printResult(results.back());
-        auto makeUpdates = [&](std::size_t count, double& levels) {
+        auto makeUpdates = [&](std::size_t count) {
             std::vector<std::string> v;
-            double total = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 std::map<std::pair<bool, std::int64_t>, std::string> agg;
                 const std::size_t k = 2 + rng() % 12;
@@ -602,31 +1107,25 @@ int main(int argc, char** argv) {
                 }
                 Levels b, as;
                 for (const auto& kv : agg) (kv.first.first ? b : as).push_back({okxPx(kv.first.second, 1), kv.second});
-                total += static_cast<double>(b.size() + as.size());
                 const std::int64_t prev = seq++;
                 v.push_back("{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"update\",\"data\":[{\"asks\":" +
                             levelsJson(as, true) + ",\"bids\":" + levelsJson(b, true) +
                             ",\"ts\":\"1597026383085\",\"checksum\":" + okxChecksumOf(book) +
                             ",\"prevSeqId\":" + std::to_string(prev) + ",\"seqId\":" + std::to_string(seq) + "}]}");
             }
-            levels = total / static_cast<double>(count);
             return v;
         };
-        out.reset();
+        auto a = makeAdapter(Exchange::OKX, config(Exchange::OKX));
+        a->onConnected();
+        AdapterResult out;
         a->onMessage(snapshot(), out);
-        double warm_levels = 0, levels = 0;
-        const auto warm = makeUpdates(2000, warm_levels);
-        const auto msgs = makeUpdates(n, levels);
+        const auto warm = makeUpdates(2000);
+        const auto msgs = makeUpdates(n);
         for (const auto& m : warm) {
             out.reset();
             a->onMessage(m, out);
         }
-        results.push_back(measure("OKX books update (checksum verified)", msgs, levels, [&](const std::string& m) {
-            out.reset();
-            a->onMessage(m, out);
-        }));
-        printResult(results.back());
-        if (!a->synced() || a->stats().checksum_failures != 0) std::printf("  !! okx stream lost sync\n");
+        microRow("OKX books update", *a, msgs);
     }
 
     // Bybit orderbook.50 delta
@@ -648,9 +1147,8 @@ int main(int argc, char** argv) {
         AdapterResult out;
         a->onMessage(msg("snapshot", sideLevels(book.bids, true, 2, 50, fixedTicks), sideLevels(book.asks, false, 2, 50, fixedTicks)),
                      out);
-        auto makeDeltas = [&](std::size_t count, double& levels) {
+        auto makeDeltas = [&](std::size_t count) {
             std::vector<std::string> v;
-            double total = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 std::map<std::pair<bool, std::int64_t>, std::string> agg;
                 const std::size_t k = 3 + rng() % 10;
@@ -663,26 +1161,18 @@ int main(int argc, char** argv) {
                 }
                 Levels b, as;
                 for (const auto& kv : agg) (kv.first.first ? b : as).push_back({fixedTicks(kv.first.second, 2), kv.second});
-                total += static_cast<double>(b.size() + as.size());
                 ++u;
                 v.push_back(msg("delta", b, as));
             }
-            levels = total / static_cast<double>(count);
             return v;
         };
-        double warm_levels = 0, levels = 0;
-        const auto warm = makeDeltas(2000, warm_levels);
-        const auto msgs = makeDeltas(n, levels);
+        const auto warm = makeDeltas(2000);
+        const auto msgs = makeDeltas(n);
         for (const auto& m : warm) {
             out.reset();
             a->onMessage(m, out);
         }
-        results.push_back(measure("Bybit orderbook.50 delta", msgs, levels, [&](const std::string& m) {
-            out.reset();
-            a->onMessage(m, out);
-        }));
-        printResult(results.back());
-        if (!a->synced() || a->stats().gaps != 0) std::printf("  !! bybit stream lost sync\n");
+        microRow("Bybit delta", *a, msgs);
     }
 
     // ======================= 2. 旧流程 vs 新流程 =======================

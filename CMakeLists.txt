@@ -105,4 +105,8 @@ if(HFT_BUILD_BENCHMARKS)
     hft_add_bench(hft_benchmark hft_core)
     hft_add_bench(matching_engine_benchmark hft_core)
     hft_add_bench(market_data_benchmark market_data)
+    # 行情基准用模拟交易所的市场仿真与发布状态机（tools/mock_market.h、tools/mock_publishers.h）生成真实形状的行情流
+    if(TARGET market_data_benchmark)
+        target_include_directories(market_data_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+    endif()
 endif()
