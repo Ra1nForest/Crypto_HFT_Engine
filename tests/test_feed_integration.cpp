@@ -543,6 +543,37 @@ mock_exchange::ServerOptions dualHostServerOptions() {
     return opt;
 }
 
+// 脚本：之后只应答心跳——每收到一个 ping 文本帧回一个 pong（pong 为空时不回应），直到客户端断开
+void answerPings(WsSession& ws, const std::string& ping, const std::string& pong) {
+    std::size_t seen = 0;
+    while (ws.clientConnected()) {
+        ws.waitUntil([&] { return ws.received().size() > seen || !ws.clientConnected(); }, 50);
+        while (seen < ws.received().size()) {
+            if (ws.received()[seen] == ping && !pong.empty()) ws.send(pong);
+            ++seen;
+        }
+    }
+}
+
+// frames 中等于 text 的帧的到达时刻
+std::vector<std::int64_t> timesOf(const std::vector<std::string>& frames, const std::vector<std::int64_t>& times,
+                                  const std::string& text) {
+    std::vector<std::int64_t> out;
+    for (std::size_t i = 0; i < frames.size() && i < times.size(); ++i) {
+        if (frames[i] == text) out.push_back(times[i]);
+    }
+    return out;
+}
+
+// 主线程的刷新循环：duration_ms 内每 10 ms 调用一次 checkHealth（停顿看门狗照常工作）
+void runHealthChecks(MarketDataFeed& feed, int duration_ms) {
+    const std::int64_t t0 = hft::nowNs();
+    while (ms(hft::nowNs() - t0) < duration_ms) {
+        feed.checkHealth(hft::nowNs());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 // 检查 feed 宣布的重连等待序列：第 i 次等待 ∈ [0.8, 1.2] x expected[i]（钳制到 max_ms；0 = 立即重连），
 // 且第 i+1 个 TCP 连接确实在宣布之后至少等待了这么久才到达（每次尝试恰好产生一个连接）
 void checkAnnouncedBackoff(const EventLog& events, const MockExchangeServer& server, std::vector<int> expected,
@@ -1100,7 +1131,7 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
         CHECK_GE(times[i], times[i - 1]);
     }
     CHECK_GE(pings, std::size_t{3});
-    CHECK_GE(n, 3);  // ping 只在收到消息之后发送
+    CHECK_GE(n, 3);  // 数据一直在来（每 10 ms 一条）：心跳由周期规则（每 40 ms）发出，不依赖空闲
     // 心跳不会比间隔更频繁：会话开始（"connected" 日志）之后的窗口内最多 window / 40 ms 个
     std::int64_t connected_ns = 0;
     for (const EventLog::Event& e : events.events()) {
@@ -1124,6 +1155,211 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     CHECK(waitFor([&] { return runner.feed.stats().messages == expected_messages; }, 2000));
     CHECK_EQ(runner.feed.getExchangeLatency().count(), static_cast<std::uint64_t>(n + 1));  // 带 ts 的消息
     CHECK(server.errors().empty());
+}
+
+// ---------------------------------------------------------------------------
+// 心跳：安静的连接也按空闲时间发心跳；回应刷新停顿看门狗；没有回应时看门狗照常踢断
+// ---------------------------------------------------------------------------
+
+// 一个快照之后只有心跳往来的会话：idle_ping = min(适配器默认 20000, stall 600 / 2) = 300 ms，
+// 运行 5 个空闲间隔：心跳按空闲时间发出、回应让看门狗不动手
+void checkIdleAppKeepalive(Exchange exchange, const std::string& ping, const std::string& pong,
+                           const std::function<void(WsSession&)>& start) {
+    MockExchangeServer server;
+    server.setWebSocketScript([start, ping, pong](WsSession& ws) {
+        start(ws);
+        answerPings(ws, ping, pong);
+    });
+    FeedConfig cfg = baseConfig(exchange, server);
+    cfg.ping_interval_ms = -1;  // 适配器默认间隔（20 s）
+    cfg.stall_timeout_ms = 600;
+    FeedRunner runner(cfg);
+    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
+    runHealthChecks(runner.feed, 1500);
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.stalls, 0u);
+    CHECK_EQ(s.reconnects, 0u);
+    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
+    CHECK_GE(s.pings, 3u);
+    CHECK_EQ(s.pongs, 0u);  // 应用层 pong 是普通消息
+    const std::vector<std::string> frames = server.framesReceived(0);
+    const std::vector<std::int64_t> pings = timesOf(frames, server.frameTimesNs(0), ping);
+    REQUIRE(pings.size() >= 3);
+    REQUIRE(!frames.empty());
+    // 第一个心跳在快照之后空闲约 300 ms 才发出；之后每个间隔都 >= 300 ms（回应刷新了空闲计时）
+    CHECK_GE(ms(pings[0] - server.frameTimesNs(0)[0]), 280.0);
+    for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);
+    CHECK_LE(pings.size(), std::size_t{6});
+    CHECK(waitFor([&] { return runner.feed.stats().messages >= 1 + pings.size(); }, 1000));  // 快照 + 每个 pong
+    CHECK(server.errors().empty());
+}
+
+TEST_CASE("feed: an idle OKX books5 session pings on idle time (\"ping\" -> \"pong\"): no stall, no reconnect") {
+    checkIdleAppKeepalive(Exchange::OKX, "ping", "pong", [](WsSession& ws) {
+        ws.expectText(kOkxBooks5Sub);
+        ws.send(simpleBook(0));  // 之后市场安静：books5 只在前 5 档变化时推送
+    });
+}
+
+TEST_CASE("feed: an idle Bybit session pings on idle time ({\"op\":\"ping\"} -> pong): no stall, no reconnect") {
+    checkIdleAppKeepalive(Exchange::BYBIT, kBybitPing, R"({"op":"pong","args":["1700000000000"],"conn_id":"c1"})",
+                          [](WsSession& ws) {
+                              ws.expectText(kBybitSub);
+                              ws.send(bybitBook("snapshot", {{"65000.0", "1"}}, {{"65000.5", "2"}}, 100, 1700000000000));
+                          });
+}
+
+TEST_CASE("feed: a silent Binance stream gets WebSocket ping frames; the server's pongs keep it up") {
+    MockExchangeServer server;
+    server.setWebSocketScript([](WsSession& ws) {
+        ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));  // 之后静默（Beast 自动应答 ping）
+    });
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = "/ws/btcusdt@depth20@100ms";
+    cfg.ping_interval_ms = -1;  // Binance 没有应用层心跳：空闲 stall / 2 = 300 ms 发 WebSocket ping
+    cfg.stall_timeout_ms = 600;
+    FeedRunner runner(cfg);
+    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
+    runHealthChecks(runner.feed, 1500);
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.stalls, 0u);
+    CHECK_EQ(s.reconnects, 0u);
+    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
+    CHECK_GE(s.pings, 3u);
+    CHECK_GE(s.pongs + 1, s.pings);  // 最后一个 pong 可能还在路上
+    CHECK_EQ(s.messages, 1u);        // 控制帧不算消息
+    CHECK(server.framesReceived(0).empty());  // 没有发任何文本帧
+    const std::vector<std::int64_t> pings = server.pingTimesNs(0);
+    CHECK_GE(pings.size(), std::size_t{3});
+    for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);
+    CHECK(server.errors().empty());
+}
+
+TEST_CASE("feed: a server that never answers pings is still kicked by the stall watchdog (app-level and WebSocket)") {
+    {  // OKX：收到 "ping" 但从不回 "pong"
+        MockExchangeServer server;
+        server.setWebSocketScripts({
+            [](WsSession& ws) {
+                ws.expectText(kOkxBooks5Sub);
+                ws.send(simpleBook(0));
+                answerPings(ws, "ping", std::string());
+            },
+            [](WsSession& ws) { ws.send(simpleBook(1)); },
+        });
+        FeedConfig cfg = baseConfig(Exchange::OKX, server);
+        cfg.ping_interval_ms = -1;
+        cfg.stall_timeout_ms = 600;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor(
+            [&] {
+                runner.feed.checkHealth(hft::nowNs());
+                return runner.feed.stats().stalls >= 1 && server.wsSessionCount() >= 2;
+            },
+            5000, 10));
+        CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 600 ms during read"));
+        const std::vector<std::string> frames = server.framesReceived(0);
+        CHECK_GE(std::count(frames.begin(), frames.end(), std::string("ping")), 1);  // 心跳确实发了
+    }
+    {  // Binance：服务器卡住（不运行 io_context，不应答 WebSocket ping）
+        MockExchangeServer server;
+        server.setWebSocketScripts({
+            [](WsSession& ws) {
+                ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));
+                ws.freezeMs(3000);
+            },
+            [](WsSession& ws) { ws.send(binanceDepth(1001, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}})); },
+        });
+        FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+        cfg.path = "/ws/btcusdt@depth20@100ms";
+        cfg.ping_interval_ms = -1;
+        cfg.stall_timeout_ms = 600;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor(
+            [&] {
+                runner.feed.checkHealth(hft::nowNs());
+                return runner.feed.stats().stalls >= 1 && server.wsSessionCount() >= 2;
+            },
+            5000, 10));
+        CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 600 ms during read"));
+        const FeedStats s = runner.feed.stats();
+        CHECK_GE(s.pings, 1u);
+        CHECK_EQ(s.pongs, 0u);
+    }
+}
+
+TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as healthy and resets the backoff") {
+    MockExchangeServer server;
+    // 连接 0..2 失败；3 = 安静的会话：一条 depth20 推送，之后约 600 ms 只有 WebSocket ping/pong，然后服务器关闭；
+    // 4 及以后失败
+    server.setAcceptHandler([](std::size_t i) { return i == 3 ? AcceptAction::Serve : AcceptAction::CloseImmediately; });
+    server.setWebSocketScript([](WsSession& ws) {
+        ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));
+        ws.sleepMs(600);  // 期间 Beast 自动应答客户端的 ping
+        ws.close();
+    });
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = "/ws/btcusdt@depth20@100ms";
+    cfg.ping_interval_ms = -1;  // WebSocket ping：空闲 100 ms 就发
+    cfg.stall_timeout_ms = 200;
+    cfg.healthy_session_ms = 300;
+    cfg.reconnect_initial_ms = 30;
+    cfg.reconnect_max_ms = 4000;
+    EventLog events;
+    FeedRunner runner(cfg, events.callback());
+    REQUIRE(waitFor(
+        [&] {
+            runner.feed.checkHealth(hft::nowNs());
+            return server.acceptCount() >= 5;
+        },
+        10000, 10));
+    runner.stop();
+    // 失败 0,1,2：30, 60, 120；安静但健康的会话 3 之后重置：30（不重置则为 240）
+    checkAnnouncedBackoff(events, server, {30, 60, 120, 30}, 4000);
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.stalls, 0u);
+    CHECK_GE(s.pongs, 3u);
+    CHECK(server.errors().empty());
+}
+
+TEST_CASE("feed: handler memory reuses the smallest fitting block and only touches the heap when the cache misses") {
+    feed_detail::HandlerMemory mem;
+    void* a = mem.allocate(100);   // 新块：128
+    void* b = mem.allocate(300);   // 新块：384
+    CHECK_EQ(mem.heapAllocations(), 2u);
+    mem.deallocate(a);
+    mem.deallocate(b);
+    void* c = mem.allocate(90);    // 最小的够用块：a
+    CHECK(c == a);
+    void* d = mem.allocate(200);   // b
+    CHECK(d == b);
+    void* e = mem.allocate(50);    // 缓存已空：新块
+    CHECK_EQ(mem.heapAllocations(), 3u);
+    mem.deallocate(c);
+    mem.deallocate(d);
+    mem.deallocate(e);
+    // 稳态：反复申请 / 释放同几种大小不再访问全局堆
+    for (int i = 0; i < 1000; ++i) {
+        void* x = mem.allocate(120);
+        void* y = mem.allocate(380);
+        void* z = mem.allocate(64);
+        mem.deallocate(y);
+        mem.deallocate(x);
+        mem.deallocate(z);
+    }
+    CHECK_EQ(mem.heapAllocations(), 3u);
+    // 缓存满（8 块）时再释放：留下较大的块
+    std::vector<void*> blocks;
+    for (std::size_t i = 0; i < feed_detail::HandlerMemory::kSlots + 1; ++i) blocks.push_back(mem.allocate(1000));
+    for (void* p : blocks) mem.deallocate(p);
+    void* big = mem.allocate(1000);  // 不需要新块
+    CHECK_EQ(mem.heapAllocations(), 3u + feed_detail::HandlerMemory::kSlots + 1);
+    mem.deallocate(big);
+    feed_detail::HandlerAllocator<int> alloc(mem);
+    int* p = alloc.allocate(4);
+    p[3] = 7;
+    CHECK_EQ(p[3], 7);
+    alloc.deallocate(p, 4);
+    CHECK(alloc == feed_detail::HandlerAllocator<double>(mem));
 }
 
 TEST_CASE("feed: Binance depth20 partial book stream goes LIVE on the first message (no REST)") {

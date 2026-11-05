@@ -1,7 +1,7 @@
 //
 // market_data_feed.h
-// 行情连接管理器：每个 feed 一个阻塞线程（同步 Boost.Beast）驱动交易所协议适配器，负责连接、退避重连、
-// 停顿踢断、REST 快照，并经 SPSC 队列向主线程发布 BookSnapshot。
+// 行情连接管理器：每个 feed 一个线程（Boost.Beast：同步建立连接，流式阶段在本线程上驱动异步读与心跳定时器）
+// 驱动交易所协议适配器，负责连接、心跳、退避重连、停顿踢断、REST 快照，并经 SPSC 队列向主线程发布 BookSnapshot。
 //
 
 #pragma once
@@ -15,8 +15,12 @@
 #include "net/https_client.h"
 #include "orderbook.h"
 
+#include <boost/asio/basic_waitable_timer.hpp>
+#include <boost/asio/bind_allocator.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/wait_traits.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
@@ -80,7 +84,8 @@ struct FeedConfig {
     // ---- 以下为规格之外的扩展：默认值即生产行为，测试用来缩短时间 ----
     int connect_timeout_ms = 10000;    // 解析 + TCP + TLS + WebSocket 握手的总时限（checkHealth 踢断；<= 0 关闭）；
                                        // TCP 连接时每个地址另有 max(1 s, 剩余时限 / 地址数) 的时限
-    int ping_interval_ms = -1;         // 应用层心跳间隔：< 0 用适配器默认值（OKX/Bybit 20000），0 关闭，> 0 覆盖
+    int ping_interval_ms = -1;         // 心跳间隔：< 0 用适配器默认值（OKX/Bybit 20000，Binance 无），0 关闭心跳，
+                                       // > 0 覆盖。空闲 min(间隔, stall_timeout_ms / 2) 即发心跳（见类注释）
     int healthy_session_ms = 30000;    // 会话连续 LIVE 超过这么久即视为健康：退避计数清零
     int rest_max_attempts = 5;         // 每个会话 REST 快照最多尝试次数，超过则重连
     std::size_t max_buffered_events = 2000;   // Binance 同步前事件缓冲上限（AdapterConfig）
@@ -94,6 +99,8 @@ struct FeedStats {
                   parse_errors = 0;
     std::int64_t last_message_ns = 0;     // 最后一条消息的 hft::nowNs()，无则为 0
     std::int64_t connected_since_ns = 0;  // 当前会话建立（WebSocket 握手完成）的 hft::nowNs()，未连接为 0
+    std::uint64_t pings = 0;              // 发出的心跳（应用层 ping 消息或 WebSocket ping 控制帧）
+    std::uint64_t pongs = 0;              // 收到的 WebSocket pong 控制帧（应用层的 "pong" 是普通消息，计入 messages）
 };
 
 namespace feed_detail {
@@ -117,12 +124,113 @@ inline std::string bodySnippet(const std::string& body) {
     }
     return ": " + s + (body.size() > kMax ? "..." : "");
 }
+
+// 异步处理器内存：feed 线程私有的小块缓存。asio 自带的 recycling allocator 把缓存放在 run_one() 栈上的
+// thread_info 里，每次 run_one() 返回就释放：用 run_one() 驱动会话时，每个异步操作都会访问全局堆。
+// 这里的缓存跨 run_one() 与会话保留，稳态下 async_read / 定时器 / 写操作反复使用同几块内存。
+// 取最小的够用块；块大小按 128 字节取整、只增不减；缓存里没有够用的块时退回 ::operator new（释放时放回缓存）。
+// 不加锁：分配与释放都在 feed 线程上（feed 析构时才释放缓存，那时运行 run() 的线程已经 join）。
+class HandlerMemory {
+public:
+    static constexpr std::size_t kSlots = 8;
+
+    HandlerMemory() = default;
+    HandlerMemory(const HandlerMemory&) = delete;
+    HandlerMemory& operator=(const HandlerMemory&) = delete;
+    ~HandlerMemory() {
+        for (void* p : free_) {
+            if (p != nullptr) ::operator delete(header(p));
+        }
+    }
+
+    void* allocate(std::size_t size) {
+        std::size_t best = kSlots;
+        for (std::size_t i = 0; i < kSlots; ++i) {
+            if (free_[i] != nullptr && capacity(free_[i]) >= size &&
+                (best == kSlots || capacity(free_[i]) < capacity(free_[best]))) {
+                best = i;
+            }
+        }
+        if (best != kSlots) {
+            void* p = free_[best];
+            free_[best] = nullptr;
+            return p;
+        }
+        if (size > std::numeric_limits<std::size_t>::max() - kRound - kHeader) throw std::bad_alloc();
+        const std::size_t cap = (size + kRound - 1) / kRound * kRound;
+        void* raw = ::operator new(cap + kHeader);
+        *static_cast<std::size_t*>(raw) = cap;
+        ++heap_allocations_;
+        return static_cast<unsigned char*>(raw) + kHeader;
+    }
+
+    void deallocate(void* p) noexcept {
+        if (p == nullptr) return;
+        std::size_t smallest = kSlots;
+        for (std::size_t i = 0; i < kSlots; ++i) {
+            if (free_[i] == nullptr) {
+                free_[i] = p;
+                return;
+            }
+            if (smallest == kSlots || capacity(free_[i]) < capacity(free_[smallest])) smallest = i;
+        }
+        if (capacity(free_[smallest]) < capacity(p)) std::swap(free_[smallest], p);  // 缓存已满：留下较大的块
+        ::operator delete(header(p));
+    }
+
+    // 向全局堆申请过的块数（测试用）
+    std::uint64_t heapAllocations() const noexcept { return heap_allocations_; }
+
+private:
+    static constexpr std::size_t kHeader = alignof(std::max_align_t);  // 块头存容量；之后的地址保持最大对齐
+    static constexpr std::size_t kRound = 128;
+    static void* header(void* p) noexcept { return static_cast<unsigned char*>(p) - kHeader; }
+    static std::size_t capacity(void* p) noexcept { return *static_cast<std::size_t*>(header(p)); }
+
+    void* free_[kSlots] = {};
+    std::uint64_t heap_allocations_ = 0;
+};
+
+// 从 HandlerMemory 分配的分配器：用 asio::bind_allocator 关联到完成处理器上，asio 与 Beast 为该处理器的
+// 异步操作分配的全部内存（reactor 操作、定时器等待、投递的完成、Beast 的稳定状态与暂停的操作）都经过它
+template <class T>
+class HandlerAllocator {
+public:
+    using value_type = T;
+
+    explicit HandlerAllocator(HandlerMemory& memory) noexcept : memory_(&memory) {}
+    template <class U>
+    HandlerAllocator(const HandlerAllocator<U>& other) noexcept : memory_(other.memory_) {}
+
+    T* allocate(std::size_t n) {
+        static_assert(alignof(T) <= alignof(std::max_align_t), "HandlerMemory blocks are max_align_t aligned");
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
+        return static_cast<T*>(memory_->allocate(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t) noexcept { memory_->deallocate(p); }
+
+    template <class U>
+    bool operator==(const HandlerAllocator<U>& other) const noexcept {
+        return memory_ == other.memory_;
+    }
+    template <class U>
+    bool operator!=(const HandlerAllocator<U>& other) const noexcept {
+        return memory_ != other.memory_;
+    }
+
+private:
+    template <class>
+    friend class HandlerAllocator;
+    HandlerMemory* memory_;
+};
 }  // namespace feed_detail
 
 // 行情连接管理器。
-// 设计决定：保持同步 Boost.Beast，每个 feed 一个阻塞线程（简单、延迟低：读到数据立即在本线程处理）。
+// 设计决定：每个 feed 一个线程（简单、延迟低：读到数据立即在本线程处理）。建立连接（解析、TCP、TLS 与
+// WebSocket 握手、首批订阅帧）是同步的；流式阶段用一个只属于本会话的 io_context，在本线程上以 run_one()
+// 驱动 ws.async_read 与心跳定时器：连接安静时也能按时发心跳。
 // 阻塞调用没有超时，及时退出与停顿恢复靠"踢断"：所有活动套接字登记在 hft::net::SocketRegistry 中，
-// stop() 与 checkHealth() 对它们 ::shutdown(SHUT_RDWR)，阻塞的 handshake/read/write 立即失败。
+// stop() 与 checkHealth() 对它们 ::shutdown(SHUT_RDWR)，阻塞的 handshake/read/write 与挂起的异步读写立即失败。
 // 每个套接字都是先 open、先登记，再发起非阻塞连接并分片等待（hft::net::connectSocket，每片之间检查踢断状态），
 // 踢断落在连接过程的任何时刻都在约 50 ms 内生效；REST 快照的套接字同样登记。注销总在关闭之前
 // （见 SocketRegistry 关于 fd 复用的说明）。DNS 解析在后台线程中进行，可被踢断状态中断。
@@ -133,23 +241,30 @@ inline std::string bodySnippet(const std::string& body) {
 //
 // 会话流程：解析 → 打开并登记套接字 → connect → TCP_NODELAY → SNI → （tls_verify：系统 CA + 可选 ca_file、
 // verify_peer、host_name_verification）→ TLS 握手 → WebSocket 握手（User-Agent: crypto_hft_engine/2.0）
-// → 发送 adapter.onConnected() 的帧 → 读循环。
-// 每条消息：recv_ns = 读取返回时刻 → adapter.onMessage → 依次处理结果：
-//   状态 SYNCING/LIVE 按 adapter.synced() 更新；error → lastError() 与日志回调；send → 按顺序发送；
+// → 同步发送 adapter.onConnected() 的帧 → 读循环（异步）。
+// 异步读开始之后的全部写（适配器要求发送的帧，含重订阅；心跳）都经同一个写队列依次异步发出：Beast 允许
+// 一个读与一个写同时挂起，异步读挂起时不能再同步写。
+// 每条消息：recv_ns = 读处理器开始执行的时刻 → adapter.onMessage → 依次处理结果：
+//   状态 SYNCING/LIVE 按 adapter.synced() 更新；error → lastError() 与日志回调；send → 按顺序进入写队列；
 //   交易所延迟记录；book_updated → 发布快照（空簿同样发布；处理延迟在入队前记录）；
 //   因此消费者取到一个快照时，status() 与两个延迟统计都已包含这条消息（队列的 release/acquire），
 //   只有 published/dropped 计数在 tryPush 之后才更新；
-//   reconnect → 结束会话并立即重连（不退避）；need_rest_snapshot → 阻塞式 HTTPS GET
-//   rest_host:rest_port/snapshot_path（同样的校验规则，响应体上限 16 MiB，WebSocket 数据暂存在内核缓冲区），
-//   200 的响应体交给 onRestSnapshot，非 200 / 传输失败视为失败；适配器继续要求时按退避重试，
-//   每会话最多 rest_max_attempts 次，之后重连。
+//   reconnect → 结束会话并立即重连（不退避）；need_rest_snapshot → 在读处理器里同步执行 HTTPS GET
+//   rest_host:rest_port/snapshot_path（同样的校验规则，响应体上限 16 MiB；其间 io_context 暂停，
+//   WebSocket 数据暂存在内核缓冲区），200 的响应体交给 onRestSnapshot，非 200 / 传输失败视为失败；
+//   适配器继续要求时按退避重试，每会话最多 rest_max_attempts 次，之后重连。
 //   （先发布、后拉 REST：缺口导致的空簿立即让消费者知道，不必等待 REST 往返。）
-// 应用层心跳：每条消息之后，若心跳间隔已到则发送 pingMessage()。
+// 心跳：有应用层心跳的交易所（OKX "ping"、Bybit {"op":"ping"}）在 idle_ping = min(心跳间隔, stall_timeout_ms / 2)
+// 内没有收到任何帧时发送 pingMessage()，数据一直在来也至少每个心跳间隔发一次；没有应用层心跳的交易所
+// （Binance）空闲同样久之后发 WebSocket ping 控制帧。收到的任何帧都算活动（含文本 pong、pong 控制帧与服务器的
+// ping）：刷新停顿看门狗与健康会话判定，所以只有心跳往来的安静会话不会被踢断；对端不回应时看门狗照常踢断。
+// 每次最多一个心跳在途。ping_interval_ms = 0 关闭心跳。
 // 会话结束（任何原因）时若最后发布的簿非空，再发布一个空簿：断线期间消费者不会继续使用过期价格。
 //
 // 状态：建立连接期间 Connecting；握手完成后 Syncing，adapter.synced() 后 Live；会话结束 → Reconnecting
 // （错误写 stderr 并存入 lastError()），退避 min(max, initial * 2^attempt)（±20% 抖动，结果钳制到
-// [1, max]，可被 stop() 打断）；会话连续 Live 超过 healthy_session_ms（默认 30 s）后 attempt 清零。
+// [1, max]，可被 stop() 打断）；会话连续 Live 超过 healthy_session_ms（默认 30 s）后 attempt 清零
+// （每次活动时检查：消息、控制帧）。
 // 适配器要求重连时立即重连；但连续 3 次立即重连之后（期间没有健康会话）改用正常退避，防止服务器
 // 刚连上就要求重连时我们无间隔地反复握手。run() 返回后为 Stopped；stop 之后不能再次 run()。
 //
@@ -246,6 +361,8 @@ public:
         s.parse_errors = parse_errors_.load(r);
         s.last_message_ns = last_message_ns_.load(r);
         s.connected_since_ns = connected_since_ns_.load(r);
+        s.pings = pings_.load(r);
+        s.pongs = pongs_.load(r);
         return s;
     }
 
@@ -296,7 +413,13 @@ public:
     }
 
 private:
-    using WsStream = boost::beast::websocket::stream<boost::beast::ssl_stream<boost::asio::ip::tcp::socket>>;
+    // 会话对象直接使用 io_context 的执行器类型（不经 any_io_executor 类型擦除）：投递完成处理器时也用处理器
+    // 关联的分配器（handler_memory_），稳态零堆分配
+    using Executor = boost::asio::io_context::executor_type;
+    using Socket = boost::asio::basic_stream_socket<boost::asio::ip::tcp, Executor>;
+    using Timer = boost::asio::basic_waitable_timer<std::chrono::steady_clock,
+                                                     boost::asio::wait_traits<std::chrono::steady_clock>, Executor>;
+    using WsStream = boost::beast::websocket::stream<boost::beast::ssl_stream<Socket>>;
 
     // 看门狗关心的阶段（mutex_ 保护）
     enum class Phase { Idle, Connecting, Streaming };
@@ -305,6 +428,41 @@ private:
         EndKind kind = EndKind::Error;
         std::string message;
     };
+
+    // 写队列中的一项
+    enum class WriteKind : std::uint8_t { Text, AppPing, WsPing };
+    struct QueuedWrite {
+        WriteKind kind = WriteKind::Text;
+        std::string text;  // 只用于 Text
+    };
+
+    // 一个 WebSocket 会话的网络对象与异步状态（只在 feed 线程上使用）。成员按此顺序声明：析构时先注销套接字
+    // （registration）、再关闭它（ws），最后销毁 io_context（其中尚未执行的处理器随之销毁、不会被调用）。
+    struct Connection {
+        explicit Connection(boost::asio::ssl::context& ctx) : ioc(1), ws(ioc, ctx), timer(ioc) {}
+
+        boost::asio::io_context ioc;                 // 只属于本会话，只由 feed 线程 run_one() / poll()
+        WsStream ws;
+        Timer timer;                                 // 心跳
+        hft::net::SocketRegistration registration;   // 声明在 ws 之后：析构时先注销、再关闭套接字
+
+        std::optional<SessionEnd> end;               // 已决定结束会话：之后的处理器什么也不做
+        bool timer_armed = false;
+        // 写队列：[queue_next, queue_used) 是待发送的项；发完复位下标，各项保留字符串容量（稳态不分配）
+        std::vector<QueuedWrite> queue;
+        std::size_t queue_next = 0;
+        std::size_t queue_used = 0;
+        QueuedWrite inflight;                        // 正在发送的项：缓冲区在写完成之前保持不变
+        bool writing = false;
+        bool ping_outstanding = false;               // 有心跳已排队或正在发送（最多一个）
+        // 心跳策略（会话开始时确定，见 setupKeepalive）
+        std::string ping_text;                       // 应用层心跳消息；"" = 发 WebSocket ping 控制帧
+        std::int64_t idle_ping_ns = 0;               // 这么久没有收到任何帧就发心跳（0 = 关闭）
+        std::int64_t ping_interval_ns = 0;           // 应用层心跳：数据一直在来也至少每隔这么久发一次（0 = 无）
+        std::int64_t last_ping_ns = 0;
+    };
+
+    static constexpr std::int64_t kMinTimerDelayNs = 1000000;  // 定时器至少 1 ms 之后才到期：不会空转
 
     static FeedConfig sanitize(FeedConfig c) {
         c.reconnect_initial_ms = std::max(1, c.reconnect_initial_ms);
@@ -429,13 +587,14 @@ private:
         error_code ec = ws_resolver_.resolve(cfg_.host, cfg_.port, endpoints, [this] { return registry_.interrupted(); });
         if (ec) return fail("resolve " + where + ": " + hft::net::errorText(ec));
 
-        WsStream ws(ioc_, *ssl_ctx_);
-        hft::net::SocketRegistration registration;  // 声明在 ws 之后：析构时先注销、再关闭套接字
+        Connection conn(*ssl_ctx_);
+        WsStream& ws = conn.ws;
         stage_ = "TCP connect";
         hft::net::ConnectOptions copt;
         copt.timeout_ms = remainingConnectMs();
         copt.cursor = &ws_cursor_;
-        ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, registration, nullptr, copt);
+        ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, conn.registration, nullptr,
+                                     copt);
         if (ec == asio::error::timed_out && !registry_.interrupted()) return connectTimeoutEnd();
         if (ec) return fail("connect " + where + ": " + hft::net::errorText(ec));
         tcp_connected_ = true;
@@ -473,38 +632,203 @@ private:
 
         stage_ = "subscribe";
         for (const std::string& frame : adapter_->onConnected()) {
-            ws.write(asio::buffer(frame), ec);
+            ws.write(asio::buffer(frame), ec);  // 同步写：异步读还没有开始
             if (ec) return fail("send subscribe frame: " + hft::net::errorText(ec));
         }
 
-        const std::string ping = adapter_->pingMessage();
-        const int ping_ms = cfg_.ping_interval_ms < 0 ? adapter_->pingIntervalMs() : cfg_.ping_interval_ms;
-        const std::int64_t ping_ns = ping.empty() || ping_ms <= 0 ? 0 : msToNs(ping_ms);
-        std::int64_t last_ping_ns = hft::nowNs();
-
         stage_ = "read";
         read_buffer_.clear();
-        for (;;) {
-            ws.read(read_buffer_, ec);
-            const std::int64_t recv_ns = hft::nowNs();
-            if (ec) return readFailed(ec, ws);
-            const auto data = read_buffer_.cdata();
-            const std::string_view payload(static_cast<const char*>(data.data()), data.size());
-            countMessage(payload.size(), recv_ns);
-            out_.reset();
-            adapter_->onMessage(payload, out_);   // 适配器把消息复制进自己的缓冲区，之后不再引用 payload
-            read_buffer_.consume(read_buffer_.size());
-            copyAdapterStats();
-            if (auto end = processResult(ws, out_, recv_ns)) return std::move(*end);
-            if (out_.need_rest_snapshot) {
-                if (auto end = fetchRestSnapshot(ws)) return std::move(*end);
-            }
-            if (ping_ns > 0 && recv_ns - last_ping_ns >= ping_ns) {
-                last_ping_ns = recv_ns;
-                ws.write(asio::buffer(ping), ec);
-                if (ec) return fail("send ping: " + hft::net::errorText(ec));
+        return streamLoop(conn);
+    }
+
+    // ---------------- 流式阶段（异步读 + 心跳定时器 + 写队列，全部在 feed 线程上）----------------
+
+    // 在本线程上用 run_one() 驱动异步读与心跳定时器，直到某个处理器决定结束会话。处理器只在这里的
+    // run_one() 与 closeConnection() 的 poll() 里执行，都在 c 的生命周期之内，所以可以按引用捕获 c。
+    SessionEnd streamLoop(Connection& c) {
+        setupKeepalive(c);
+        c.ws.control_callback(
+            [this](boost::beast::websocket::frame_type kind, boost::beast::string_view) { onControlFrame(kind); });
+        startRead(c);
+        armTimer(c, hft::nowNs());
+        while (!c.end) {
+            if (c.ioc.run_one() == 0) {  // 不应发生：会话进行中总有一个挂起的读
+                c.end = SessionEnd{EndKind::Error, "internal error: no pending network operation"};
             }
         }
+        closeConnection(c);
+        return std::move(*c.end);
+    }
+
+    // 会话结束：取消定时器，先注销、再关闭套接字（挂起的读写以 operation_aborted 完成），然后执行完已就绪的
+    // 处理器（它们看到 end 已设置，什么也不做）。仍未完成的操作随 io_context 析构而销毁、不会被调用。
+    void closeConnection(Connection& c) noexcept {
+        try {
+            c.timer.cancel();
+        } catch (...) {
+        }
+        c.registration.release();
+        feed_detail::error_code ignored;
+        boost::beast::get_lowest_layer(c.ws).close(ignored);
+        try {
+            c.ioc.restart();
+            c.ioc.poll();
+        } catch (...) {
+        }
+    }
+
+    // 第一个结束原因生效（例如写失败之后读也会以错误完成）
+    static void endSession(Connection& c, SessionEnd end) {
+        if (!c.end) c.end = std::move(end);
+    }
+
+    // 让异步操作的内存都来自 handler_memory_
+    template <class Handler>
+    auto bindHandler(Handler&& handler) {
+        return boost::asio::bind_allocator(feed_detail::HandlerAllocator<void>(handler_memory_),
+                                           std::forward<Handler>(handler));
+    }
+
+    void startRead(Connection& c) {
+        c.ws.async_read(read_buffer_, bindHandler([this, &c](const feed_detail::error_code& ec, std::size_t) {
+                            onRead(c, ec);
+                        }));
+    }
+
+    void onRead(Connection& c, const feed_detail::error_code& ec) {
+        const std::int64_t recv_ns = hft::nowNs();
+        if (c.end) return;
+        if (ec) return endSession(c, readFailed(ec, c.ws));
+        const auto data = read_buffer_.cdata();
+        const std::string_view payload(static_cast<const char*>(data.data()), data.size());
+        countMessage(payload.size(), recv_ns);
+        out_.reset();
+        adapter_->onMessage(payload, out_);  // 适配器把消息复制进自己的缓冲区，之后不再引用 payload
+        read_buffer_.consume(read_buffer_.size());
+        copyAdapterStats();
+        if (auto end = processResult(c, out_, recv_ns)) return endSession(c, std::move(*end));
+        if (out_.need_rest_snapshot) {
+            if (auto end = fetchRestSnapshot(c)) return endSession(c, std::move(*end));
+        }
+        startRead(c);
+    }
+
+    // WebSocket 控制帧（在异步读内部回调）：pong 与服务器的 ping 都证明连接活着，算作活动
+    void onControlFrame(boost::beast::websocket::frame_type kind) noexcept {
+        if (kind == boost::beast::websocket::frame_type::close) return;
+        constexpr auto r = std::memory_order_relaxed;
+        const std::int64_t now = hft::nowNs();
+        activity_ns_.store(now, r);
+        if (kind == boost::beast::websocket::frame_type::pong) pongs_.store(pongs_.load(r) + 1, r);
+        updateHealthy(now);
+    }
+
+    // 心跳策略：有应用层心跳的交易所空闲 idle_ping 就发、并且至少每个心跳间隔发一次；没有的发 WebSocket ping，
+    // 只在空闲时发。idle_ping = min(心跳间隔, stall_timeout_ms / 2)：回应总能在看门狗动手之前到达。
+    void setupKeepalive(Connection& c) {
+        c.ping_text = adapter_->pingMessage();
+        const bool app_ping = !c.ping_text.empty();
+        int interval_ms = 0;
+        if (cfg_.ping_interval_ms > 0) {
+            interval_ms = cfg_.ping_interval_ms;
+        } else if (cfg_.ping_interval_ms < 0 && app_ping) {
+            interval_ms = std::max(0, adapter_->pingIntervalMs());
+        }
+        int idle_ms = 0;
+        if (cfg_.ping_interval_ms != 0) {
+            idle_ms = interval_ms;
+            if (cfg_.stall_timeout_ms > 0) {
+                const int half = std::max(1, cfg_.stall_timeout_ms / 2);
+                idle_ms = idle_ms > 0 ? std::min(idle_ms, half) : half;
+            }
+        }
+        c.idle_ping_ns = feed_detail::msToNs(idle_ms);
+        c.ping_interval_ns = app_ping ? feed_detail::msToNs(interval_ms) : 0;
+        c.last_ping_ns = hft::nowNs();
+    }
+
+    // 定时器下一次需要到期的时刻（0 = 不需要）。消息到达时不动定时器：到期时再按最新的活动时刻重新计算。
+    std::int64_t nextWakeNs(const Connection& c, std::int64_t now) const noexcept {
+        std::int64_t due = std::numeric_limits<std::int64_t>::max();
+        if (c.idle_ping_ns > 0) {
+            due = std::min(due, std::max(activity_ns_.load(std::memory_order_relaxed), c.last_ping_ns) + c.idle_ping_ns);
+        }
+        if (c.ping_interval_ns > 0) due = std::min(due, c.last_ping_ns + c.ping_interval_ns);
+        if (due == std::numeric_limits<std::int64_t>::max()) return 0;
+        return std::max(due, now + kMinTimerDelayNs);
+    }
+
+    void armTimer(Connection& c, std::int64_t now) {
+        if (c.timer_armed || c.end) return;
+        const std::int64_t due = nextWakeNs(c, now);
+        if (due == 0) return;
+        c.timer.expires_at(Timer::time_point(
+            std::chrono::duration_cast<Timer::duration>(std::chrono::nanoseconds(due))));
+        c.timer_armed = true;
+        c.timer.async_wait(bindHandler([this, &c](const feed_detail::error_code& ec) { onTimer(c, ec); }));
+    }
+
+    void onTimer(Connection& c, const feed_detail::error_code& ec) {
+        c.timer_armed = false;
+        if (c.end || ec) return;
+        const std::int64_t now = hft::nowNs();
+        maybeSendPing(c, now);
+        armTimer(c, now);
+    }
+
+    void maybeSendPing(Connection& c, std::int64_t now) {
+        if (c.ping_outstanding) return;
+        const std::int64_t last_rx = activity_ns_.load(std::memory_order_relaxed);
+        const bool idle = c.idle_ping_ns > 0 && now - last_rx >= c.idle_ping_ns && now - c.last_ping_ns >= c.idle_ping_ns;
+        const bool periodic = c.ping_interval_ns > 0 && now - c.last_ping_ns >= c.ping_interval_ns;
+        if (!idle && !periodic) return;
+        constexpr auto r = std::memory_order_relaxed;
+        c.last_ping_ns = now;
+        c.ping_outstanding = true;
+        pings_.store(pings_.load(r) + 1, r);
+        enqueueWrite(c, c.ping_text.empty() ? WriteKind::WsPing : WriteKind::AppPing);
+    }
+
+    // 写队列：任何时刻最多一个写操作（async_write / async_ping）在进行
+    void enqueueWrite(Connection& c, WriteKind kind, std::string_view text = std::string_view()) {
+        if (c.end) return;
+        if (c.queue_used == c.queue.size()) c.queue.emplace_back();
+        QueuedWrite& w = c.queue[c.queue_used++];
+        w.kind = kind;
+        w.text.assign(text.data(), text.size());
+        if (!c.writing) startNextWrite(c);
+    }
+
+    void startNextWrite(Connection& c) {
+        if (c.queue_next == c.queue_used) {  // 队列已空：复位下标
+            c.queue_next = 0;
+            c.queue_used = 0;
+            return;
+        }
+        QueuedWrite& w = c.queue[c.queue_next++];
+        c.inflight.kind = w.kind;
+        c.inflight.text.swap(w.text);  // 交换而不是复制：两边的容量都保留下来
+        c.writing = true;
+        auto done = [this, &c](const feed_detail::error_code& ec, std::size_t) { onWritten(c, ec); };
+        switch (c.inflight.kind) {
+            case WriteKind::Text: c.ws.async_write(boost::asio::buffer(c.inflight.text), bindHandler(done)); break;
+            case WriteKind::AppPing: c.ws.async_write(boost::asio::buffer(c.ping_text), bindHandler(done)); break;
+            case WriteKind::WsPing:
+                c.ws.async_ping(boost::beast::websocket::ping_data(),
+                                bindHandler([this, &c](const feed_detail::error_code& ec) { onWritten(c, ec); }));
+                break;
+        }
+    }
+
+    void onWritten(Connection& c, const feed_detail::error_code& ec) {
+        c.writing = false;
+        if (c.inflight.kind != WriteKind::Text) c.ping_outstanding = false;
+        if (c.end) return;
+        if (ec) {
+            const char* what = c.inflight.kind == WriteKind::Text ? "send frame: " : "send ping: ";
+            return endSession(c, fail(what + hft::net::errorText(ec)));
+        }
+        startNextWrite(c);
     }
 
     // 新会话开始：重新武装登记表并进入 Connecting（与 checkHealth 同一把锁，看门狗不会踢错会话）
@@ -556,14 +880,10 @@ private:
 
     // 处理一次适配器结果；需要结束会话时返回结束原因。
     // 先更新状态（SYNCING/LIVE）再发布：消费者取到快照时看到的 status() 至少与该快照一样新。
-    std::optional<SessionEnd> processResult(WsStream& ws, const AdapterResult& out, std::int64_t recv_ns) {
+    std::optional<SessionEnd> processResult(Connection& c, const AdapterResult& out, std::int64_t recv_ns) {
         updateSyncState(hft::nowNs());
         if (!out.error.empty()) noteError(out.error);
-        for (const std::string& frame : out.send) {
-            feed_detail::error_code ec;
-            ws.write(boost::asio::buffer(frame), ec);
-            if (ec) return fail("send frame: " + hft::net::errorText(ec));
-        }
+        for (const std::string& frame : out.send) enqueueWrite(c, WriteKind::Text, frame);
         // 先记交易所延迟再发布：消费者取到快照时，这条消息的延迟样本必然已经可见（队列的 release/acquire）
         if (out.exchange_ts_ms > 0) recordExchangeLatency(out.exchange_ts_ms);
         if (out.book_updated) publish(recv_ns, out.exchange_ts_ms);
@@ -575,7 +895,7 @@ private:
     }
 
     // 拉取 REST 快照直到适配器满意；失败按退避重试，超过 rest_max_attempts 次结束会话
-    std::optional<SessionEnd> fetchRestSnapshot(WsStream& ws) {
+    std::optional<SessionEnd> fetchRestSnapshot(Connection& c) {
         if (cfg_.rest_host.empty() || cfg_.snapshot_path.empty()) {
             return SessionEnd{EndKind::Error,
                               "REST snapshot required, but rest_host/snapshot_path are not configured"};
@@ -601,7 +921,7 @@ private:
                 rest_out_.reset();
                 adapter_->onRestSnapshot(http.body, rest_out_);
                 copyAdapterStats();
-                if (auto end = processResult(ws, rest_out_, recv_ns)) return end;  // 已记录 rest_out_.error
+                if (auto end = processResult(c, rest_out_, recv_ns)) return end;  // 已记录 rest_out_.error
                 if (!rest_out_.need_rest_snapshot) {
                     stage_ = saved_stage;
                     return std::nullopt;
@@ -698,6 +1018,12 @@ private:
             status_.store(synced ? FeedStatus::Live : FeedStatus::Syncing, std::memory_order_release);
             noteEvent(synced ? "book synced (LIVE)" : "book lost sync, resyncing");
         }
+        updateHealthy(now);
+    }
+
+    // 会话连续 Live 超过 healthy_session_ms：退避计数清零。每次活动（消息、控制帧）都检查一次，
+    // 所以只有心跳往来的安静会话同样会被认定为健康。
+    void updateHealthy(std::int64_t now) noexcept {
         if (synced_ && !healthy_ && now - live_since_ns_ >= feed_detail::msToNs(cfg_.healthy_session_ms)) {
             healthy_ = true;
             attempt_ = 0;
@@ -819,11 +1145,12 @@ private:
 
     std::atomic<std::uint64_t> messages_{0}, bytes_{0}, book_updates_{0}, published_{0}, dropped_{0},
         reconnects_{0}, connect_failures_{0}, stalls_{0}, gaps_{0}, checksum_failures_{0}, resyncs_{0},
-        rest_snapshots_{0}, parse_errors_{0};
+        rest_snapshots_{0}, parse_errors_{0}, pings_{0}, pongs_{0};
     std::atomic<std::int64_t> last_message_ns_{0}, connected_since_ns_{0};
 
     // 以下只由 feed 线程访问
-    boost::asio::io_context ioc_;                     // 只做同步操作，从不 run()
+    feed_detail::HandlerMemory handler_memory_;       // 异步操作的内存（会话的 io_context 是局部对象，先于它销毁）
+    boost::asio::io_context ioc_;                     // REST 请求用：只做同步操作，从不 run()
     std::unique_ptr<boost::asio::ssl::context> ssl_ctx_;   // 首次连接时创建，之后各会话（含 REST）复用
     hft::net::Resolver ws_resolver_;
     hft::net::Resolver rest_resolver_;

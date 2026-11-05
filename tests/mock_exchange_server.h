@@ -398,6 +398,13 @@ public:
         runUntil([] { return false; }, ms);
     }
 
+    // 冻结 ms 毫秒：期间不运行 io_context（不接收帧，也不应答 WebSocket ping），模拟卡住的服务器；
+    // 服务器停止时提前返回
+    void freezeMs(int ms) {
+        const auto deadline = Clock::now() + std::chrono::milliseconds(ms);
+        while (Clock::now() < deadline && !stopping()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
     // 等待一个满足 match 的文本帧（从上次 expect 之后的帧开始找，不匹配的帧被跳过），返回该帧。
     // 超时抛出 ScriptError（记入 errors()）；客户端断开抛出 ConnectionClosed。
     std::string expectText(const std::function<bool(const std::string&)>& match, int timeout_ms,
@@ -513,6 +520,7 @@ private:
     }
 
     inline void onFrame(const std::string& frame);
+    inline void onPing();
 
     // 写完应答后的收尾：关闭发送方向，读到客户端 EOF（最多 timeout_ms）再关闭，避免未读数据触发 RST
     void gracefulTcpClose(int timeout_ms) noexcept {
@@ -735,6 +743,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return session < ws_frame_times_.size() ? ws_frame_times_[session] : std::vector<std::int64_t>();
     }
+    // 第 session 个 WebSocket 会话收到的 WebSocket ping 控制帧的到达时刻（nowNs；Beast 自动应答 pong）
+    std::vector<std::int64_t> pingTimesNs(std::size_t session) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return session < ws_ping_times_.size() ? ws_ping_times_[session] : std::vector<std::int64_t>();
+    }
     std::vector<std::string> wsTargets() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return ws_targets_;
@@ -869,6 +882,7 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         ws_frames_.emplace_back();
         ws_frame_times_.emplace_back();
+        ws_ping_times_.emplace_back();
         ws_targets_.push_back(target);
         ws_times_.push_back(nowNs());
         return ws_frames_.size() - 1;
@@ -880,6 +894,11 @@ private:
             ws_frames_[session].push_back(frame);
             ws_frame_times_[session].push_back(nowNs());
         }
+    }
+
+    void recordPing(std::size_t session) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (session < ws_ping_times_.size()) ws_ping_times_[session].push_back(nowNs());
     }
 
     HttpRequestInfo recordHttpRequest(std::size_t connection, const http::request<http::string_body>& req) {
@@ -968,6 +987,7 @@ private:
     std::vector<std::int64_t> end_times_;
     std::vector<std::vector<std::string>> ws_frames_;
     std::vector<std::vector<std::int64_t>> ws_frame_times_;
+    std::vector<std::vector<std::int64_t>> ws_ping_times_;
     std::vector<std::string> ws_targets_;
     std::vector<std::int64_t> ws_times_;
     std::vector<HttpRequestInfo> http_requests_;
@@ -986,6 +1006,8 @@ inline bool WsSession::stopping() const noexcept { return server_.stopping(); }
 inline int WsSession::handshakeTimeoutMs() const noexcept { return server_.opt_.handshake_timeout_ms; }
 
 inline void WsSession::onFrame(const std::string& frame) { server_.recordFrame(session_, frame); }
+
+inline void WsSession::onPing() { server_.recordPing(session_); }
 
 inline void WsSession::serve() {
     op_done_ = false;
@@ -1078,6 +1100,9 @@ inline void WsSession::serveWebSocket() {
     }
     open_ = true;
     ws_.text(true);
+    ws_.control_callback([this](websocket::frame_type kind, beast::string_view) {
+        if (kind == websocket::frame_type::ping) onPing();  // 只记录；pong 由 Beast 自动应答
+    });
     startRead();
     const WsScript script = server_.scriptFor(session_);
     if (script) script(*this);

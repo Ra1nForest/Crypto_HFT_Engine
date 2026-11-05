@@ -56,7 +56,7 @@ enum class KickReason : int { None = 0, Stop = 1, Stall = 2, ConnectTimeout = 3 
 // ---------------------------------------------------------------------------
 // 同步 Boost.Beast 的阻塞调用（TLS 握手 / read / write）没有超时也无法取消。其他线程调用 kick() 时，对登记的
 // 每个套接字执行 ::shutdown(SHUT_RDWR)：阻塞在已连接（或正在连接、SYN_SENT）的套接字上的系统调用立即返回
-// （recv 返回 EOF，进行中的连接以 ECONNRESET 失败），会话随之结束。
+// （recv 返回 EOF，进行中的连接以 ECONNRESET 失败），挂起的异步读写同样以错误完成，会话随之结束。
 // 注意：Linux 上对还没有发起连接（TCP_CLOSE）的套接字 shutdown 只返回 ENOTCONN，并不阻止之后的 connect()。
 // 所以 connectSocket 从不调用阻塞的 connect()：它用非阻塞 connect + 分片 poll，每片之间检查 interrupted()，
 // 踢断落在任何时刻都会在一个轮询片之内生效。
@@ -65,8 +65,10 @@ enum class KickReason : int { None = 0, Stop = 1, Stall = 2, ConnectTimeout = 3 
 // 因此即使原 fd 已被关闭（Beast 在收到 close 帧或协议错误时会在 teardown 里自行关闭套接字），踢断也
 // 不会误伤别的连接。使用方仍然遵守"先注销、再关闭"（SocketRegistration 声明在流对象之后）。
 // 副本让底层套接字在注销前保持存活：注销（关闭副本）后才真正释放连接。
-// 注意：副本会让 epoll 中原 fd 的登记在原 fd 关闭后残留到副本关闭为止，所以本工具只用于从不 run()
-// 的、纯同步使用的 io_context（feed 正是如此）。
+// epoll：副本也会让原 fd 在 epoll 中的登记残留到副本关闭为止。只做同步操作、从不 run() 的 io_context 不受影响。
+// feed 的 WebSocket 会话用一个只属于该会话、由 feed 线程 run_one() 的 io_context：残留只出现在 Beast 自行关闭
+// 套接字之后、会话结束注销之前；asio 的描述符状态对象由 io_context 的对象池持有、不会被释放，残留的事件只落在
+// 没有挂起操作的状态上（什么也不做），这段时间该 io_context 也不再打开新的套接字，会话结束时它随之销毁。
 // 线程安全：全部方法可在任意线程调用（内部互斥锁）；reason()/interrupted() 无锁。
 class SocketRegistry {
 public:
