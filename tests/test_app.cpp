@@ -1149,31 +1149,31 @@ TEST_CASE("text_util: visibleWidth counts UTF-8 code points and skips ANSI escap
     using text_util::visibleWidth;
     CHECK_EQ(visibleWidth(""), 0u);
     CHECK_EQ(visibleWidth("abc"), 3u);
-    CHECK_EQ(visibleWidth("12.3 µs"), 7u);        // U+00B5 micro sign (2 bytes)
-    CHECK_EQ(visibleWidth("12.3 μs"), 7u);        // U+03BC greek mu (2 bytes)
-    CHECK_EQ(visibleWidth("╔═══╗"), 5u);          // box drawing (3 bytes each)
+    CHECK_EQ(visibleWidth("12.3 µs"), 7u);        // U+00B5 微符号（2 字节）
+    CHECK_EQ(visibleWidth("12.3 μs"), 7u);        // U+03BC 希腊字母 mu（2 字节）
+    CHECK_EQ(visibleWidth("╔═══╗"), 5u);          // 框线字符（每个 3 字节）
     CHECK_EQ(visibleWidth("…€"), 2u);
-    CHECK_EQ(visibleWidth("\xF0\x9F\x98\x80"), 1u);  // 4-byte code point (documented: counted as 1)
+    CHECK_EQ(visibleWidth("\xF0\x9F\x98\x80"), 1u);  // 4 字节码点（按文档约定计 1 列）
     CHECK_EQ(visibleWidth("\033[32mLIVE\033[0m"), 4u);
     CHECK_EQ(visibleWidth("\033[1;38;5;208mX\033[0m"), 1u);
-    CHECK_EQ(visibleWidth("\033[?25l\033[2J\033[H"), 0u);  // private-mode CSI
-    CHECK_EQ(visibleWidth("\033]0;window title\007ok"), 2u);   // OSC ... BEL
-    CHECK_EQ(visibleWidth("\033]8;;http://x\033\\link\033]8;;\033\\"), 4u);  // OSC ... ST
-    CHECK_EQ(visibleWidth("a\tb\r\n"), 2u);       // C0 controls have no width
+    CHECK_EQ(visibleWidth("\033[?25l\033[2J\033[H"), 0u);  // 私有模式 CSI
+    CHECK_EQ(visibleWidth("\033]0;window title\007ok"), 2u);   // OSC ... 以 BEL 结束
+    CHECK_EQ(visibleWidth("\033]8;;http://x\033\\link\033]8;;\033\\"), 4u);  // OSC ... 以 ST 结束
+    CHECK_EQ(visibleWidth("a\tb\r\n"), 2u);       // C0 控制字符宽度为 0
     CHECK_EQ(visibleWidth("\x7f"), 0u);
-    CHECK_EQ(visibleWidth("\033["), 0u);          // unterminated CSI
+    CHECK_EQ(visibleWidth("\033["), 0u);          // 未结束的 CSI
     CHECK_EQ(visibleWidth("\033[31"), 0u);
     CHECK_EQ(visibleWidth("x\033"), 1u);
-    // invalid UTF-8: every bad byte is one column (rendered as U+FFFD)
+    // 非法 UTF-8：每个坏字节按 1 列计（终端显示为 U+FFFD）
     CHECK_EQ(visibleWidth("\xff"), 1u);
-    CHECK_EQ(visibleWidth("\xc3"), 1u);           // truncated 2-byte sequence
+    CHECK_EQ(visibleWidth("\xc3"), 1u);           // 缺少续字节的 2 字节序列
     CHECK_EQ(visibleWidth("\xc3("), 2u);
-    CHECK_EQ(visibleWidth("\x80\x80"), 2u);       // stray continuation bytes
-    CHECK_EQ(visibleWidth("\xc0\xaf"), 2u);       // overlong '/'
-    CHECK_EQ(visibleWidth("\xe0\x80\xaf"), 3u);   // overlong 3-byte
-    CHECK_EQ(visibleWidth("\xed\xa0\x80"), 3u);   // UTF-16 surrogate
-    CHECK_EQ(visibleWidth("\xf4\x90\x80\x80"), 4u);  // > U+10FFFF
-    CHECK_EQ(visibleWidth("\xe2\x94"), 2u);       // box char cut in the middle
+    CHECK_EQ(visibleWidth("\x80\x80"), 2u);       // 孤立的续字节
+    CHECK_EQ(visibleWidth("\xc0\xaf"), 2u);       // 过长编码的 '/'
+    CHECK_EQ(visibleWidth("\xe0\x80\xaf"), 3u);   // 过长的 3 字节编码
+    CHECK_EQ(visibleWidth("\xed\xa0\x80"), 3u);   // UTF-16 代理码点
+    CHECK_EQ(visibleWidth("\xf4\x90\x80\x80"), 4u);  // 大于 U+10FFFF
+    CHECK_EQ(visibleWidth("\xe2\x94"), 2u);       // 从中间切开的框线字符
 }
 
 TEST_CASE("text_util: padRight / padLeft / center / fit pad to visible columns, colours and multi-byte included") {
@@ -1182,8 +1182,8 @@ TEST_CASE("text_util: padRight / padLeft / center / fit pad to visible columns, 
     CHECK_EQ(visibleWidth(padRight(green, 6)), 6u);
     CHECK_EQ(padRight(green, 6), green + "    ");
     CHECK_EQ(padLeft("µs", 4), std::string("  µs"));
-    CHECK_EQ(padRight("toolong", 3), std::string("toolong"));  // never truncates
-    CHECK_EQ(center("ab", 5), std::string(" ab  "));            // extra column on the right
+    CHECK_EQ(padRight("toolong", 3), std::string("toolong"));  // 从不截断
+    CHECK_EQ(center("ab", 5), std::string(" ab  "));            // 多出的一列放在右侧
     CHECK_EQ(center("abcdef", 4), std::string("abcd"));
     CHECK_EQ(visibleWidth(center("═µ═", 10)), 10u);
     CHECK_EQ(center(green, 6), "  " + green + "  ");
@@ -1202,8 +1202,8 @@ TEST_CASE("text_util: truncateVisible never splits a code point or an escape and
     CHECK_EQ(truncateVisible("µµµ", 2), std::string("µµ"));
     CHECK_EQ(truncateVisible("short", 10, "…"), std::string("short"));
     CHECK_EQ(truncateVisible("abc", 0), std::string());
-    CHECK_EQ(truncateVisible("abc", 1, "……"), std::string("a"));  // ellipsis wider than the width: dropped
-    // the reset code after the cut survives, so colours never leak
+    CHECK_EQ(truncateVisible("abc", 1, "……"), std::string("a"));  // 省略号比 width 还宽：不放省略号
+    // 截断处之后的完整转义序列（复位码）保留，颜色不会泄漏
     CHECK_EQ(truncateVisible("\033[31mred text\033[0m", 3), std::string("\033[31mred\033[0m"));
     CHECK_EQ(truncateVisible("\033[31mred text\033[0m", 4, "…"), std::string("\033[31mred…\033[0m"));
 }
@@ -1238,7 +1238,7 @@ TEST_CASE("text_util: sanitize turns control characters and invalid UTF-8 into h
     using text_util::sanitize;
     CHECK_EQ(sanitize("a\nb\tc\033[31md"), std::string("a b c [31md"));
     CHECK_EQ(sanitize("\xff"), std::string("?"));
-    CHECK_EQ(sanitize("\xc2\x9b" "31m"), std::string(" 31m"));  // C1 CSI (U+009B)
+    CHECK_EQ(sanitize("\xc2\x9b" "31m"), std::string(" 31m"));  // C1 CSI（U+009B）
     CHECK_EQ(sanitize("µ═…"), std::string("µ═…"));
     CHECK_EQ(sanitize("\xc0\xaf"), std::string("??"));
     CHECK_EQ(sanitize("\xed\xa0\x80"), std::string("???"));
