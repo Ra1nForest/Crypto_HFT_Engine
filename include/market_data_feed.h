@@ -79,7 +79,7 @@ struct FeedConfig {
     int reconnect_initial_ms = 500;  // 指数退避（±20% 抖动），健康会话后重置
     int reconnect_max_ms = 30000;
     int publish_levels = BookSnapshot::kMaxLevels;   // 每侧发布的档位数（钳制到 [0, kMaxLevels]）
-    std::size_t queue_capacity = 1024;               // SPSC 队列容量（向上取整到 2 的幂）
+    std::size_t queue_capacity = 1024;               // SPSC 队列容量（向上取整到 2 的幂；最后一个槽位留给空簿）
 
     // ---- 以下为规格之外的扩展：默认值即生产行为，测试用来缩短时间 ----
     int connect_timeout_ms = 10000;    // 解析 + TCP + TLS + WebSocket 握手的总时限（checkHealth 踢断；<= 0 关闭）；
@@ -251,7 +251,7 @@ private:
 //   状态 SYNCING/LIVE 按 adapter.synced() 更新；error → lastError() 与日志回调；send → 按顺序进入写队列；
 //   交易所延迟记录；book_updated → 发布快照（空簿同样发布；处理延迟在入队前记录）；
 //   因此消费者取到一个快照时，status() 与两个延迟统计都已包含这条消息（队列的 release/acquire），
-//   只有 published/dropped 计数在 tryPush 之后才更新；
+//   只有 published/dropped 计数在入队之后才更新；
 //   reconnect → 结束会话并立即重连（不退避）；need_rest_snapshot → 在读处理器里同步执行 HTTPS GET
 //   rest_host:rest_port/snapshot_path（同样的校验规则，响应体上限 16 MiB；其间 io_context 暂停，
 //   WebSocket 数据暂存在内核缓冲区），200 的响应体交给 onRestSnapshot，非 200 / 传输失败视为失败；
@@ -264,8 +264,10 @@ private:
 // ping）：刷新停顿看门狗与健康会话判定，所以只有心跳往来的安静会话不会被踢断；对端不回应时看门狗照常踢断。
 // 每次最多一个心跳在途。ping_interval_ms = 0 关闭心跳。
 // 会话结束（任何原因）时若消费者最后收到的簿非空，再发布一个空簿：断线期间消费者不会继续使用过期价格。
-// 队列满时这个快照保持待发布，约每 5 ms 重试一次（退避等待、DNS 解析与 TCP 连接的等待中，以及新会话的定时器里），
-// 直到入队或被新会话真正入队的快照取代；重试送出的总是当时的最新状态（新会话已组装过的簿优先于旧的空簿）。
+// 这个空簿一定能入队，不需要重试：非空快照入队之后总要留一个空槽位，空簿可以用掉最后一个（见 pushSnapshot；
+// 缺口导致的空簿同理）。所以非空快照最多占用 queue_capacity - 1 个槽位。
+// 消费者手里是空簿时没能入队的非空快照保持待发布：流式阶段由单独的定时器约每 5 ms 重试一次（会话内 REST 请求
+// 之间的等待中同样重试），送出的总是当时的最新状态；会话结束时它随之作废（过期的簿不会在空簿之后送出）。
 //
 // 状态：建立连接期间 Connecting；握手完成后 Syncing，adapter.synced() 后 Live；会话结束 → Reconnecting
 // （错误写 stderr 并存入 lastError()），退避 min(max, initial * 2^attempt)（±20% 抖动，结果钳制到
@@ -451,15 +453,17 @@ private:
     // 一个 WebSocket 会话的网络对象与异步状态（只在 feed 线程上使用）。成员按此顺序声明：析构时先注销套接字
     // （registration）、再关闭它（ws），最后销毁 io_context（其中尚未执行的处理器随之销毁、不会被调用）。
     struct Connection {
-        explicit Connection(boost::asio::ssl::context& ctx) : ioc(1), ws(ioc, ctx), timer(ioc) {}
+        explicit Connection(boost::asio::ssl::context& ctx) : ioc(1), ws(ioc, ctx), timer(ioc), retry_timer(ioc) {}
 
         boost::asio::io_context ioc;                 // 只属于本会话，只由 feed 线程 run_one() / poll()
         WsStream ws;
         Timer timer;                                 // 心跳
+        Timer retry_timer;                           // 待发布快照的重试（只在有待发布快照时武装）
         hft::net::SocketRegistration registration;   // 声明在 ws 之后：析构时先注销、再关闭套接字
 
         std::optional<SessionEnd> end;               // 已决定结束会话：之后的处理器什么也不做
         bool timer_armed = false;
+        bool retry_armed = false;
         // 写队列：[queue_next, queue_used) 是待发送的项；发完复位下标，各项保留字符串容量（稳态不分配）
         std::vector<QueuedWrite> queue;
         std::size_t queue_next = 0;
@@ -537,7 +541,8 @@ private:
         return delay;
     }
 
-    // 可被 stop() 打断的等待；返回 false 表示已请求停止。有待发布的快照时分片等待，每片之后（锁外）重试入队。
+    // 可被 stop() 打断的等待；返回 false 表示已请求停止。有待发布的快照时分片等待，每片之后（锁外）重试入队
+    // （待发布快照不会跨过会话边界：只有会话内 REST 请求之间的等待可能遇到，退避等待时没有）。
     bool sleepFor(int ms) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
         std::unique_lock<std::mutex> lock(mutex_);
@@ -583,7 +588,10 @@ private:
             phase_start_ns_ = 0;
         }
         connected_since_ns_.store(0, std::memory_order_relaxed);
-        if (delivered_nonempty_ || publish_pending_) publishEmpty();
+        // 消费者最后收到的簿非空 → 发布空簿（一定能入队，见 pushSnapshot）。本会话没能入队的待发布快照随会话一起
+        // 过期、不再送出：那时消费者手里本来就是空簿，正是断线期间该有的状态。
+        if (delivered_nonempty_) publishEmpty();
+        publish_pending_ = false;
         copyAdapterStats();
         if (stopRequested() || end.kind == EndKind::Stopped) return;
         status_.store(FeedStatus::Reconnecting, std::memory_order_release);
@@ -611,10 +619,7 @@ private:
 
         stage_ = "DNS resolve";
         tcp::resolver::results_type endpoints;
-        error_code ec = ws_resolver_.resolve(cfg_.host, cfg_.port, endpoints, [this] {
-            retryPendingPublish();  // 约每 10 ms 一次
-            return registry_.interrupted();
-        });
+        error_code ec = ws_resolver_.resolve(cfg_.host, cfg_.port, endpoints, [this] { return registry_.interrupted(); });
         if (ec) return fail("resolve " + where + ": " + hft::net::errorText(ec));
 
         Connection conn(*ssl_ctx_);
@@ -623,7 +628,6 @@ private:
         hft::net::ConnectOptions copt;
         copt.timeout_ms = remainingConnectMs();
         copt.cursor = &ws_cursor_;
-        copt.on_wait = [this] { retryPendingPublish(); };  // 每个空闲的轮询片（<= 50 ms）一次
         ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, conn.registration, nullptr,
                                      copt);
         if (ec == asio::error::timed_out && !registry_.interrupted()) return connectTimeoutEnd();
@@ -696,6 +700,7 @@ private:
     void closeConnection(Connection& c) noexcept {
         try {
             c.timer.cancel();
+            c.retry_timer.cancel();
         } catch (...) {
         }
         c.registration.release();
@@ -741,6 +746,7 @@ private:
         if (out_.need_rest_snapshot) {
             if (auto end = fetchRestSnapshot(c)) return endSession(c, std::move(*end));
         }
+        if (publish_pending_) armRetry(c);
         startRead(c);
     }
 
@@ -785,7 +791,6 @@ private:
             due = std::min(due, std::max(activity_ns_.load(std::memory_order_relaxed), c.last_ping_ns) + c.idle_ping_ns);
         }
         if (c.ping_interval_ns > 0) due = std::min(due, c.last_ping_ns + c.ping_interval_ns);
-        if (publish_pending_) due = std::min(due, now + feed_detail::msToNs(kPendingRetryMs));
         if (due == std::numeric_limits<std::int64_t>::max()) return 0;
         return std::max(due, now + kMinTimerDelayNs);
     }
@@ -804,9 +809,24 @@ private:
         c.timer_armed = false;
         if (c.end || ec) return;
         const std::int64_t now = hft::nowNs();
-        retryPendingPublish();
         maybeSendPing(c, now);
         armTimer(c, now);
+    }
+
+    // 有待发布的快照时每 kPendingRetryMs 重试一次入队，直到入队（或会话结束）。用单独的定时器：心跳定时器可能
+    // 几秒之后才到期，关闭心跳时根本不武装。待发布快照只在处理消息时产生，所以读处理器末尾武装即可。
+    void armRetry(Connection& c) {
+        if (c.retry_armed || c.end || !publish_pending_) return;
+        c.retry_timer.expires_after(std::chrono::milliseconds(kPendingRetryMs));
+        c.retry_armed = true;
+        c.retry_timer.async_wait(bindHandler([this, &c](const feed_detail::error_code& ec) { onRetry(c, ec); }));
+    }
+
+    void onRetry(Connection& c, const feed_detail::error_code& ec) {
+        c.retry_armed = false;
+        if (c.end || ec) return;
+        retryPendingPublish();
+        armRetry(c);
     }
 
     void maybeSendPing(Connection& c, std::int64_t now) {
@@ -1100,14 +1120,15 @@ private:
         snapshot_.exchange_ts_ms = exchange_ts_ms;
         snapshot_.recv_ns = recv_ns;
         snapshot_.publish_ns = hft::nowNs();
-        // 处理延迟在入队之前记录（同上：取到快照即可见）；published/dropped 只能在 tryPush 之后计数，
+        // 处理延迟在入队之前记录（同上：取到快照即可见）；published/dropped 只能在入队之后计数，
         // 所以消费者刚取到快照时，这两个计数可能还差这一次
         const std::int64_t latency = snapshot_.publish_ns - recv_ns;
         latency_.recordNs(latency > 0 ? static_cast<std::uint64_t>(latency) : 0);
         pushSnapshot();
     }
 
-    // 会话结束时发布空簿（不记录处理延迟：不对应任何消息）。队列满时不能丢：保持待发布，之后重试。
+    // 会话结束时发布空簿（不记录处理延迟：不对应任何消息）。只在消费者最后收到的快照非空时调用，
+    // 这时它一定能入队（见 pushSnapshot）。
     void publishEmpty() noexcept {
         snapshot_.bid_count = 0;
         snapshot_.ask_count = 0;
@@ -1117,14 +1138,22 @@ private:
         snapshot_.exchange_ts_ms = 0;
         snapshot_.recv_ns = hft::nowNs();
         snapshot_.publish_ns = snapshot_.recv_ns;
-        if (!pushSnapshot()) publish_pending_ = true;
+        pushSnapshot();
     }
 
-    // 入队 snapshot_；队列满时丢弃（dropped++），绝不阻塞
+    // 入队 snapshot_，绝不阻塞。非空快照入队之后至少要留一个空槽位（tryPushReserving(…, 1)），空簿可以用掉
+    // 最后一个：只要消费者最后收到的快照非空，下一个空簿（断线、缺口）就一定能入队，消费者不会在断线期间继续
+    // 使用过期价格——无论队列多满、feed 线程接下来阻塞在哪一步，都不需要重试。
+    // 入队失败 → dropped++。消费者手里是空簿而 snapshot_ 非空时（例如断线之后新会话的第一本簿没能入队）保持待发布，
+    // 之后重试最新状态（见 retryPendingPublish），否则推送稀少的交易所可能长时间只显示空簿；消费者手里是非空簿时
+    // 照常丢弃（seq 跳号），下一次推送会替换它。
     bool pushSnapshot() noexcept {
         constexpr auto r = std::memory_order_relaxed;
-        if (!queue_.tryPush(snapshot_)) {
+        const bool empty = snapshot_.bid_count + snapshot_.ask_count == 0;
+        if (!queue_.tryPushReserving(snapshot_, empty ? 0 : 1)) {
+            HFT_ASSERT(!(empty && delivered_nonempty_) && "the slot reserved for an empty book was taken");
             dropped_.store(dropped_.load(r) + 1, r);
+            publish_pending_ = !empty && !delivered_nonempty_;
             return false;
         }
         delivered();
@@ -1145,13 +1174,13 @@ private:
         }
     }
 
-    // 重试没能入队的会话边界快照。snapshot_ 总是最新的状态：断线后是空簿；新会话组装过（但同样没能入队）的簿
-    // 会覆盖它——所以新会话 LIVE 之后不会再送出一个过期的空簿。重试不再计入 dropped，seq 不变；
+    // 重试待发布的快照（只在消费者手里是空簿、snapshot_ 非空时才有，见 pushSnapshot）。snapshot_ 总是最新的
+    // 状态：期间又有推送没能入队时，送出的是最新的那一本。重试不再计入 dropped，seq 不变；
     // publish_ns 改为真正入队的时刻（消费者的队列延迟从这里算起）。
     void retryPendingPublish() noexcept {
         if (!publish_pending_) return;
         snapshot_.publish_ns = hft::nowNs();
-        if (queue_.tryPush(snapshot_)) delivered();
+        if (queue_.tryPushReserving(snapshot_, 1)) delivered();
     }
 
     void recordExchangeLatency(std::int64_t exchange_ts_ms) noexcept {
@@ -1258,6 +1287,6 @@ private:
     int rest_failures_ = 0;                           // 连续失败的 REST 请求数（同步成功后清零）
     std::int64_t last_rest_ns_ = 0;                   // 本会话上一次 REST 请求的开始时刻（0 = 还没有）
     bool delivered_nonempty_ = false;                 // 消费者最后收到（真正入队）的快照非空
-    bool publish_pending_ = false;                    // 会话边界的快照因队列满还没入队：需要重试
+    bool publish_pending_ = false;                    // 消费者手里是空簿、snapshot_ 非空却没能入队：需要重试
     const char* stage_ = "setup";                     // 当前步骤（用于错误信息）
 };

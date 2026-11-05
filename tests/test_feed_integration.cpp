@@ -1937,19 +1937,22 @@ TEST_CASE("feed: dropped_snapshots counts publishes that found the tiny queue fu
             return st.published + st.dropped_snapshots == static_cast<std::uint64_t>(kCount);
         },
         5000));
+    // 非空快照入队之后要留一个空槽位（给断线时的空簿）：容量 2 的队列只放得下一本簿
     const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.published, 2u);
-    CHECK_EQ(s.dropped_snapshots, static_cast<std::uint64_t>(kCount - 2));
+    CHECK_EQ(s.published, 1u);
+    CHECK_EQ(s.dropped_snapshots, static_cast<std::uint64_t>(kCount - 1));
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
     SnapshotLog log;
     log.pump(runner.feed);
-    REQUIRE_EQ(log.all.size(), std::size_t{2});
-    CHECK_EQ(log.all[0].seq, 1u);  // 留在队列里的是最早的两个；seq 跳号表示丢弃
-    CHECK_EQ(log.all[1].seq, 2u);
+    REQUIRE_EQ(log.all.size(), std::size_t{1});
+    CHECK_EQ(log.all[0].seq, 1u);  // 留在队列里的是最早的那一本；之后的 seq 跳号表示丢弃
     CHECK_EQ(runner.feed.getLatencyTracker().count(), static_cast<std::uint64_t>(kCount));  // 丢弃的也计入处理延迟
+    // 消费者手里是非空簿时丢弃的快照不重试：腾出位置之后也不会再送来
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_EQ(log.pump(runner.feed), std::size_t{0});
 }
 
-TEST_CASE("feed: the empty book of a disconnect is kept pending while the queue is full and delivered once there is room") {
+TEST_CASE("feed: the empty book of a disconnect always fits: a full queue keeps its last slot for it") {
     // 队列容量 2 代表"消费者卡住、1024 个槽位已满"；断线之后交易所长时间不可用（退避 3 s）
     MockExchangeServer server;
     server.setWebSocketScripts({
@@ -1968,41 +1971,143 @@ TEST_CASE("feed: the empty book of a disconnect is kept pending while the queue 
     // 消费者直到断线之后才开始取
     REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Reconnecting; }, 5000));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.published, 2u);
-    CHECK_EQ(s.dropped_snapshots, 2u);  // 第 3 本簿与断线时的空簿
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.published, 2u);          // 第 1 本簿与断线时的空簿
+    CHECK_EQ(s.dropped_snapshots, 2u);  // 第 2、3 本簿：非空快照不能占用最后一个槽位
+    // 队列里最后一个就是空簿：消费者一腾出位置就不再使用断线前的价格，不必等任何重试
     SnapshotLog log;
     log.pump(runner.feed);
     REQUIRE_EQ(log.all.size(), std::size_t{2});
-    CHECK_EQ(log.all[1].bids[0].price, 65001.0);
-    // 有了空位：退避等待中的重试在几毫秒内送达空簿，消费者不再使用断线前的价格
-    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));
-    CHECK_EQ(log.all[2].bid_count + log.all[2].ask_count, 0u);
-    CHECK_EQ(log.all[2].seq, 4u);  // 沿用第一次尝试的 seq：3 号（第 3 本簿）确实丢了
-    CHECK_LE(log.all[2].publish_ns, log.pop_ns[2]);
-    CHECK_LT(ms(log.pop_ns[2] - log.all[2].publish_ns), 100.0);  // publish_ns = 真正入队的时刻
+    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
+    CHECK_EQ(log.all[1].seq, 4u);  // 2、3 号（第 2、3 本簿）确实丢了
+    CHECK_LE(log.all[1].publish_ns, log.pop_ns[1]);
     CHECK_EQ(runner.feed.status(), FeedStatus::Reconnecting);
-    s = runner.feed.stats();
-    CHECK_EQ(s.published, 3u);
-    CHECK_EQ(s.dropped_snapshots, 2u);  // 重试不重复计数
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
+    CHECK_EQ(runner.feed.stats().published, 2u);
 }
 
-TEST_CASE("feed: the publish callback runs on the feed thread right after every successful push, empty books included") {
+namespace {
+
+// 消费者在 feed 线程卡在下一个会话的某个同步步骤里时才腾出队列：它取到的最后一个快照必须是断线时的空簿
+//（第 1 本簿、空簿；第 2、3 本簿被丢弃），而且立即就能取到
+void checkDrainEndsWithEmptyBook(MarketDataFeed& feed, const char* phase) {
+    SnapshotLog log;
+    log.pump(feed);
+    const FeedStats s = feed.stats();
+    const char* last = "-";
+    if (!log.all.empty()) last = log.all.back().bid_count + log.all.back().ask_count == 0 ? "empty" : "NOT empty";
+    std::printf("    next session stuck in %s: consumer drained %zu snapshot(s), last one %s (published %llu, "
+                "dropped %llu)\n",
+                phase, log.all.size(), last, static_cast<unsigned long long>(s.published),
+                static_cast<unsigned long long>(s.dropped_snapshots));
+    REQUIRE_EQ(log.all.size(), std::size_t{2});
+    CHECK_GT(log.all[0].bid_count + log.all[0].ask_count, 0u);
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
+    CHECK_EQ(log.all[1].seq, 4u);
+    CHECK_EQ(s.published, 2u);
+    CHECK_EQ(s.dropped_snapshots, 2u);
+}
+
+// 第一个会话：三本簿，然后服务器关闭
+void threeBooksThenClose(WsSession& ws) {
+    for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
+    ws.sleepMs(50);
+    ws.close(1001, "going away");
+}
+
+}  // namespace
+
+TEST_CASE("feed: a consumer that drains while the next session is stuck (TLS, WebSocket upgrade, REST) gets the empty book") {
+    // 队列容量 2 代表"消费者卡住、队列已满"。之前断线时的空簿没能入队、保持待发布，而 TLS 握手、WebSocket 升级和
+    // 第一个读处理器里的 REST 请求都是同步的、期间没有重试：消费者腾出位置之后仍拿着断线前的价格，直到
+    // connect_timeout_ms（默认 10 s）或停顿看门狗结束那个会话
+    {  // TCP 已连上，服务器不做 TLS 握手
+        MockExchangeServer server;
+        server.setAcceptHandler([](std::size_t i) { return i == 0 ? AcceptAction::Serve : AcceptAction::Silent; });
+        server.setWebSocketScript(threeBooksThenClose);
+        FeedConfig cfg = baseConfig(Exchange::OKX, server);
+        cfg.queue_capacity = 2;
+        cfg.connect_timeout_ms = 3000;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return server.acceptCount() >= 2; }, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
+        checkDrainEndsWithEmptyBook(runner.feed, "the TLS handshake");
+    }
+    {  // WebSocket 升级请求迟迟得不到应答
+        std::atomic<int> upgrades{0};      // 声明在服务器之前：服务器线程里的过滤器可能用到它们，直到服务器析构
+        std::atomic<bool> release{false};
+        MockExchangeServer server;
+        const MockExchangeServer* srv = &server;
+        server.setUpgradeFilter([&upgrades, &release, srv](const std::string&) {
+            if (upgrades.fetch_add(1) >= 1) {
+                const std::int64_t t0 = hft::nowNs();
+                while (!release.load() && !srv->stopping() && hft::nowNs() - t0 < 5'000'000'000LL) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+            return true;
+        });
+        server.setWebSocketScript(threeBooksThenClose);
+        FeedConfig cfg = baseConfig(Exchange::OKX, server);
+        cfg.queue_capacity = 2;
+        cfg.connect_timeout_ms = 3000;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return upgrades.load() >= 2; }, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
+        checkDrainEndsWithEmptyBook(runner.feed, "the WebSocket upgrade");
+        release.store(true);
+    }
+    {  // Binance 增量深度：下一个会话第一条消息触发的 REST 快照请求迟迟得不到应答
+        MockExchangeServer server;
+        server.setHttpHandler([](const HttpRequestInfo& info) {
+            if (info.index == 0) return HttpReply{200, binanceDepth(105, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}})};
+            return HttpReply{200, binanceDepth(205, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}}), "application/json",
+                             3000};
+        });
+        server.setWebSocketScripts({
+            [](WsSession& ws) {
+                // 快照（L=105）之后回放 101..110 → 第 1 本簿；111..120、121..130 → 第 2、3 本簿
+                ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {}));
+                ws.send(binanceDiff(111, 120, {{"65000.00", "2.5"}}, {}));
+                ws.send(binanceDiff(121, 130, {{"65000.00", "3.5"}}, {}));
+                ws.waitUntil([&ws] { return ws.server().httpRequestCount() >= 1; }, 5000);
+                ws.sleepMs(100);
+                ws.close(1001, "going away");
+            },
+            [](WsSession& ws) { ws.send(binanceDiff(201, 210, {{"65000.00", "1.5"}}, {})); },
+        });
+        FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+        cfg.path = "/ws/btcusdt@depth@100ms";
+        cfg.rest_host = "127.0.0.1";
+        cfg.rest_port = server.portString();
+        cfg.snapshot_path = kBinanceSnapshotPath;
+        cfg.queue_capacity = 2;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return server.httpRequestCount() >= 2; }, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK_EQ(runner.feed.status(), FeedStatus::Syncing);
+        CHECK_EQ(server.wsSessionCount(), std::size_t{2});
+        checkDrainEndsWithEmptyBook(runner.feed, "a REST snapshot request");
+    }
+}
+
+TEST_CASE("feed: the publish callback runs on the feed thread right after every successful push, empty books and retries included") {
     MockExchangeServer server;
-    server.setWebSocketScript([](WsSession& ws) {
-        for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
-        ws.sleepMs(50);
-        ws.close(1001, "going away");
+    server.setWebSocketScripts({
+        threeBooksThenClose,
+        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静
     });
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
-    cfg.queue_capacity = 2;  // 第 3 本簿与断线时的第一次空簿入队都会失败
-    cfg.reconnect_initial_ms = 3000;
-    cfg.reconnect_max_ms = 3000;
+    // 第 2、3 本簿入队失败（非空快照要给空簿留一个槽位），断线时的空簿用掉最后一个；新会话的第一本簿入队失败、
+    // 保持待发布，消费者腾出位置之后由重试送达
+    cfg.queue_capacity = 2;
     struct Calls {
         std::mutex mutex;
-        std::vector<std::size_t> queue_sizes;    // 回调时队列里的快照数（消费者在断线之前不取）
+        std::vector<std::size_t> queue_sizes;    // 回调时队列里的快照数（消费者在新会话 LIVE 之前不取）
         std::vector<std::uint64_t> published;    // 回调时的 stats().published
         std::vector<std::thread::id> threads;
     };
@@ -2015,20 +2120,24 @@ TEST_CASE("feed: the publish callback runs on the feed thread right after every 
         calls->published.push_back(published);
         calls->threads.push_back(std::this_thread::get_id());
     });
-    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Reconnecting; }, 5000));
+    REQUIRE(waitFor(
+        [&] {
+            return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live &&
+                   runner.feed.stats().dropped_snapshots == 3;
+        },
+        5000));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     {
         std::lock_guard<std::mutex> lock(calls->mutex);
-        CHECK_EQ(calls->queue_sizes, (std::vector<std::size_t>{1, 2}));   // 每次都在入队之后
+        CHECK_EQ(calls->queue_sizes, (std::vector<std::size_t>{1, 2}));   // 每次都在入队之后：第 1 本簿、空簿
         CHECK_EQ(calls->published, (std::vector<std::uint64_t>{1, 2}));    // 计数已包含这一次
     }
-    CHECK_EQ(runner.feed.stats().dropped_snapshots, 2u);  // 丢弃的快照没有回调
     SnapshotLog log;
-    log.pump(runner.feed);
-    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));  // 待发布的空簿
-    CHECK_EQ(log.all[2].bid_count + log.all[2].ask_count, 0u);
+    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));  // 重试送达新会话的簿
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
+    CHECK_EQ(log.all[2].bids[0].price, 65009.0);
     std::lock_guard<std::mutex> lock(calls->mutex);
-    CHECK_EQ(calls->queue_sizes.size(), std::size_t{3});
+    CHECK_EQ(calls->queue_sizes.size(), std::size_t{3});  // 丢弃的 3 次没有回调，重试成功的那次有
     CHECK_EQ(calls->published.back(), 3u);
     for (const std::thread::id& id : calls->threads) CHECK(id == runner.thread.get_id());
 }
@@ -2048,20 +2157,16 @@ TEST_CASE("feed: an exception thrown by the publish callback is swallowed and th
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
 }
 
-TEST_CASE("feed: a pending disconnect book is superseded by the next session's book, never delivered stale after it") {
+TEST_CASE("feed: after a disconnect, the next session's book that found the queue full is retried once there is room") {
     MockExchangeServer server;
     server.setWebSocketScripts({
-        [](WsSession& ws) {
-            for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
-            ws.sleepMs(50);
-            ws.close(1001, "going away");
-        },
-        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静：没有新的推送来覆盖队列里的旧状态
+        threeBooksThenClose,
+        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静：没有新的推送来替换消费者手里的空簿
     });
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
     cfg.queue_capacity = 2;
     FeedRunner runner(cfg);
-    // 消费者直到新会话 LIVE（其第一本簿因队列满被丢弃）之后才开始取
+    // 消费者直到新会话 LIVE（其第一本簿因队列满没能入队）之后才开始取
     REQUIRE(waitFor(
         [&] {
             return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live &&
@@ -2071,16 +2176,58 @@ TEST_CASE("feed: a pending disconnect book is superseded by the next session's b
     SnapshotLog log;
     REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);
-    CHECK_EQ(log.all[1].bids[0].price, 65001.0);
-    // 送达的是新会话的簿（当前状态），不是旧会话结束时的空簿
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);  // 断线时的空簿
+    CHECK_EQ(log.all[1].seq, 4u);
+    // 消费者手里是空簿：新会话没能入队的簿保持待发布，腾出位置之后送达（推送稀少的交易所不会一直显示空簿）
     REQUIRE_EQ(log.all[2].bid_count, 1u);
     CHECK_EQ(log.all[2].bids[0].price, 65009.0);
     CHECK_EQ(log.all[2].seq, 5u);
+    CHECK_LT(ms(log.pop_ns[2] - log.all[2].publish_ns), 100.0);  // publish_ns = 真正入队的时刻
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    CHECK_EQ(log.pump(runner.feed), std::size_t{0});
+    CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.published, 3u);
-    CHECK_EQ(s.dropped_snapshots, 3u);
+    CHECK_EQ(s.dropped_snapshots, 3u);  // 重试不重复计数
+}
+
+TEST_CASE("feed: a book still pending when its session ends is dropped with it, never delivered after the empty book") {
+    MockExchangeServer server;
+    // 第三个连接起服务器不做 TLS 握手：之后不会再有新的簿
+    server.setAcceptHandler([](std::size_t i) { return i < 2 ? AcceptAction::Serve : AcceptAction::Silent; });
+    server.setWebSocketScripts({
+        [](WsSession& ws) {
+            ws.send(simpleBook(0));
+            ws.sleepMs(50);
+            ws.close(1001, "going away");
+        },
+        [](WsSession& ws) {
+            ws.send(simpleBook(9));  // 队列已满（第 1 本簿 + 断线时的空簿）：没能入队，保持待发布
+            ws.sleepMs(50);
+            ws.close(1001, "going away");
+        },
+    });
+    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    cfg.queue_capacity = 2;
+    cfg.reconnect_initial_ms = 1000;
+    cfg.reconnect_max_ms = 1000;
+    FeedRunner runner(cfg);
+    // 第二个会话也结束之后（退避约 1 s 期间），消费者才开始取
+    REQUIRE(waitFor(
+        [&] {
+            return server.wsSessionCount() == 2 && runner.feed.stats().dropped_snapshots == 1 &&
+                   runner.feed.status() == FeedStatus::Reconnecting;
+        },
+        5000));
+    SnapshotLog log;
+    log.pump(runner.feed);
+    REQUIRE_EQ(log.all.size(), std::size_t{2});
+    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
+    // 第二个会话的簿随会话一起作废：腾出位置之后也不会在空簿之后送来过期的 65009
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK_EQ(log.pump(runner.feed), std::size_t{0});
+    CHECK_EQ(runner.feed.stats().published, 2u);
+    CHECK_NE(runner.feed.status(), FeedStatus::Live);
 }
 
 TEST_CASE("feed: failed attempts back off exponentially (initial, 2x, 4x ... capped at max)") {

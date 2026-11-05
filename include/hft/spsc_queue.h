@@ -31,7 +31,8 @@ namespace hft {
 //   消费者析构元素后 release 存 read_idx_，生产者 acquire 读到后才复用该槽位。
 //   各端读取自己的下标用 relaxed（只有自己会写它）。
 // - 原始对齐内存 + placement new：T 无需默认构造，支持只可移动类型；析构时销毁剩余元素。
-// - 线程约束：tryEmplace/tryPush 只能由一个生产者线程调用，front/pop/tryPop 只能由一个消费者线程调用；
+// - 线程约束：tryEmplace/tryPush（及其 Reserving 版本）只能由一个生产者线程调用，front/pop/tryPop 只能由一个
+//   消费者线程调用；
 //   size/empty/capacity 任意线程可调用（对方并发操作时结果是近似值）。
 template <class T>
 class SpscQueue {
@@ -85,6 +86,32 @@ public:
 
     bool tryPush(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
         return tryEmplace(std::move(v));
+    }
+
+    // 带预留的推入：只有推入之后仍至少空着 reserve 个槽位才构造并返回 true（reserve >= capacity() 时总是失败；
+    // reserve = 0 与 tryEmplace 相同）。用途：生产者给必须送达的元素留位置——普通元素用 reserve = 1，
+    // 关键元素用 0，那么只要最近一次成功推入的是普通元素，下一个关键元素一定能推入（消费者只会腾出更多槽位）。
+    template <class... Args>
+    bool tryEmplaceReserving(std::size_t reserve,
+                             Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        if (HFT_UNLIKELY(reserve >= capacity_)) return false;
+        const std::uint64_t limit = static_cast<std::uint64_t>(capacity_ - reserve);
+        const std::uint64_t w = write_idx_.load(std::memory_order_relaxed);
+        if (HFT_UNLIKELY(w - cached_read_idx_ >= limit)) {
+            cached_read_idx_ = read_idx_.load(std::memory_order_acquire);  // 同 tryEmplace
+            if (w - cached_read_idx_ >= limit) return false;
+        }
+        ::new (slotAddress(w)) T(std::forward<Args>(args)...);
+        write_idx_.store(w + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool tryPushReserving(const T& v, std::size_t reserve) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+        return tryEmplaceReserving(reserve, v);
+    }
+
+    bool tryPushReserving(T&& v, std::size_t reserve) noexcept(std::is_nothrow_move_constructible_v<T>) {
+        return tryEmplaceReserving(reserve, std::move(v));
     }
 
     // ---------------- 消费者端 ----------------

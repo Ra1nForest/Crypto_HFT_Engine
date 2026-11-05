@@ -460,6 +460,107 @@ TEST_CASE("spsc: size is approximate but bounded while both sides run") {
     CHECK_EQ(popped, std::uint64_t{200'000});
 }
 
+TEST_CASE("spsc: tryPushReserving keeps reserve slots free; reserve 0 is tryPush; reserve >= capacity always fails") {
+    hft::SpscQueue<int> q(4);
+    CHECK(!q.tryPushReserving(1, 4));  // 预留不少于容量：空队列也推不进
+    CHECK(!q.tryPushReserving(1, 5));
+    CHECK(!q.tryEmplaceReserving(std::numeric_limits<std::size_t>::max(), 1));
+    CHECK(q.empty());
+    CHECK(q.tryPushReserving(10, 3));  // reserve = capacity - 1：只有空队列能推入
+    CHECK(!q.tryPushReserving(11, 3));
+    CHECK(q.tryPushReserving(11, 1));
+    CHECK(q.tryEmplaceReserving(1, 12));
+    CHECK(!q.tryPushReserving(13, 1));  // 再推就只剩 0 个空位
+    CHECK_EQ(q.size(), std::size_t{3});
+    CHECK(q.tryPushReserving(13, 0));  // 预留的最后一个槽位
+    CHECK(!q.tryPushReserving(14, 0));
+    CHECK(!q.tryPush(14));
+    int out = -1;
+    REQUIRE(q.tryPop(out));
+    CHECK_EQ(out, 10);
+    CHECK(!q.tryPushReserving(14, 1));  // 消费者腾出一个：推入后会剩 0 个，仍然不行
+    CHECK(q.tryPushReserving(14, 0));
+    for (int want = 11; want <= 14; ++want) {
+        REQUIRE(q.tryPop(out));
+        CHECK_EQ(out, want);  // FIFO 不受预留影响
+    }
+    CHECK(q.empty());
+
+    // 只可移动类型：推入失败不消费参数
+    hft::SpscQueue<std::unique_ptr<int>> m(2);
+    CHECK(m.tryPushReserving(std::make_unique<int>(1), 1));
+    auto extra = std::make_unique<int>(2);
+    CHECK(!m.tryPushReserving(std::move(extra), 1));
+    CHECK(extra != nullptr);
+    CHECK(m.tryPushReserving(std::move(extra), 0));
+    CHECK(extra == nullptr);
+    CHECK_EQ(m.size(), std::size_t{2});
+}
+
+TEST_CASE("spsc: randomized single-thread ops with random reserves match std::deque") {
+    const std::size_t capacities[] = {2, 4, 16};
+    for (std::size_t cap : capacities) {
+        hft::SpscQueue<std::uint64_t> q(cap);
+        std::deque<std::uint64_t> model;
+        std::mt19937_64 rng(cap * 7 + 1);
+        std::uint64_t next = 0;
+        for (int iter = 0; iter < 200000; ++iter) {
+            const unsigned op = static_cast<unsigned>(rng() % 3);
+            if (op < 2) {
+                const std::size_t reserve = static_cast<std::size_t>(rng() % (cap + 2));  // 含 >= 容量的情况
+                const bool ok = q.tryPushReserving(next, reserve);
+                REQUIRE_EQ(ok, reserve < cap && model.size() < cap - reserve);
+                if (ok) model.push_back(next);
+                ++next;
+            } else {
+                std::uint64_t v = 0;
+                const bool ok = q.tryPop(v);
+                REQUIRE_EQ(ok, !model.empty());
+                if (ok) {
+                    REQUIRE_EQ(v, model.front());
+                    model.pop_front();
+                }
+            }
+            REQUIRE_EQ(q.size(), model.size());
+        }
+    }
+}
+
+TEST_CASE("spsc: with a consumer running, a reserve-0 push right after a successful reserve-1 push never fails") {
+    // MarketDataFeed 依赖的性质：普通快照用 reserve = 1，紧接着的关键快照（空簿）用 reserve = 0，一定能推入
+    for (std::size_t cap : {std::size_t{2}, std::size_t{8}}) {
+        hft::SpscQueue<std::uint64_t> q(cap);
+        constexpr std::uint64_t kPairs = 300'000;
+        std::atomic<std::uint64_t> failures{0};
+        std::thread producer([&q, &failures] {
+            for (std::uint64_t i = 0; i < kPairs; ++i) {
+                unsigned spins = 0;
+                while (!q.tryPushReserving(2 * i, 1)) backoff(spins);
+                if (!q.tryPushReserving(2 * i + 1, 0)) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    while (!q.tryPush(2 * i + 1)) backoff(spins);
+                }
+            }
+        });
+        std::uint64_t expected = 0, mismatches = 0;
+        unsigned spins = 0;
+        std::uint64_t v = 0;
+        while (expected < 2 * kPairs) {
+            if (q.tryPop(v)) {
+                if (v != expected) ++mismatches;
+                ++expected;
+                spins = 0;
+            } else {
+                backoff(spins);
+            }
+        }
+        producer.join();
+        CHECK_EQ(failures.load(), std::uint64_t{0});
+        CHECK_EQ(mismatches, std::uint64_t{0});
+        CHECK(q.empty());
+    }
+}
+
 // ============================================================================
 // ObjectPool
 // ============================================================================
