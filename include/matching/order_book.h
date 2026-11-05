@@ -58,8 +58,10 @@ struct OrderBookTestPeer;
 // 监听器不得在回调中重入调用本簿的 submit/cancel/modify；回调抛出的异常会原样传播，簿保持结构一致
 // （checkInvariants() 成立），但正在处理的那条命令就此中止（例如主动单不再继续撮合、也不挂单）。
 //
-// 数量假设（与参考模型相同）：同一价位所有挂单剩余量之和须能放进 int64（档位总量被缓存）；
-// FOK 预检用"仍需数量"做减法，不会溢出。
+// 档位总量上限（契约的一部分，三个实现完全一致，见 matching/types.h 的 kMaxLevelQty）：会让某档总量超过
+// INT64_MAX 的限价 GTC 新单与改价/加量改单，在产生任何其他事件之前以 InvalidQuantity 拒绝。缓存的档位
+// 总量因此始终精确、不会溢出：depth()/volumeAt() 直接返回它；不启用 STP 的 FOK 预检也直接拿它与"仍需
+// 数量"比较——参考模型逐单累计，结论不依赖任何缓存，这里的 FOK 判定则依赖这条上限。
 //
 // 规范未定义的输入：side/type/tif/stp 超出枚举取值范围（只能通过强制类型转换构造）时按 InvalidFlags 拒单
 // （作为第 3 条规则"标志非法"的一部分），保证引擎对任意字节输入都有确定行为、不会越界访问。
@@ -92,7 +94,8 @@ class LimitOrderBook {
               account(account_), side(side_), post_only(post_only_), stp(stp_) {}
     };
 
-    // 价位：缓存剩余总量与订单数（count 用 64 位，不可能回绕；对外的 LevelInfo::orders 为 32 位）
+    // 价位：缓存剩余总量（不超过 kMaxLevelQty）与订单数（count 用 64 位，不可能回绕；对外的
+    // LevelInfo::orders 为 32 位）
     struct Level {
         Price price;
         Qty total;
@@ -163,6 +166,18 @@ public:
         const bool rests = req.type == OrderType::Limit && req.tif == TimeInForce::GTC;
         if (max_orders_ != 0 && index_.size() >= max_orders_ && rests)
             return reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
+        // 档位总量上限：只有限价 GTC 会挂单。撮合不触及本侧；本侧该价位已有档位时订单也不可能穿价
+        // （盘口不交叉），会整单挂上去——所以这条检查恰好拒绝会让该档总量越界的请求。顺便记下挂单位置
+        // 交给 rest()：从这里到挂单，撮合只改动对手方、回调不得重入、扩容不改变下标，本侧数组不变
+        std::size_t rest_pos = 0;
+        if (rests) {
+            const SideLevels& own = sides_[sideIndex(req.side)];
+            const Price key = keyOf(req.side, req.price);
+            rest_pos = lowerBoundFromBack(own, key);
+            const Qty resting = rest_pos < own.size() && own[rest_pos].key == key ? own[rest_pos].level->total : 0;
+            if (HFT_UNLIKELY(req.qty > kMaxLevelQty - resting))
+                return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
+        }
         if (req.post_only && crosses(req.side, req.price))
             return reject(req.id, RequestType::New, RejectReason::PostOnlyWouldCross);
 
@@ -193,7 +208,7 @@ public:
             return;
         }
         HFT_ASSERT(tif == TimeInForce::GTC && "FOK order has a remainder after a successful pre-check");
-        rest(taker, price, post_only);  // 限价 GTC：剩余量挂到该价位 FIFO 队尾，不发事件
+        rest(taker, price, post_only, rest_pos);  // 限价 GTC：剩余量挂到该价位 FIFO 队尾，不发事件
     }
 
     // ---------------------------------------------------------------- 撤单
@@ -214,11 +229,20 @@ public:
         if (new_qty <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
         if (new_price <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidPrice);
         Level* const level = order->level;
-        if (order->post_only && new_price != level->price && crosses(order->side, new_price))
+        const bool same_price = new_price == level->price;
+        const bool in_place = same_price && new_qty <= order->remaining;
+        // 档位总量上限：改价或加量会把订单重新挂到 new_price（原地减量不会增加档位总量）。目标档位中其他
+        // 订单的总量：同价时是本档总量减去它自己，改价时是新价位的现有总量（没有该价位为 0）
+        if (!in_place) {
+            const Qty others = same_price ? level->total - order->remaining : volumeAt(order->side, new_price);
+            if (HFT_UNLIKELY(new_qty > kMaxLevelQty - others))
+                return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+        }
+        if (order->post_only && !same_price && crosses(order->side, new_price))
             return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
 
         // 价格不变且数量不增加：原地修改，保留时间优先级（档位总量随之调整）
-        if (new_price == level->price && new_qty <= order->remaining) {
+        if (in_place) {
             level->total -= order->remaining - new_qty;
             order->remaining = new_qty;
             listener_.onModified(id, new_price, new_qty);
@@ -235,7 +259,9 @@ public:
         listener_.onModified(id, new_price, new_qty);
         if (crossesTop(taker) && !match(taker)) return;  // 被自成交保护撤销
         if (taker.remaining == 0) return;                // 全部成交
-        rest(taker, new_price, post_only);
+        // 移出旧价位（可能删掉该档）之后本侧数组已变：在这里查找挂单位置
+        rest(taker, new_price, post_only,
+             lowerBoundFromBack(sides_[sideIndex(taker.side)], keyOf(taker.side, new_price)));
     }
 
     // ---------------------------------------------------------------- 查询（const，绝不调用监听器）
@@ -350,8 +376,8 @@ public:
                     if (o->side != side) return fail(orderName(o) + " rests on the wrong side");
                     if (o->remaining <= 0)
                         return fail(orderName(o) + " has non-positive remaining " + std::to_string(o->remaining));
-                    if (o->remaining > std::numeric_limits<Qty>::max() - sum)
-                        return fail(levelName(side, l) + ": total quantity overflows int64");
+                    if (o->remaining > kMaxLevelQty - sum)  // 档位总量上限（sum >= 0、remaining > 0，不会溢出）
+                        return fail(levelName(side, l) + ": total quantity exceeds kMaxLevelQty");
                     sum += o->remaining;
                     Order* const* found = index_.find(o->id);
                     if (found == nullptr) return fail("resting " + orderName(o) + " is missing from the index");
@@ -487,20 +513,22 @@ private:
     }
 
     // ---------------------------------------------------------------- 挂单与移除
-    // 剩余量挂到 price 价位 FIFO 队尾（价位不存在则创建）。调用前必须已 ensureCapacityForOneMore()，
-    // 因此这里的对象池、价位数组、索引操作都不会分配内存。
-    HFT_ALWAYS_INLINE void rest(const Taker& t, Price price, bool post_only) {
+    // 剩余量挂到 price 价位 FIFO 队尾（价位不存在则在 pos 处创建）。pos 是 price 在本侧价位数组中的
+    // lowerBound 位置，由调用方查好、其后本侧数组未变。调用前必须已 ensureCapacityForOneMore()，
+    // 因此这里的对象池、价位数组、索引操作都不会分配内存；调用方也已检查过档位总量上限。
+    HFT_ALWAYS_INLINE void rest(const Taker& t, Price price, bool post_only, std::size_t pos) {
         SideLevels& v = sides_[sideIndex(t.side)];
         const Price key = keyOf(t.side, price);
-        const std::size_t i = lowerBoundFromBack(v, key);
+        HFT_ASSERT(pos == lowerBoundFromBack(v, key));
         Level* level;
-        if (i < v.size() && v[i].key == key) {
-            level = v[i].level;
+        if (pos < v.size() && v[pos].key == key) {
+            level = v[pos].level;
         } else {
             HFT_ASSERT(level_pool_.available() > 0 && v.size() < v.capacity());
             level = level_pool_.create(price);
-            v.insert(v.begin() + static_cast<std::ptrdiff_t>(i), LevelRef{key, level});
+            v.insert(v.begin() + static_cast<std::ptrdiff_t>(pos), LevelRef{key, level});
         }
+        HFT_ASSERT(t.remaining <= kMaxLevelQty - level->total);
         HFT_ASSERT(order_pool_.available() > 0 && index_.size() < index_.capacity());
         Order* const order = order_pool_.create(t.id, t.remaining, t.account, t.side, post_only, t.stp);
         order->level = level;
@@ -542,9 +570,9 @@ private:
     }
 
     // ---------------------------------------------------------------- FOK 预检与撮合
-    // FOK 预检：按撮合顺序遍历可成交价位上的 maker，用"仍需数量"做减法（不会溢出）。
+    // FOK 预检：按撮合顺序遍历可成交价位上的 maker，用"仍需数量"做减法（只在不够时才减，结果恒为正）。
     // STP 适用的 maker：CancelMaker 跳过（贡献 0、继续），CancelTaker/CancelBoth 停止遍历（不可成交）。
-    // 不启用 STP 时整档可成交，直接用缓存的档位总量，不必逐单遍历。
+    // 不启用 STP 时整档可成交，直接用缓存的档位总量，不必逐单遍历——档位总量上限保证它是精确值。
     bool fokFillable(const Taker& t) const noexcept {
         const SideLevels& book = sides_[sideIndex(opposite(t.side))];
         Qty needed = t.remaining;

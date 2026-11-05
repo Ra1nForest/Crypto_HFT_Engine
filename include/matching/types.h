@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace hft::matching {
@@ -18,6 +19,11 @@ using Price     = std::int64_t;    // 整数 tick
 using Qty       = std::int64_t;    // 整数手数
 using TradeId   = std::uint64_t;   // 每个订单簿从 1 开始、每笔成交加 1
 using SymbolId  = std::uint32_t;   // 多交易对路由使用
+
+// 档位总量上限：同一侧同一价位全部挂单的剩余量之和不得超过它，因此档位总量（缓存或现算）、depth()
+// 与 volumeAt() 的结果都能用 Qty 表示。会让某档总量超过上限的请求——限价 GTC 新单、改价或加量的改单——
+// 在产生任何其他事件之前以 InvalidQuantity 拒绝（规则顺序见 docs/MATCHING_ENGINE.md）。
+inline constexpr Qty kMaxLevelQty = std::numeric_limits<Qty>::max();
 
 enum class Side : std::uint8_t { Buy, Sell };
 enum class OrderType : std::uint8_t { Limit, Market };

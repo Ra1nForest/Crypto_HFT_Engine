@@ -80,6 +80,7 @@ struct PreState {
     std::optional<Price> best_bid;
     std::optional<Price> best_ask;
     TradeId last_trade_id = 0;
+    Qty level_volume = 0;  // 命令可能挂单的那一档的现有总量：新单 (side, price)，改单 (原方向, 新价格)
 };
 
 template <class Book>
@@ -90,6 +91,8 @@ PreState capturePre(const Book& book, const Command& cmd) {
     p.best_bid = book.bestBid();
     p.best_ask = book.bestAsk();
     p.last_trade_id = book.lastTradeId();
+    if (cmd.type == RequestType::New) p.level_volume = book.volumeAt(cmd.order.side, cmd.order.price);
+    if (cmd.type == RequestType::Modify && p.target) p.level_volume = book.volumeAt(p.target->side, cmd.price);
     return p;
 }
 
@@ -235,6 +238,7 @@ bool checkCommandEvents(const Command& cmd, const PreState& pre, const std::vect
             else if (r.post_only && !limit_gtc) expect = RejectReason::InvalidFlags;
             else if (pre.target) expect = RejectReason::DuplicateOrderId;
             else if (max_orders != 0 && pre.order_count >= max_orders && limit_gtc) expect = RejectReason::CapacityExceeded;
+            else if (limit_gtc && r.qty > kMaxLevelQty - pre.level_volume) expect = RejectReason::InvalidQuantity;
             else if (r.post_only && crossedBefore(r.side, r.price)) expect = RejectReason::PostOnlyWouldCross;
             if (expect) return sameEvents(ev, {rejectedNew(r.id, *expect)}, why);
             if (ev[0] != accepted(r)) return fail("first event is not Accepted(request): " + ev[0].toString());
@@ -252,9 +256,13 @@ bool checkCommandEvents(const Command& cmd, const PreState& pre, const std::vect
         case RequestType::Modify: {
             if (!pre.target) return sameEvents(ev, {rejectedModify(cmd.id, RejectReason::UnknownOrder)}, why);
             const OrderInfo& o = *pre.target;
+            const bool in_place = cmd.price == o.price && cmd.qty <= o.remaining;
+            // 重新挂单时目标档位里的其他订单：同价加量时扣掉它自己原来的数量
+            const Qty others = pre.level_volume - (cmd.price == o.price ? o.remaining : 0);
             std::optional<RejectReason> expect;
             if (cmd.qty <= 0) expect = RejectReason::InvalidQuantity;
             else if (cmd.price <= 0) expect = RejectReason::InvalidPrice;
+            else if (!in_place && cmd.qty > kMaxLevelQty - others) expect = RejectReason::InvalidQuantity;
             else if (o.post_only && cmd.price != o.price && crossedBefore(o.side, cmd.price))
                 expect = RejectReason::PostOnlyWouldCross;
             if (expect) {
@@ -1445,6 +1453,9 @@ TEST_CASE("optimized: checkInvariants detects every kind of internal corruption"
     // sides[0] = 买盘（升序，末尾最优），sides[1] = 卖盘（价格降序，末尾最优）
     const Corruption cases[] = {
         {"level total", "caches total", [](OptBook& b) { Peer::sides(b)[0].back().level->total += 1; }},
+        // 卖盘 103 = [5, 6]：5 号单的剩余量改成 INT64_MAX，两单之和超出档位总量上限
+        {"level total past the bound", "exceeds kMaxLevelQty",
+         [](OptBook& b) { Peer::sides(b)[1].front().level->head->remaining = kMaxLevelQty; }},
         {"level count", "counts", [](OptBook& b) { Peer::sides(b)[1].front().level->count += 1; }},
         {"order count too small", "FIFO longer", [](OptBook& b) { Peer::sides(b)[1].front().level->count -= 1; }},
         {"non-positive remaining", "non-positive remaining", [](OptBook& b) {
@@ -1696,6 +1707,62 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
     CHECK_EQ(d.opt.book.volumeAt(Side::Sell, INT64_MIN), 0);
     CHECK(d.opt.book.ordersAt(Side::Sell, INT64_MIN).empty());
     CHECK_EQ(d.opt.book.volumeAt(Side::Buy, 0), 0);
+}
+
+TEST_CASE("optimized: orders that would push a level total past INT64_MAX are rejected like the reference") {
+    constexpr Qty kMax = kMaxLevelQty;
+    constexpr Qty kP62 = Qty{1} << 62;
+    using RR = RejectReason;
+    {
+        // 两张 2^62 的卖单：第二张被拒；之后不启用 STP（整档快速路径）与启用 STP（逐单遍历）的 FOK 都成交
+        DualBook d(0, 8);
+        const OrderRequest a1 = sell(1, 100, kP62).account(1);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(a1)), accepted(a1));
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(sell(2, 100, kP62).account(2))), rejectedNew(2, RR::InvalidQuantity));
+        DUAL_VERIFY(d);
+        const OrderRequest f3 = buy(3, 100, 10).fok().account(3);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f3)), accepted(f3), trade(1, 1, 3, 1, 3, Side::Buy, 100, 10, kP62 - 10, 0));
+        const OrderRequest f4 = buy(4, 100, 10).fok().account(3).stp(StpMode::CancelMaker);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f4)), accepted(f4), trade(2, 1, 4, 1, 3, Side::Buy, 100, 10, kP62 - 20, 0));
+        DUAL_VERIFY(d);
+    }
+    {
+        // 三张 INT64_MAX 的卖单挂同一价位：后两张被拒；要 INT64_MAX 的 FOK 吃掉第一张
+        DualBook d(0, 8);
+        const OrderRequest a1 = sell(1, 100, kMax).account(1);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(a1)), accepted(a1));
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(sell(2, 100, kMax).account(2))), rejectedNew(2, RR::InvalidQuantity));
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(sell(3, 100, kMax).account(4))), rejectedNew(3, RR::InvalidQuantity));
+        CHECK_LEVELS(d.opt.book.depth(Side::Sell), {100, kMax, 1});
+        DUAL_VERIFY(d);
+        const OrderRequest f4 = buy(4, 100, kMax).fok().account(3);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f4)), accepted(f4), trade(1, 1, 4, 1, 3, Side::Buy, 100, kMax, 0, 0));
+        DUAL_VERIFY(d);
+        CHECK_EQ(d.opt.book.orderCount(), 0u);
+    }
+    {
+        // 改单路径：1 手的卖单同价加量到 2^62 被拒，订单原样保留（含队列位置）；加到 2^62 - 1 恰好到上限
+        DualBook d(0, 8);
+        DUAL_RUN(d, Command::newOrder(sell(1, 100, kP62).account(1)));
+        DUAL_RUN(d, Command::newOrder(sell(2, 100, 1).account(2)));
+        DUAL_RUN(d, Command::newOrder(sell(5, 101, 7).account(2)));
+        CHECK_EVENTS(DUAL_RUN(d, Command::modify(2, 100, kP62)), rejectedModify(2, RR::InvalidQuantity));
+        CHECK_EVENTS(DUAL_RUN(d, Command::modify(5, 100, kP62)), rejectedModify(5, RR::InvalidQuantity));
+        CHECK_ORDERS_AT(d.opt.book, Side::Sell, 100, orderInfo(1, 1, Side::Sell, 100, kP62),
+                        orderInfo(2, 2, Side::Sell, 100, 1));
+        DUAL_VERIFY(d);
+        const OrderRequest m3 = marketBuy(3, 5).fok().account(3);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(m3)), accepted(m3), trade(1, 1, 3, 1, 3, Side::Buy, 100, 5, kP62 - 5, 0));
+        CHECK_EVENTS(DUAL_RUN(d, Command::modify(2, 100, kP62 + 4)), modified(2, 100, kP62 + 4));
+        CHECK_LEVELS(d.opt.book.depth(Side::Sell), {100, kMax, 2}, {101, 7, 1});
+        CHECK_EVENTS(DUAL_RUN(d, Command::modify(5, 100, 1)), rejectedModify(5, RR::InvalidQuantity));
+        DUAL_VERIFY(d);
+        const OrderRequest m4 = marketBuy(4, kMax).fok().account(3).stp(StpMode::CancelTaker);
+        CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(m4)), accepted(m4),
+                     trade(2, 1, 4, 1, 3, Side::Buy, 100, kP62 - 5, 0, kP62 + 4),
+                     trade(3, 2, 4, 2, 3, Side::Buy, 100, kP62 + 4, 0, 0));
+        DUAL_VERIFY(d);
+    }
 }
 
 TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {

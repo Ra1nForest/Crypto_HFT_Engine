@@ -31,14 +31,17 @@ namespace hft::matching {
 // - 每侧一个 std::map<Price, std::list<OrderInfo>>，比较器保证 begin() 恒为最优档
 //   （买盘价高者在前、卖盘价低者在前）；同一档内 list 头部即时间优先级最高的订单
 // - 订单索引 std::unordered_map<OrderId, list 迭代器>：list 迭代器在其他元素增删时保持有效
-// - 档位总量与订单数在查询时现算，不做任何缓存
+// - 档位总量与订单数在查询时现算，不做任何缓存（档位总量上限检查另用只增不减的 max_rested_qty_
+//   做 O(1) 的保守预判，见 fitsInLevel()；它不影响任何查询结果）
 //
 // 回调时机：每个事件发出时，簿内状态已包含该事件的效果（例如成交回报发出时，完全成交的
 // maker 已被移除）。规范只约束事件流本身，不约束回调期间可见的簿状态；监听器不得在回调中
 // 重入调用本簿的修改接口。
 //
-// 数量假设：同一价位所有挂单剩余量之和须能放进 int64（规范未规定数量上限）；FOK 预检本身
-// 用减法实现，不会溢出。
+// 档位总量上限（契约的一部分，见 matching/types.h 的 kMaxLevelQty）：会让某档总量超过 INT64_MAX 的
+// 限价 GTC 新单与改价/加量改单在 onAccepted / onModified 之前以 InvalidQuantity 拒绝，因此现算的档位
+// 总量不会溢出（累加前仍逐项检查，越界即为本模型自身的错误，直接中止）；FOK 预检用"仍需数量"做减法，
+// 跨档累计也不会溢出。
 template <class Listener>
 class ReferenceOrderBook {
 public:
@@ -77,6 +80,14 @@ public:
         if (max_orders_ != 0 && orderCount() >= max_orders_ &&
             req.type == OrderType::Limit && req.tif == TimeInForce::GTC) {
             reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
+            return;
+        }
+        // 档位总量上限：只有限价 GTC 会挂单。撮合循环从不触及 taker 自己这一侧；本侧该价位已有档位时
+        // 订单也不可能穿价（盘口不交叉），会整单挂上去——所以这条检查恰好拒绝会让该档总量越界的请求
+        // （该价位没有档位时检查恒通过）
+        if (req.type == OrderType::Limit && req.tif == TimeInForce::GTC &&
+            !fitsInLevel(req.side, req.price, req.qty, 0)) {
+            reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
             return;
         }
         if (req.post_only && crosses(req.side, req.price)) {
@@ -141,6 +152,15 @@ public:
             reject(id, RequestType::Modify, RejectReason::InvalidPrice);
             return;
         }
+        // 档位总量上限：改价或加量会把订单重新挂到 new_price（原地减量不会增加档位总量，不受限）。
+        // 目标档位中其他订单的总量 = 该档现有总量；同价加量时扣掉订单自己原来的数量
+        if (new_price != order.price || new_qty > order.remaining) {
+            const Qty own = new_price == order.price ? order.remaining : 0;
+            if (!fitsInLevel(order.side, new_price, new_qty, own)) {
+                reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+                return;
+            }
+        }
         if (order.post_only && new_price != order.price && crosses(order.side, new_price)) {
             reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
             return;
@@ -188,9 +208,7 @@ public:
         std::vector<LevelInfo> out;
         for (const auto& [price, orders] : levels(side)) {
             if (out.size() >= max_levels) break;
-            Qty total = 0;
-            for (const OrderInfo& o : orders) total += o.remaining;
-            out.push_back(LevelInfo{price, total, static_cast<std::uint32_t>(orders.size())});
+            out.push_back(LevelInfo{price, levelTotal(orders), static_cast<std::uint32_t>(orders.size())});
         }
         return out;
     }
@@ -213,9 +231,7 @@ public:
         const LevelMap& book_side = levels(side);
         auto level = book_side.find(price);
         if (level == book_side.end()) return 0;
-        Qty total = 0;
-        for (const OrderInfo& o : level->second) total += o.remaining;
-        return total;
+        return levelTotal(level->second);
     }
 
     // 最近一笔成交的 id；尚无成交时为 0
@@ -240,10 +256,18 @@ public:
                     return fail(name + " level with non-positive price " + std::to_string(price));
                 if (orders.empty())
                     return fail(name + " empty level at price " + std::to_string(price));
+                Qty total = 0;
                 for (const OrderInfo& o : orders) {
                     if (o.remaining <= 0)
                         return fail("order " + std::to_string(o.id) + " has non-positive remaining " +
                                     std::to_string(o.remaining));
+                    // 档位总量上限（remaining > 0 且 total 在 [0, kMaxLevelQty] 内，减法不会溢出）
+                    if (o.remaining > kMaxLevelQty - total)
+                        return fail(name + " level at price " + std::to_string(price) +
+                                    ": total quantity exceeds kMaxLevelQty");
+                    total += o.remaining;
+                    if (o.remaining > max_rested_qty_)  // fitsInLevel() 的保守判断依赖这一点
+                        return fail("order " + std::to_string(o.id) + " has more remaining than any order ever rested");
                     if (o.side != side || o.price != price)
                         return fail("order " + std::to_string(o.id) + " is stored at the wrong level");
                     auto found = index_.find(o.id);
@@ -302,6 +326,31 @@ private:
     const LevelMap& levels(Side side) const { return side == Side::Buy ? bids_ : asks_; }
 
     bool isLive(OrderId id) const { return index_.count(id) != 0; }
+
+    // 档位总量（现算）。剩余量恒为正、档位总量不超过 kMaxLevelQty 都是本模型维护的不变量；累加前仍逐项
+    // 检查（这样 total 始终在 [0, kMaxLevelQty] 内，减法不会溢出），违反即为本模型自身的错误
+    static Qty levelTotal(const OrderList& orders) {
+        Qty total = 0;
+        for (const OrderInfo& o : orders) {
+            if (o.remaining <= 0 || o.remaining > kMaxLevelQty - total)
+                fatal("level total: non-positive remaining or total above kMaxLevelQty");
+            total += o.remaining;
+        }
+        return total;
+    }
+
+    // 档位总量上限：把 qty 挂到 (side, price) 之后，该档总量（先扣掉 own：同价加量的改单里订单自己原来的
+    // 剩余量）是否仍不超过 kMaxLevelQty。先做 O(1) 的保守判断：剩余量只在 rest() 挂单时设定、之后只减不增，
+    // 所以每个挂单的剩余量都不超过 max_rested_qty_，该档总量不超过"订单数 × max_rested_qty_"——这个上界
+    // 放得下就一定放得下（正常流量都走这里，不必逐单求和）；否则按定义逐单求和后精确判断
+    bool fitsInLevel(Side side, Price price, Qty qty, Qty own) const {
+        const LevelMap& book_side = levels(side);
+        const auto level = book_side.find(price);
+        if (level == book_side.end()) return true;  // 空价位（此时 own 必为 0）：qty 本身不超过上限
+        const auto orders = static_cast<Qty>(level->second.size());
+        if (orders <= (kMaxLevelQty - qty) / max_rested_qty_) return true;  // 有挂单，max_rested_qty_ >= 1
+        return qty <= kMaxLevelQty - (levelTotal(level->second) - own);
+    }
 
     // 规范定义：买单 —— 卖盘非空且 p >= 卖一；卖单 —— 买盘非空且 p <= 买一
     bool crosses(Side side, Price p) const {
@@ -390,6 +439,7 @@ private:
         OrderList& queue = levels(order.side)[order.price];
         queue.push_back(order);
         index_[order.id] = std::prev(queue.end());
+        max_rested_qty_ = std::max(max_rested_qty_, order.remaining);
     }
 
     // 移除一个活动订单；价位空了就删除该价位
@@ -416,6 +466,7 @@ private:
     LevelMap asks_;
     std::unordered_map<OrderId, typename OrderList::iterator> index_;
     TradeId last_trade_id_ = 0;
+    Qty max_rested_qty_ = 0;  // 曾经挂单的最大剩余量（只增不减）：任何挂单的剩余量都不超过它
 };
 
 }  // namespace hft::matching

@@ -11,9 +11,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace hft::matching::test {
@@ -23,6 +27,8 @@ namespace hft::matching::test {
 // - 最优 maker、深度、档位等全部靠线性扫描 + 排序现算
 // - FOK 预检不单独实现"遍历求和"，而是在挂单副本上空跑一遍真正的撮合循环（丢弃事件），
 //   看能否完全成交 —— 这同时验证了规范中"预检按撮合顺序遍历"的描述与撮合循环本身一致
+// - 档位总量上限（kMaxLevelQty）不用"上限减去现有总量"，而是把目标价位上其他挂单逐单加到请求数量上、
+//   检测加法溢出；改单时按 id 排除订单自己，而不是减去它原来的数量
 // 接口与 ReferenceOrderBook / LimitOrderBook 相同（设计文档 2.3）。仅用于测试，性能无关紧要。
 template <class Listener>
 class NaiveOrderBook {
@@ -97,11 +103,17 @@ public:
             return;
         }
         OrderInfo info = orders_[i].info;
+        // 改价或加量会把订单重新挂到 new_price：挂上去之后该档总量不得越界（原地减量不受限）
+        const bool in_place = new_price == info.price && new_qty <= info.remaining;
+        if (!in_place && exceedsLevelBound(info.side, new_price, id, new_qty)) {
+            listener_.onRejected(id, RequestType::Modify, RejectReason::InvalidQuantity);
+            return;
+        }
         if (info.post_only && new_price != info.price && wouldCross(info.side, new_price)) {
             listener_.onRejected(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
             return;
         }
-        if (new_price == info.price && new_qty <= info.remaining) {
+        if (in_place) {
             orders_[i].info.remaining = new_qty;  // 原地修改：seq 不变，保留时间优先级
             listener_.onModified(id, new_price, new_qty);
             return;
@@ -135,7 +147,7 @@ public:
         std::vector<LevelInfo> out;
         for (const Resting* r : inPriority(orders_, side)) {
             if (!out.empty() && out.back().price == r->info.price) {
-                out.back().qty += r->info.remaining;
+                out.back().qty = addToLevel(out.back().qty, r->info.remaining);
                 ++out.back().orders;
                 continue;
             }
@@ -166,7 +178,7 @@ public:
     Qty volumeAt(Side side, Price price) const {
         Qty total = 0;
         for (const Resting& r : orders_) {
-            if (r.info.side == side && r.info.price == price) total += r.info.remaining;
+            if (r.info.side == side && r.info.price == price) total = addToLevel(total, r.info.remaining);
         }
         return total;
     }
@@ -180,11 +192,15 @@ public:
         };
         std::set<OrderId> ids;
         std::set<std::uint64_t> seqs;
+        std::map<std::pair<Side, Price>, Qty> level_totals;
         for (const Resting& r : orders_) {
             if (r.info.remaining <= 0) return fail("order " + std::to_string(r.info.id) + " has remaining <= 0");
             if (r.info.price <= 0) return fail("order " + std::to_string(r.info.id) + " has price <= 0");
             if (!ids.insert(r.info.id).second) return fail("duplicate live id " + std::to_string(r.info.id));
             if (!seqs.insert(r.seq).second) return fail("duplicate arrival sequence");
+            Qty& total = level_totals[{r.info.side, r.info.price}];
+            if (__builtin_add_overflow(total, r.info.remaining, &total) || total > kMaxLevelQty)
+                return fail("level at price " + std::to_string(r.info.price) + ": total quantity exceeds kMaxLevelQty");
         }
         const std::optional<Price> bid = bestBid();
         const std::optional<Price> ask = bestAsk();
@@ -307,8 +323,31 @@ private:
         if (indexOf(r.id) != kNone) return RejectReason::DuplicateOrderId;
         if (max_orders_ != 0 && limit_gtc && orders_.size() >= max_orders_)
             return RejectReason::CapacityExceeded;
+        // 只有限价 GTC 会挂单；新单的 id 不在簿上，没有需要排除的订单
+        if (limit_gtc && exceedsLevelBound(r.side, r.price, std::nullopt, r.qty)) return RejectReason::InvalidQuantity;
         if (r.post_only && wouldCross(r.side, r.price)) return RejectReason::PostOnlyWouldCross;
         return std::nullopt;
+    }
+
+    // 档位总量上限：把 (side, price) 上除 exclude 之外的挂单逐单加到 qty 上，结果是否超过 kMaxLevelQty
+    // （任何一步加法溢出都算超过）
+    bool exceedsLevelBound(Side side, Price price, std::optional<OrderId> exclude, Qty qty) const {
+        Qty total = qty;
+        for (const Resting& r : orders_) {
+            if (r.info.side != side || r.info.price != price || (exclude && r.info.id == *exclude)) continue;
+            if (__builtin_add_overflow(total, r.info.remaining, &total)) return true;
+        }
+        return total > kMaxLevelQty;
+    }
+
+    // 查询时累加档位总量：上限规则保证结果不超过 kMaxLevelQty；加法溢出说明本模型自身有错，直接中止
+    static Qty addToLevel(Qty total, Qty qty) {
+        Qty sum = 0;
+        if (__builtin_add_overflow(total, qty, &sum) || sum > kMaxLevelQty) {
+            std::fprintf(stderr, "NaiveOrderBook internal error: level total exceeds kMaxLevelQty\n");
+            std::abort();
+        }
+        return sum;
     }
 
     void insert(const OrderInfo& info) { orders_.push_back(Resting{info, next_seq_++}); }

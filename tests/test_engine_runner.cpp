@@ -1133,6 +1133,51 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     CHECK(runner.checkInvariants(&why));
 }
 
+TEST_CASE("runner: requests that would push a level total past INT64_MAX are rejected to their sender") {
+    // 一个网关的合法大单不能让价位总量溢出、进而让其他网关的 FOK 被误撤
+    EngineRunner<> runner(testConfig(2));
+    runner.addSymbol("AAA", 0, 64);
+    runner.start();
+    SyncDriver<EngineRunner<>> d(runner);
+    constexpr Qty kP62 = Qty{1} << 62;
+
+    const OrderRequest s1 = limitReq(1, Side::Sell, 100, kP62, 1);
+    Hdr h = d.submit(0, 0, s1);
+    CHECK_STREAM(d.drain(0), evAccepted(h, s1));
+    h = d.submit(0, 0, limitReq(2, Side::Sell, 100, kP62, 2));
+    CHECK_STREAM(d.drain(0), evRejected(h, 2, RequestType::New, RejectReason::InvalidQuantity));
+
+    // 网关 1 的 FOK（不启用 STP 与 CancelMaker）照常成交；maker 一侧的 Fill 发给网关 0
+    OrderRequest f3 = limitReq(3, Side::Buy, 100, 10, 9);
+    f3.tif = TimeInForce::FOK;
+    h = d.submit(1, 0, f3);
+    CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 1, 100, 10, kP62 - 10));
+    CHECK_STREAM(d.drain(1), evAccepted(h, f3), evFill(h, 3, Liquidity::Taker, 1, 100, 10, 0));
+    OrderRequest f4 = limitReq(4, Side::Buy, 100, 10, 9, StpMode::CancelMaker);
+    f4.tif = TimeInForce::FOK;
+    h = d.submit(1, 0, f4);
+    CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 2, 100, 10, kP62 - 20));
+    CHECK_STREAM(d.drain(1), evAccepted(h, f4), evFill(h, 4, Liquidity::Taker, 2, 100, 10, 0));
+
+    // 改单加量同样受限：被拒的改单不改变订单与归属；恰好到上限的改单生效
+    const OrderRequest s5 = limitReq(5, Side::Sell, 100, 1, 1);
+    h = d.submit(0, 0, s5);
+    CHECK_STREAM(d.drain(0), evAccepted(h, s5));
+    h = d.modify(0, 0, 5, 100, kP62 + 20);
+    CHECK_STREAM(d.drain(0), evRejected(h, 5, RequestType::Modify, RejectReason::InvalidQuantity));
+    h = d.modify(0, 0, 5, 100, kP62 + 19);
+    CHECK_STREAM(d.drain(0), evModified(h, 5, 100, kP62 + 19));
+    CHECK_SILENT(d.drain(1));
+
+    runner.stop();
+    CHECK_EQ(runner.engine().book(0).volumeAt(Side::Sell, 100), kMaxLevelQty);
+    CHECK(runner.ownerOf(0, 1) == std::optional<GatewayId>(0));
+    CHECK(runner.ownerOf(0, 5) == std::optional<GatewayId>(0));
+    CHECK(!runner.ownerOf(0, 2).has_value());
+    std::string why;
+    CHECK(runner.checkInvariants(&why));
+}
+
 TEST_CASE("runner: multi-symbol routing keeps books and owners separate") {
     EngineRunner<> runner(testConfig(3));
     const SymbolId A = runner.addSymbol("AAA");

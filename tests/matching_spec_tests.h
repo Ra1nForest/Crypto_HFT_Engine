@@ -329,6 +329,75 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         }
         CHECK_EQ(h.book.orderCount(), 6u);
     });
+
+    add("validation: a GTC order that would push its level total past INT64_MAX is rejected", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        const OrderRequest a1 = sell(1, 100, kMax - 10).account(kA);
+        PLACE(h, a1);
+        const StateSnapshot before = snapshotOf(h.book);
+        CHECK_EVENTS(h.submit(sell(2, 100, 11).account(kB)), rejectedNew(2, RR::InvalidQuantity));
+        CHECK_EVENTS(h.submit(sell(3, 100, kMax).account(kB)), rejectedNew(3, RR::InvalidQuantity));
+        CHECK_EVENTS(h.submit(sell(4, 100, 11).postOnly().account(kB)), rejectedNew(4, RR::InvalidQuantity));
+        CHECK_UNCHANGED(before, h.book);
+        // 恰好达到上限：接受；之后这一档再多一手也不行
+        const OrderRequest a5 = sell(5, 100, 10).account(kB);
+        CHECK_EVENTS(h.submit(a5), accepted(a5));
+        CHECK_DEPTH(h.book, S::Sell, {100, kMax, 2});
+        CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1), infoOf(a5));
+        CHECK_EVENTS(h.submit(sell(6, 100, 1).account(kC)), rejectedNew(6, RR::InvalidQuantity));
+        // 买盘同理
+        PLACE(h, buy(7, 99, kMax).account(kC));
+        CHECK_EVENTS(h.submit(buy(8, 99, 1).account(kD)), rejectedNew(8, RR::InvalidQuantity));
+        CHECK_DEPTH(h.book, S::Buy, {99, kMax, 1});
+        // 上限按档位计算：同一侧的其他价位不受影响；被拒的 id 也没有被占用
+        const OrderRequest a2 = sell(2, 101, kMax).account(kB);
+        CHECK_EVENTS(h.submit(a2), accepted(a2));
+        const OrderRequest b8 = buy(8, 98, kMax).account(kD);
+        CHECK_EVENTS(h.submit(b8), accepted(b8));
+        CHECK_DEPTH(h.book, S::Sell, {100, kMax, 2}, {101, kMax, 1});
+        CHECK_DEPTH(h.book, S::Buy, {99, kMax, 1}, {98, kMax, 1});
+        CHECK_EQ(h.book.lastTradeId(), 0u);
+    });
+
+    add("validation: the level total bound is checked after duplicate id and capacity", __LINE__, [] {
+        // 上限触发时本侧在该价位已有档位：价格必然为正、订单也不可能穿价，所以它与 InvalidPrice、
+        // PostOnlyWouldCross 永远不会同时成立；能与它同时成立、决定先后的只有重复 id 与容量规则
+        H h(2);
+        constexpr Qty kMax = kMaxLevelQty;
+        PLACE(h, sell(1, 100, kMax).account(kA));
+        CHECK_EVENTS(h.submit(sell(1, 100, 1).account(kB)), rejectedNew(1, RR::DuplicateOrderId));
+        CHECK_EVENTS(h.submit(sell(2, 100, 1).account(kB)), rejectedNew(2, RR::InvalidQuantity));
+        PLACE(h, buy(3, 90, 1).account(kB));
+        CHECK_EVENTS(h.submit(sell(2, 100, 1).account(kB)), rejectedNew(2, RR::CapacityExceeded));
+        CHECK_EVENTS(h.submit(sell(4, 100, 1).postOnly().account(kB)), rejectedNew(4, RR::CapacityExceeded));
+        CHECK_EQ(h.book.orderCount(), 2u);
+    });
+
+    add("validation: orders that never rest are not subject to the level total bound", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        PLACE(h, sell(1, 100, kMax).account(kA));
+        PLACE(h, buy(2, 99, kMax).account(kA));
+        // IOC / FOK / 市价单不会挂单：本侧该价位已满也照常接受
+        const OrderRequest i3 = sell(3, 100, kMax).ioc().account(kB);
+        CHECK_EVENTS(h.submit(i3), accepted(i3), cancelled(3, kMax, CR::IocRemainder));
+        const OrderRequest f4 = buy(4, 99, kMax).fok().account(kB);
+        CHECK_EVENTS(h.submit(f4), accepted(f4), cancelled(4, kMax, CR::FokUnfillable));
+        const OrderRequest m5 = marketSell(5, 2).account(kB);
+        CHECK_EVENTS(h.submit(m5), accepted(m5), trade(1, 2, 5, kA, kB, S::Sell, 99, 2, kMax - 2, 0));
+        // 会穿价的限价 GTC：本侧在它的价格上不可能已有档位（盘口不交叉），剩余量挂成新的一档
+        const OrderRequest b6 = buy(6, 101, kMax).account(kB);
+        CHECK_EVENTS(h.submit(b6), accepted(b6), trade(2, 1, 6, kA, kB, S::Buy, 100, kMax, 0, 0));
+        PLACE(h, sell(7, 100, 5).account(kA));
+        const OrderRequest b8 = buy(8, 100, kMax).account(kC);
+        CHECK_EVENTS(h.submit(b8), accepted(b8), trade(3, 7, 8, kA, kC, S::Buy, 100, 5, 0, kMax - 5));
+        CHECK_DEPTH(h.book, S::Buy, {100, kMax - 5, 1}, {99, kMax - 2, 1});
+        CHECK_EVENTS(h.submit(buy(9, 100, 6).account(kD)), rejectedNew(9, RR::InvalidQuantity));
+        const OrderRequest b10 = buy(10, 100, 5).account(kD);
+        CHECK_EVENTS(h.submit(b10), accepted(b10));
+        CHECK_DEPTH(h.book, S::Buy, {100, kMax, 2}, {99, kMax - 2, 1});
+    });
 }
 
 // ============================================================================
@@ -803,6 +872,49 @@ void registerFokSpecs(const SpecRegistrar& add) {
         const OrderRequest t = marketBuy(3, 1).fok().account(kA).stp(SM::CancelMaker);
         CHECK_EVENTS(h.submit(t), accepted(t), cancelled(3, 1, CR::FokUnfillable));
         CHECK_UNCHANGED(before, h.book);
+    });
+
+    add("fok: a level holding INT64_MAX in total fills FOK orders with and without STP", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        constexpr Qty kP62 = Qty{1} << 62;
+        PLACE(h, sell(1, 100, kP62).account(kA));
+        // 第二张 2^62 会让档位总量超过 INT64_MAX：拒单；补上 2^62 - 1 恰好到 INT64_MAX
+        CHECK_EVENTS(h.submit(sell(2, 100, kP62).account(kB)), rejectedNew(2, RR::InvalidQuantity));
+        PLACE(h, sell(3, 100, kP62 - 1).account(kB));
+        CHECK_DEPTH(h.book, S::Sell, {100, kMax, 2});
+        const OrderRequest f4 = buy(4, 100, 10).fok().account(kC);
+        CHECK_EVENTS(h.submit(f4), accepted(f4), trade(1, 1, 4, kA, kC, S::Buy, 100, 10, kP62 - 10, 0));
+        const OrderRequest f5 = buy(5, 100, 10).fok().account(kC).stp(SM::CancelMaker);
+        CHECK_EVENTS(h.submit(f5), accepted(f5), trade(2, 1, 5, kA, kC, S::Buy, 100, 10, kP62 - 20, 0));
+        // 整档还剩 INT64_MAX - 20：多要一手就整单撤销，正好这么多就全部成交
+        const StateSnapshot before = snapshotOf(h.book);
+        const OrderRequest f6 = buy(6, 100, kMax - 19).fok().account(kC);
+        CHECK_EVENTS(h.submit(f6), accepted(f6), cancelled(6, kMax - 19, CR::FokUnfillable));
+        const OrderRequest f7 = marketBuy(7, kMax - 19).fok().account(kC).stp(SM::CancelTaker);
+        CHECK_EVENTS(h.submit(f7), accepted(f7), cancelled(7, kMax - 19, CR::FokUnfillable));
+        CHECK_UNCHANGED(before, h.book);
+        const OrderRequest f8 = buy(8, 100, kMax - 20).fok().account(kC);
+        CHECK_EVENTS(h.submit(f8), accepted(f8), trade(3, 1, 8, kA, kC, S::Buy, 100, kP62 - 20, 0, kP62 - 1),
+                     trade(4, 3, 8, kB, kC, S::Buy, 100, kP62 - 1, 0, 0));
+        CHECK_EQ(h.book.orderCount(), 0u);
+    });
+
+    add("fok: the pre-check counts down across several full levels", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        PLACE(h, sell(1, 100, kMax - 5).account(kA));
+        PLACE(h, sell(2, 101, kMax).account(kB));
+        PLACE(h, sell(3, 102, kMax).account(kC));
+        // 整侧总量远超 INT64_MAX；预检从 INT64_MAX 倒数，跨档也不溢出
+        const OrderRequest f4 = buy(4, 102, kMax).fok().account(kD);
+        CHECK_EVENTS(h.submit(f4), accepted(f4), trade(1, 1, 4, kA, kD, S::Buy, 100, kMax - 5, 0, 5),
+                     trade(2, 2, 4, kB, kD, S::Buy, 101, 5, kMax - 5, 0));
+        // CancelMaker 跳过本账户的一整档，下一档正好够
+        const OrderRequest f5 = buy(5, 102, kMax).fok().account(kB).stp(SM::CancelMaker);
+        CHECK_EVENTS(h.submit(f5), accepted(f5), cancelled(2, kMax - 5, CR::SelfTradePrevention),
+                     trade(3, 3, 5, kC, kB, S::Buy, 102, kMax, 0, 0));
+        CHECK_EQ(h.book.orderCount(), 0u);
     });
 }
 
@@ -1339,6 +1451,63 @@ void registerModifySpecs(const SpecRegistrar& add) {
                      trade(1, 2, 1, kB, kA, S::Buy, 104, 1, 0, 49));
         CHECK_ORDER(h.book, 1, orderInfo(1, kA, S::Buy, 104, 49));
         CHECK_EQ(h.book.orderCount(), 1u);
+    });
+
+    add("modify: a quantity increase that would push the level total past INT64_MAX is rejected", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        const OrderRequest a1 = sell(1, 100, kMax - 10).account(kA);
+        const OrderRequest a2 = sell(2, 100, 5).account(kB);
+        const OrderRequest a3 = sell(3, 100, 1).account(kC);
+        PLACE(h, a1);
+        PLACE(h, a2);
+        PLACE(h, a3);
+        const StateSnapshot before = snapshotOf(h.book);
+        // 其他订单共 INT64_MAX - 9：2 号单最多加到 9（它自己原来的 5 不计入）
+        CHECK_EVENTS(h.modify(2, 100, 10), rejectedModify(2, RR::InvalidQuantity));
+        CHECK_EVENTS(h.modify(2, 100, kMax), rejectedModify(2, RR::InvalidQuantity));
+        CHECK_UNCHANGED(before, h.book);  // 被拒的改单保留原队列位置
+        CHECK_EVENTS(h.modify(2, 100, 9), modified(2, 100, 9));
+        CHECK_DEPTH(h.book, S::Sell, {100, kMax, 3});
+        CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1), infoOf(a3), infoOf(a2, 9));
+        // 原地减量从不受限；减量空出来的数量可以再加回去
+        CHECK_EVENTS(h.modify(1, 100, kMax - 12), modified(1, 100, kMax - 12));
+        CHECK_EVENTS(h.modify(3, 100, 4), rejectedModify(3, RR::InvalidQuantity));
+        CHECK_EVENTS(h.modify(3, 100, 3), modified(3, 100, 3));
+        CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1, kMax - 12), infoOf(a2, 9), infoOf(a3, 3));
+        CHECK_DEPTH(h.book, S::Sell, {100, kMax, 3});
+        // 独占一档的订单可以加到 INT64_MAX
+        const OrderRequest b4 = buy(4, 90, 1).account(kD);
+        PLACE(h, b4);
+        CHECK_EVENTS(h.modify(4, 90, kMax), modified(4, 90, kMax));
+        CHECK_ORDER(h.book, 4, infoOf(b4, kMax));
+    });
+
+    add("modify: a price change onto a level whose total would pass INT64_MAX is rejected", __LINE__, [] {
+        H h;
+        constexpr Qty kMax = kMaxLevelQty;
+        PLACE(h, buy(1, 100, kMax - 3).account(kA));
+        PLACE(h, buy(2, 98, 4).account(kB));
+        PLACE(h, sell(3, 105, 1).account(kC));
+        const StateSnapshot before = snapshotOf(h.book);
+        CHECK_EVENTS(h.modify(2, 100, 4), rejectedModify(2, RR::InvalidQuantity));
+        CHECK_EVENTS(h.modify(2, 100, kMax), rejectedModify(2, RR::InvalidQuantity));
+        CHECK_UNCHANGED(before, h.book);
+        // 数量减到 3 才放得下：恰好到 INT64_MAX
+        CHECK_EVENTS(h.modify(2, 100, 3), modified(2, 100, 3));
+        CHECK_DEPTH(h.book, S::Buy, {100, kMax, 2});
+        CHECK_ORDER(h.book, 2, orderInfo(2, kB, S::Buy, 100, 3));
+        // 改到没有档位的价格只受订单自身数量的限制；改回满档价位时只看目标档位的现有总量
+        CHECK_EVENTS(h.modify(1, 99, kMax), modified(1, 99, kMax));
+        CHECK_DEPTH(h.book, S::Buy, {100, 3, 1}, {99, kMax, 1});
+        CHECK_EVENTS(h.modify(1, 100, kMax - 2), rejectedModify(1, RR::InvalidQuantity));
+        // 穿价的改价：本侧在新价格上不可能已有档位，成交后剩余量挂成新的一档
+        CHECK_EVENTS(h.modify(2, 105, kMax), modified(2, 105, kMax),
+                     trade(1, 3, 2, kC, kB, S::Buy, 105, 1, 0, kMax - 1));
+        CHECK_DEPTH(h.book, S::Buy, {105, kMax - 1, 1}, {99, kMax, 1});
+        CHECK_EVENTS(h.modify(1, 105, 2), rejectedModify(1, RR::InvalidQuantity));
+        CHECK_EVENTS(h.modify(1, 105, 1), modified(1, 105, 1));
+        CHECK_DEPTH(h.book, S::Buy, {105, kMax, 2});
     });
 }
 
