@@ -74,8 +74,9 @@ inline std::string usageText(const std::string& program) {
            "                        lowest queue latency (microseconds), but one CPU core stays at 100%\n"
            "  -h, --help            show this help and exit\n"
            "\n"
-           "Ctrl+C or SIGTERM stops the monitor gracefully and prints the final report (a second signal exits\n"
-           "immediately). Logs are appended to logs/arb_<date>.log under the current directory.\n";
+           "Ctrl+C or SIGTERM stops the monitor gracefully and prints the final report. A repeated Ctrl+C or\n"
+           "SIGTERM within 1 s counts as the same request (wrappers such as timeout forward it); a later one\n"
+           "exits immediately. Logs are appended to logs/arb_<date>.log under the current directory.\n";
 }
 
 namespace app_detail {

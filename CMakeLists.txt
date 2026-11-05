@@ -86,6 +86,10 @@ if(HFT_BUILD_TESTS)
     hft_add_test(test_feed_integration market_data)
     hft_add_test(test_mock_exchange market_data)
     hft_add_test(test_app market_data)
+    # test_app 的信号处理测试运行同一构建目录中的主程序：先构建它，测试不会用到旧的二进制
+    if(TARGET test_app)
+        add_dependencies(test_app crypto_hft_engine)
+    endif()
 endif()
 
 # 基准测试：输出到构建目录，不会弄脏 benchmark/

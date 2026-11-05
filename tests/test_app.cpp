@@ -26,9 +26,11 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -2760,6 +2762,263 @@ TEST_CASE("app: --duration ends the run on time even while every venue keeps fai
         CHECK(app.feed(i).status() == FeedStatus::Stopped);
     }
     CHECK_EQ(app.detector().getTotalSignals(), 0u);
+}
+
+// ============================================================================
+// 主程序的信号处理：运行真实的 crypto_hft_engine 子进程
+// ============================================================================
+
+// 与测试程序同一构建目录中的主程序（CMake 让 test_app 依赖它）
+std::string engineBinary() {
+    std::error_code ec;
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? std::string("./crypto_hft_engine") : (self.parent_path() / "crypto_hft_engine").string();
+}
+
+// /proc/<pid>/status 中的信号掩码（SigPnd、ShdPnd、SigCgt ...，十六进制）；读不到时为 0
+std::uint64_t procSignalMask(pid_t pid, const std::string& field) {
+    std::ifstream f("/proc/" + std::to_string(pid) + "/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, field.size() + 1, field + ":") == 0) return std::stoull(line.substr(field.size() + 1), nullptr, 16);
+    }
+    return 0;
+}
+
+bool maskHas(std::uint64_t mask, int sig) { return ((mask >> (sig - 1)) & 1u) != 0; }
+
+// crypto_hft_engine 子进程：stdout 与 stderr 合并到一个 PipeReader，工作目录 cwd（日志写到 cwd/logs），
+// 放在自己的进程组里。
+class EngineProcess {
+public:
+    struct Options {
+        std::vector<std::string> args;
+        std::string cwd;
+        int pipe_capacity = 4096;
+        bool prefill = false;  // 启动前写满管道（且不读）：子进程的第一次输出（启动横幅）就阻塞
+    };
+
+    explicit EngineProcess(const Options& o) : out_(o.pipe_capacity, !o.prefill) {
+        if (o.prefill) {
+            const std::string filler(static_cast<std::size_t>(out_.capacity()), '.');
+            if (::write(out_.writeFd(), filler.data(), filler.size()) != static_cast<ssize_t>(filler.size())) {
+                throw std::runtime_error("cannot fill the pipe");
+            }
+        }
+        const std::string bin = engineBinary();
+        std::vector<std::string> args = {bin};
+        args.insert(args.end(), o.args.begin(), o.args.end());
+        std::vector<char*> argv;
+        for (std::string& a : args) argv.push_back(a.data());
+        argv.push_back(nullptr);
+        const int wfd = out_.writeFd();
+        pid_ = ::fork();
+        if (pid_ < 0) throw std::runtime_error("fork failed");
+        if (pid_ == 0) {
+            // 子进程：exec 之前只调用 async-signal-safe 的函数
+            ::setpgid(0, 0);
+            for (int sig : {SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGCONT, SIGPIPE}) ::signal(sig, SIG_DFL);
+            sigset_t none;
+            sigemptyset(&none);
+            ::sigprocmask(SIG_SETMASK, &none, nullptr);
+            ::dup2(wfd, STDOUT_FILENO);
+            ::dup2(wfd, STDERR_FILENO);
+            if (::chdir(o.cwd.c_str()) != 0) ::_exit(126);
+            ::execv(bin.c_str(), argv.data());
+            ::_exit(127);
+        }
+        ::setpgid(pid_, pid_);  // 父进程也设一次：不论谁先执行，信号发出之前进程组都已建立
+        out_.closeWriteEnd();
+    }
+
+    ~EngineProcess() {
+        if (pid_ > 0 && !reaped_) {
+            ::kill(pid_, SIGKILL);
+            int st = 0;
+            ::waitpid(pid_, &st, 0);
+        }
+    }
+
+    EngineProcess(const EngineProcess&) = delete;
+    EngineProcess& operator=(const EngineProcess&) = delete;
+
+    pid_t pid() const noexcept { return pid_; }
+    PipeReader& output() noexcept { return out_; }
+
+    // 子进程已安装 sig 的处理函数（/proc 的 SigCgt）
+    bool waitCaught(int sig, int timeout_ms) const {
+        return waitFor([&] { return maskHas(procSignalMask(pid_, "SigCgt"), sig); }, timeout_ms, 2);
+    }
+
+    // 发送 sig 并等到它被取走（不再挂起），之后再发的同一信号不会与它合并
+    bool signalTaken(int sig, int timeout_ms) const {
+        if (::kill(pid_, sig) != 0) return false;
+        return waitFor(
+            [&] { return !maskHas(procSignalMask(pid_, "ShdPnd"), sig) && !maskHas(procSignalMask(pid_, "SigPnd"), sig); },
+            timeout_ms, 1);
+    }
+
+    // 等待退出，返回 waitpid 的状态；超时返回 -1
+    int waitExit(int timeout_ms) {
+        int st = 0;
+        const bool done = waitFor(
+            [&] {
+                const pid_t r = ::waitpid(pid_, &st, WNOHANG);
+                return r == pid_;
+            },
+            timeout_ms, 5);
+        if (!done) return -1;
+        reaped_ = true;
+        return st;
+    }
+
+private:
+    PipeReader out_;
+    pid_t pid_ = -1;
+    bool reaped_ = false;
+};
+
+// 子进程的临时工作目录与配置：所有交易所都连不上（端口已关闭）、退避 30 s，没有任何数据
+struct EngineSandbox {
+    TempPath dir{"test_app_engine"};
+    std::string config;
+
+    explicit EngineSandbox(int refresh_ms) {
+        fs::create_directories(dir.path);
+        const std::string port = jsonString(closedPort());
+        ConfigText t;
+        for (const char* v : {"binance", "okx", "bybit"}) t.set(v, "host", "\"127.0.0.1\"").set(v, "port", port);
+        t.set("binance", "rest_host", "\"127.0.0.1\"").set("binance", "rest_port", port);
+        t.set("connection", "reconnect_initial_ms", "30000").set("connection", "reconnect_max_ms", "30000");
+        t.set("display", "refresh_ms", std::to_string(refresh_ms));
+        config = (dir.path / "config.json").string();
+        std::ofstream(config, std::ios::binary) << t.str();
+    }
+
+    EngineProcess::Options options(std::vector<std::string> extra) const {
+        EngineProcess::Options o;
+        o.args = {"--config", config};
+        o.args.insert(o.args.end(), extra.begin(), extra.end());
+        o.cwd = dir.str();
+        return o;
+    }
+
+    // logs/ 下所有日志文件的内容
+    std::string logs() const {
+        std::string all;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(dir.path / "logs", ec)) all += readFile(e.path().string());
+        return all;
+    }
+};
+
+bool exitedWith(int status, int code) { return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == code; }
+
+std::string describeStatus(int status) {
+    if (status == -1) return "still running";
+    if (WIFEXITED(status)) return "exit " + std::to_string(WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) return "killed by signal " + std::to_string(WTERMSIG(status));
+    return "status " + std::to_string(status);
+}
+
+// 子进程以 code 退出，且输出里没有 sanitizer 报告（子进程与测试程序是同一种 sanitizer 构建；
+// 强制退出（_Exit）时 sanitizer 的退出码不起作用，所以检查输出）
+void checkChildExit(int status, int code, const std::string& out) {
+    CHECK(exitedWith(status, code));
+    if (!exitedWith(status, code)) std::cerr << "    child: " << describeStatus(status) << std::endl;
+    CHECK(!contains(out, "Sanitizer"));
+    CHECK(!contains(out, "runtime error:"));
+}
+
+// 光标显示着：最后一个隐藏序列之后有显示序列（或从未隐藏）
+bool cursorVisibleAtEnd(const std::string& out) {
+    const std::size_t hide = out.rfind(Display::kHideCursor);
+    return hide == std::string::npos || out.find(Display::kShowCursor, hide) != std::string::npos;
+}
+
+TEST_CASE("main: a duplicate SIGINT within 1 s (terminal plus a forwarding wrapper) still ends with the final report") {
+    // 一次 Ctrl+C 到达两次：终端发给前台进程组一次，timeout 转发一次，而且第一次已被处理（两次不会合并）。
+    // 管道事先写满，子进程装好信号处理函数后阻塞在启动横幅的输出里，两次 SIGINT 都等前一次被取走后才发出。
+    EngineSandbox box(200);
+    EngineProcess::Options o = box.options({"--headless", "--duration", "30"});
+    o.prefill = true;
+    EngineProcess p(o);
+    REQUIRE(p.waitCaught(SIGINT, 10000));
+    REQUIRE(p.signalTaken(SIGINT, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(p.signalTaken(SIGINT, 5000));
+    p.output().setReading(true);
+    const int status = p.waitExit(30000);
+    const std::string text = p.output().text();
+    checkChildExit(status, 0, text);
+    CHECK(contains(text, "Shutting down (stop requested after"));
+    CHECK(contains(text, "═══ Final Report ═══"));
+    CHECK(contains(text, "Goodbye!"));
+    CHECK(!contains(text, "second signal received"));
+    const std::string log = box.logs();
+    CHECK(contains(log, "[INFO] === Final Report ==="));
+    CHECK(contains(log, "=== Crypto HFT Engine v2.0 Stopped ==="));
+}
+
+// 停止读取之后，子进程的输出停滞了 stable_ms（管道里有数据且不再增长）：它阻塞在写 stdout 上
+bool waitOutputBlocked(const PipeReader& out, int stable_ms, int timeout_ms) {
+    const std::int64_t end = hft::nowNs() + static_cast<std::int64_t>(timeout_ms) * 1000000;
+    int last = out.buffered();
+    std::int64_t since = hft::nowNs();
+    while (hft::nowNs() < end) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const int n = out.buffered();
+        if (n != last) {
+            last = n;
+            since = hft::nowNs();
+        } else if (n > 0 && hft::nowNs() - since >= static_cast<std::int64_t>(stable_ms) * 1000000) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// TSan 构建：TSan 把线程阻塞在 libc 内部的 write（fwrite 里，不经过它的拦截函数）期间到达的信号推迟到调用返回后
+// 才交给处理函数，并把推迟期间重复到达的同一信号合并成一个
+#if defined(__SANITIZE_THREAD__)
+constexpr bool kThreadSanitizer = true;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+constexpr bool kThreadSanitizer = true;
+#else
+constexpr bool kThreadSanitizer = false;
+#endif
+#else
+constexpr bool kThreadSanitizer = false;
+#endif
+
+TEST_CASE("main: a second SIGINT more than 1 s after the first still exits at once, after restoring the cursor") {
+    // 终端界面运行中停止读取输出（如同 Ctrl+S）：
+    // - 默认：主线程卡在写一帧上（光标仍隐藏），第一次 SIGINT 的优雅退出无法进行；1.2 s 后的第二次 SIGINT 由
+    //   处理函数先写显示光标序列，再以 128 + SIGINT 退出。
+    // - TSan 构建（见 kThreadSanitizer）：refresh 2 s，在两帧之间（主线程在等待）发第一次 SIGINT，优雅退出卡在
+    //   写最终报告上（光标已由 restoreCursor 恢复）；第二次 SIGINT 同样立即退出。
+    EngineSandbox box(kThreadSanitizer ? 2000 : 50);
+    EngineProcess p(box.options({"--duration", "30"}));
+    REQUIRE(p.output().waitForText("Press Ctrl+C to exit", 10000));
+    REQUIRE(p.output().waitForText("\033[J", 5000, p.output().text().rfind("Press Ctrl+C to exit")));  // 第一帧写完
+    p.output().setReading(false);
+    if (!kThreadSanitizer) REQUIRE(waitOutputBlocked(p.output(), 300, 5000));
+    REQUIRE(p.signalTaken(SIGINT, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    REQUIRE(p.signalTaken(SIGINT, 5000));
+    p.output().setReading(true);
+    const int status = p.waitExit(10000);
+    const std::string text = p.output().text();
+    checkChildExit(status, 128 + SIGINT, text);
+    CHECK(contains(text, "[Signal] second signal received, exiting immediately"));
+    CHECK(contains(text, Display::kHideCursor));
+    CHECK(cursorVisibleAtEnd(text));
+    if (!kThreadSanitizer) {
+        // 光标由处理函数恢复：显示序列 + 换行紧接在提示之前，之后没有最终报告
+        CHECK(contains(text, std::string(Display::kShowCursor) + "\n[Signal] second signal received"));
+        CHECK(!contains(text, "Final Report"));
+    }
 }
 
 }  // namespace
