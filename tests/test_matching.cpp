@@ -365,12 +365,39 @@ struct Coverage {
         }
     }
 
+    // 档位总量上限：被上限拒绝的新单 / 改单（数量为正的 InvalidQuantity），以及限价 GTC 新单或生效的改单
+    // 之后所在档位恰好等于上限
+    template <class Book>
+    void classifyLevelBound(const Command& cmd, const PreState& pre, const std::vector<Event>& ev, const Book& book) {
+        if (ev.empty() || cmd.type == RequestType::Cancel) return;
+        const Event& first = ev[0];
+        const bool positive_qty = cmd.type == RequestType::New ? cmd.order.qty > 0 : cmd.qty > 0;
+        if (first.kind == Event::Kind::Rejected && first.reject_reason == RejectReason::InvalidQuantity && positive_qty) {
+            hit(cmd.type == RequestType::New ? "bound/reject_new" : "bound/reject_modify");
+            return;
+        }
+        const OrderRequest& r = cmd.order;
+        if (cmd.type == RequestType::New && first.kind == Event::Kind::Accepted && r.type == OrderType::Limit &&
+            r.tif == TimeInForce::GTC && book.volumeAt(r.side, r.price) == kMaxLevelQty)
+            hit("bound/level_at_max");
+        if (cmd.type == RequestType::Modify && first.kind == Event::Kind::Modified && pre.target &&
+            book.volumeAt(pre.target->side, cmd.price) == kMaxLevelQty)
+            hit("bound/level_at_max");
+    }
+
     std::string summary() const {
         std::string s;
         for (const auto& [key, n] : counts) s += "    " + key + " = " + std::to_string(n) + "\n";
         return s;
     }
 };
+
+// 档位总量上限的分支（Coverage::classifyLevelBound 的键）：极端数量的随机流必须全部触发过
+const std::vector<const char*>& requiredLevelBoundBranches() {
+    static const std::vector<const char*> kRequired = {"bound/reject_new", "bound/reject_modify",
+                                                        "bound/level_at_max"};
+    return kRequired;
+}
 
 // 随机流必须触发过的全部规则分支（Coverage::classify 的键）
 const std::vector<const char*>& requiredBranches() {
@@ -389,13 +416,16 @@ const std::vector<const char*>& requiredBranches() {
     return kRequired;
 }
 
-// 逐个报告从未触发过的分支；有遗漏时打印完整覆盖统计
-void checkAllBranchesExercised(const Coverage& cov, const char* file, int line) {
+// 逐个报告从未触发过的分支（requiredBranches() 加上 extra）；有遗漏时打印完整覆盖统计
+void checkAllBranchesExercised(const Coverage& cov, const char* file, int line,
+                               const std::vector<const char*>& extra = {}) {
     bool all = true;
-    for (const char* key : requiredBranches()) {
-        if (cov.get(key) == 0) {
-            all = false;
-            ::hft_test::reportFailure(file, line, std::string("branch never exercised: ") + key);
+    for (const std::vector<const char*>* keys : {&requiredBranches(), &extra}) {
+        for (const char* key : *keys) {
+            if (cov.get(key) == 0) {
+                all = false;
+                ::hft_test::reportFailure(file, line, std::string("branch never exercised: ") + key);
+            }
         }
     }
     if (!all) std::printf("%s", cov.summary().c_str());
@@ -1001,6 +1031,17 @@ void mutateLargeQty(Command& c, Mutator&) {
     if (c.type == RequestType::Modify && c.qty > 0) c.qty *= kScale;
 }
 
+// 极端数量：八成新单与改单的数量改成 kUnit = INT64_MAX / 7 的 1~7 倍（7 个单位恰好是 INT64_MAX），
+// 同一价位两三张挂单的总量就会恰好到达、或将要超过档位总量上限 kMaxLevelQty；其余保留原来的小数量
+// （非法数量保持非法），部分成交后的剩余量于是不再是单位的整数倍，"离上限只差几手"也常出现
+void mutateExtremeQty(Command& c, Mutator& m) {
+    constexpr Qty kUnit = kMaxLevelQty / 7;
+    static_assert(kUnit * 7 == kMaxLevelQty, "INT64_MAX is a multiple of 7");
+    Qty* q = c.type == RequestType::New ? &c.order.qty : c.type == RequestType::Modify ? &c.qty : nullptr;
+    if (q == nullptr || *q <= 0 || m.chance(0.2)) return;
+    *q = kUnit * m.range(1, 7);
+}
+
 // 差分测试场景：生成器参数 + 订单簿参数 + 可选的命令改写
 struct DiffProfile {
     const char* name;
@@ -1053,6 +1094,8 @@ std::vector<DiffProfile> diffProfiles() {
         {"edge ids and accounts", 9000, 6, 200'000, 0, 1024, GeneratorConfig(), mutateEdgeIds},
         {"large quantities", 9500, 6, 200'000, 0, 1024,
          makeConfig([](GeneratorConfig& c) { c.aggressive_ticks = 10; }), mutateLargeQty},
+        {"extreme quantities", 9700, 6, 200'000, 0, 1024,
+         makeConfig([](GeneratorConfig& c) { c.aggressive_ticks = 10; }), mutateExtremeQty},
     };
 }
 
@@ -1099,7 +1142,10 @@ std::string runDifferential(const DiffProfile& p, std::uint64_t seed, std::size_
                                "event streams differ (expected = reference, actual = optimized):\n" + why);
         if (!checkCommandEvents(cmd, pre, actual, opt.book, p.max_orders, &why))
             return diffFailure(p, seed, i, cmd, expected, actual, "event stream check: " + why);
-        if (cov != nullptr) cov->classify(cmd, pre, actual);
+        if (cov != nullptr) {
+            cov->classify(cmd, pre, actual);
+            cov->classifyLevelBound(cmd, pre, actual, opt.book);
+        }
         totals.peak_orders = std::max(totals.peak_orders, opt.book.orderCount());
         if (i % 64 == 63 || i + 1 == commands) {
             if (!opt.book.checkInvariants(&why))
@@ -1159,7 +1205,7 @@ void runDiffSuite(std::uint64_t seed_offset, std::size_t seed_multiplier, bool e
         CHECK_GE(all.runs, 40u);
         CHECK_GE(all.commands, 5'000'000u);
     }
-    checkAllBranchesExercised(cov, __FILE__, __LINE__);
+    checkAllBranchesExercised(cov, __FILE__, __LINE__, requiredLevelBoundBranches());
 }
 
 }  // namespace
@@ -1208,6 +1254,44 @@ TEST_CASE("optimized/differential: identical events and state vs the naive model
             }
         }
     }
+}
+
+TEST_CASE("differential/reference vs naive: level totals at the INT64_MAX bound") {
+    // 两个预言机用不同写法实现档位总量上限（参考模型：上限减去现有总量；朴素模型：逐单求和并检测加法溢出，
+    // 改单时按 id 排除订单自己），在极端数量的随机流上事件流与簿状态必须逐条一致
+    Coverage cov;
+    for (const std::uint64_t seed : {121, 122, 123}) {
+        RandomCommandGenerator gen(seed);
+        Mutator mutator(seed);
+        Stepper<RefBook> ref;
+        Stepper<NaiveBook> naive;
+        for (std::size_t i = 0; i < 15'000; ++i) {
+            Command cmd = gen.next();
+            mutateExtremeQty(cmd, mutator);
+            const PreState pre = capturePre(ref.book, cmd);
+            const std::vector<Event> expected = ref.run(cmd);
+            const std::vector<Event> actual = naive.run(cmd);
+            const std::string where = "seed " + std::to_string(seed) + " command #" + std::to_string(i) + " " +
+                                      cmd.toString() + "\n    reference events: " + str(expected) + "\n    ";
+            std::string why;
+            if (!sameEvents(actual, expected, &why)) FAIL(where + "naive diverged from reference:\n" + why);
+            if (!checkCommandEvents(cmd, pre, expected, ref.book, 0, &why)) FAIL(where + "event stream: " + why);
+            cov.classifyLevelBound(cmd, pre, expected, ref.book);
+            if (i % 16 == 15) {
+                if (!ref.book.checkInvariants(&why)) FAIL(where + "reference: " + why);
+                if (!naive.book.checkInvariants(&why)) FAIL(where + "naive: " + why);
+                if (!sameState(ref.book, naive.book, &why)) FAIL(where + "state differs: " + why);
+                if (!queriesConsistent(naive.book, &why)) FAIL(where + "naive queries: " + why);
+            }
+        }
+    }
+    for (const char* key : requiredLevelBoundBranches()) {
+        if (cov.get(key) == 0) ::hft_test::reportFailure(__FILE__, __LINE__, std::string("branch never exercised: ") + key);
+    }
+    std::printf("    bound rejections: %llu new, %llu modify; %llu commands left a level at exactly INT64_MAX\n",
+                static_cast<unsigned long long>(cov.get("bound/reject_new")),
+                static_cast<unsigned long long>(cov.get("bound/reject_modify")),
+                static_cast<unsigned long long>(cov.get("bound/level_at_max")));
 }
 
 // ============================================================================
@@ -1296,6 +1380,7 @@ TEST_CASE("optimized: listeners observe exactly the reference book state during 
         {33, makeConfig([](GeneratorConfig& c) { c.max_live = 80; c.weight_modify = 45; }), nullptr},
         {34, makeConfig([](GeneratorConfig& c) { c.max_live = 80; c.aggressive_ticks = 10; }), mutateFokIoc},
         {35, makeConfig([](GeneratorConfig& c) { c.max_live = 80; c.aggressive_ticks = 20; }), mutateAggressive},
+        {36, makeConfig([](GeneratorConfig& c) { c.max_live = 80; c.aggressive_ticks = 10; }), mutateExtremeQty},
     };
     std::size_t callbacks = 0;
     for (const Run& run : runs) {
