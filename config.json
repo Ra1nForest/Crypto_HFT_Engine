@@ -3,8 +3,11 @@
         "enabled": true,
         "host": "stream.binance.com",
         "port": "9443",
-        "path": "/ws/btcusdt@depth20@100ms",
-        "symbol": "BTCUSDT"
+        "path": "/ws/btcusdt@depth@100ms",
+        "symbol": "BTCUSDT",
+        "rest_host": "api.binance.com",
+        "rest_port": "443",
+        "snapshot_path": "/api/v3/depth?symbol=BTCUSDT&limit=1000"
     },
     "okx": {
         "enabled": true,
@@ -12,15 +15,32 @@
         "port": "8443",
         "path": "/ws/v5/public",
         "symbol": "BTCUSDT",
-        "subscribe": "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"books5\",\"instId\":\"BTC-USDT\"}]}"
+        "subscribe": "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}]}"
+    },
+    "bybit": {
+        "enabled": true,
+        "host": "stream.bybit.com",
+        "port": "443",
+        "path": "/v5/public/spot",
+        "symbol": "BTCUSDT",
+        "subscribe": "{\"op\":\"subscribe\",\"args\":[\"orderbook.50.BTCUSDT\"]}"
     },
     "arbitrage": {
         "fee_rate": 0.0,
-        "min_profit": 0.01
+        "min_profit": 0.01,
+        "max_qty": 0.0,
+        "max_levels": 20
     },
     "display": {
         "refresh_ms": 200,
         "levels": 5,
         "spread_log_interval": 50
+    },
+    "connection": {
+        "tls_verify": true,
+        "ca_file": "",
+        "stall_timeout_ms": 15000,
+        "reconnect_initial_ms": 500,
+        "reconnect_max_ms": 30000
     }
 }

@@ -1,154 +1,218 @@
 //
 // logger.h
-// 日志模块：记录系统启动、套利信号、价差与延迟统计。
+// 日志模块（线程安全）：按日期写日志文件，记录启动信息、行情源连接事件、套利信号、价差、延迟统计与最终报告。
 //
 
 #pragma once
 
 #include "arbitrage_detector.h"
+#include "display.h"
 #include "latency_tracker.h"
+#include "text_util.h"
 
-#include <string>
-#include <fstream>
-#include <iostream>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <sstream>
 #include <sys/stat.h>
+#include <sys/types.h>
 
-// 文件日志器：按日期创建日志文件，支持多种类型的记录
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// 文件日志器：
+// - 日志文件 <log_dir>/arb_<YYYY-MM-DD>.log（启动日期），追加写入；目录不存在时创建（mkdir 0755）。
+// - 线程安全：所有写入在同一把互斥锁内完成，行情线程的连接事件（logFeed）与主线程的信号日志不会交错在一行里。
+// - 每行 "<YYYY-MM-DD HH:MM:SS.mmm> [TAG] message"；消息中的控制字符（换行、ESC 等）被替换为空格，一条消息永远是一行。
+// - 刷新策略：INFO / WARN / FEED 立即刷新（少见且对排查问题重要）；SIGNAL / SPREAD / PERF 由调用方定期 flush()
+//   （主循环每个 tick，即每 refresh_ms 调用一次），避免高频信号时每行一次系统调用。
+// - 可选的控制台回显（setEcho，用于 --headless）：INFO / WARN / FEED / SIGNAL 行同时写到给定的 FILE*，
+//   整行一次 fwrite，与其他线程整行写 stdout 的输出不会交错在一行内。
 class Logger {
 public:
-    // log_dir: 日志目录，默认 logs
-    Logger(const std::string& log_dir = "logs") : log_dir_(log_dir) {
-        mkdir(log_dir_.c_str(), 0755);
-
-        std::string date = getCurrentDate();
-        std::string filepath = log_dir_ + "/arb_" + date + ".log";
-
-    // 以追加方式打开文件，避免覆盖
-    file_.open(filepath, std::ios::app);
-        
-        if (!file_.is_open()) {
-            std::cerr << "[Logger] Failed to open log file: " << filepath << std::endl;
-            return ;
+    // log_dir：日志目录；announce：是否在 stdout 打印 "[Logger] Log file: <path>"
+    explicit Logger(const std::string& log_dir = "logs", bool announce = true) : log_dir_(log_dir) {
+        if (::mkdir(log_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
+            std::cerr << "[Logger] Cannot create log directory " << log_dir_ << ": " << std::strerror(errno)
+                      << std::endl;
         }
-
-        log("=== Crypto HFT Engine Started ===");
-        log("Log file: " + filepath);
-        std::cout << "[Logger] Log file: " << filepath << std::endl;
+        path_ = log_dir_ + "/arb_" + currentDate() + ".log";
+        file_.open(path_, std::ios::app);
+        if (!file_.is_open()) {
+            std::cerr << "[Logger] Failed to open log file: " << path_ << std::endl;
+            return;
+        }
+        log(std::string("=== ") + kAppVersion + " Started ===");
+        log("Log file: " + path_);
+        if (announce) std::cout << "[Logger] Log file: " << path_ << std::endl;
     }
 
     // 析构时写入停止信息
     ~Logger() {
         if (file_.is_open()) {
-            log("=== Crypto HFT Engine Stopped ===");
+            log(std::string("=== ") + kAppVersion + " Stopped ===");
             file_.close();
         }
     }
 
-    // 通用文本日志
-    void log(const std::string& message) {
-        if (!file_.is_open()) return;
-        file_ << getTimestamp() << " [INFO] " << message << std::endl;
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+
+    bool isOpen() const noexcept { return file_.is_open(); }
+    const std::string& path() const noexcept { return path_; }
+
+    // 控制台回显目标（nullptr 关闭）
+    void setEcho(std::FILE* out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        echo_ = out;
     }
 
-    // 记录套利信号
-    void logSignal(const ArbitrageSignal& signal){
-        if (!file_.is_open()) return;
+    // 通用文本日志
+    void log(const std::string& message) { write("INFO", message, true, true); }
 
+    // 告警（如配置告警）
+    void warn(const std::string& message) { write("WARN", message, true, true); }
+
+    // 行情源连接事件（feed 线程上的日志回调，参数已是 "[name] message"）
+    void logFeed(const std::string& message) { write("FEED", message, true, true); }
+
+    // 套利信号
+    void logSignal(const ArbitrageSignal& s) {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(4);
-        ss << "SIGNAL | "
-            << " Buy " << signal.buy_exchange << " @ " << signal.buy_price
-            << " | Sell" << signal.sell_exchange << " @ " << signal.sell_price
-            << " | Qty: " << signal.quantity
-            << " | Gross: $" << signal.gross_profit
-            << " | Net: $" << signal.net_profit;
-        
-        file_ << getTimestamp() << " [SIGNAL] " << ss.str() << std::endl;
-        file_.flush();
+        ss << "SIGNAL | Buy " << s.buy_exchange << " @ " << s.buy_price << " | Sell " << s.sell_exchange << " @ "
+           << s.sell_price << " | Qty: " << s.quantity << " | VWAP: " << s.vwap_buy << " / " << s.vwap_sell
+           << " | Gross: $" << s.gross_profit << " | Fees: $" << s.fees << " | Net: $" << s.net_profit
+           << " | Levels: " << s.levels_used;
+        write("SIGNAL", ss.str(), true, false);
     }
 
-    // 记录双边价差（周期性写入）
-    void logSpread(const std::string& exchang_a, double ask_a,
-         const std::string& exchange_b, double bid_b, double diff) {
-            if (!file_.is_open()) return;
+    // 价差：exchange_a 的卖一与 exchange_b 的买一（在 a 买、在 b 卖），diff = bid_b - ask_a
+    void logSpread(const std::string& exchange_a, double ask_a, const std::string& exchange_b, double bid_b,
+                   double diff) {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(2);
+        ss << "SPREAD | " << exchange_a << " Ask: " << ask_a << " | " << exchange_b << " Bid: " << bid_b
+           << " | Diff: $" << diff;
+        write("SPREAD", ss.str(), false, false);
+    }
 
+    // 延迟统计（微秒，一位小数）
+    void logLatency(const LatencyTracker& tracker) { write("PERF", latencyLine("LATENCY", tracker), false, false); }
+
+    // 最终报告：每个交易所的处理 / 队列 / 交易所延迟与连接统计，每个有序交易所对的信号汇总，以及总计
+    void logFinalReport(const std::vector<VenueView>& venues, const ArbitrageDetector& detector) {
+        write("INFO", "=== Final Report ===", false, false);
+        for (const VenueView& v : venues) {
+            if (v.processing != nullptr) {
+                write("PERF", latencyLine("LATENCY", *v.processing, v.name), false, false);
+            }
+            if (v.queue != nullptr) write("PERF", latencyLine("QUEUE", *v.queue, v.name), false, false);
+            if (v.exchange != nullptr) {
+                const LatencyTracker& e = *v.exchange;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(1) << "EXCHANGE | " << v.name << " | Samples: " << e.count()
+                   << " | P50: " << static_cast<double>(e.percentileNs(0.50)) / 1e6
+                   << "ms | P99: " << static_cast<double>(e.percentileNs(0.99)) / 1e6 << "ms";
+                write("PERF", ss.str(), false, false);
+            }
+            const FeedStats& st = v.stats;
             std::ostringstream ss;
-            ss << std::fixed << std::setprecision(2);
-            ss << "SPREAD | "
-                << exchang_a << " Ask: " << ask_a
-                << " | " << exchange_b << " Bid: " << bid_b
-                << " | Diff: $" << diff;
-            
-        file_ << getTimestamp() << " [SPREAD] " << ss.str() << std::endl;
-    }
-
-    // 记录延迟统计
-    void logLatency(const LatencyTracker& tracker) {
-        if (!file_.is_open()) return;
-
+            ss << "FEED | " << v.name << " | Status: " << feedStatusName(v.status) << " | Msgs: " << st.messages
+               << " | Bytes: " << st.bytes << " | Book updates: " << st.book_updates << " | Published: " << st.published
+               << " | Dropped: " << st.dropped_snapshots << " | Reconnects: " << st.reconnects
+               << " | Connect failures: " << st.connect_failures << " | Stalls: " << st.stalls << " | Gaps: " << st.gaps
+               << " | Checksum failures: " << st.checksum_failures << " | Resyncs: " << st.resyncs
+               << " | REST snapshots: " << st.rest_snapshots << " | Parse errors: " << st.parse_errors;
+            write("FEED", ss.str(), false, false);
+            if (!v.last_error.empty()) write("FEED", "FEED | " + v.name + " | Last error: " + v.last_error, false, false);
+        }
+        const std::size_t n = std::min(venues.size(), detector.venueCount());
+        for (std::size_t buy = 0; buy < n; ++buy) {
+            for (std::size_t sell = 0; sell < n; ++sell) {
+                if (buy == sell) continue;
+                const ArbitrageDetector::PairState& st = detector.pairState(buy, sell);
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << "PAIR | " << venues[buy].name << " -> " << venues[sell].name
+                   << " | Signals: " << st.signals << " | Net: $" << st.net_total << " | Fees: $" << st.fees_total
+                   << " | Best: $" << st.best_net;
+                write("SUMMARY", ss.str(), false, false);
+            }
+        }
         std::ostringstream ss;
-        ss << std::fixed << std::setprecision(2);
-        ss << "LATENCY | " << tracker.getName()
-            << " | Msgs: " << tracker.getCount()
-            << " | Avg: " << tracker.getAvg() << "μs"
-            << " | P50: " << tracker.getP50() << "μs"
-            << " | P95: " << tracker.getP95() << "μs"
-            << " | P99: " << tracker.getP99() << "μs"
-            << " | Max: " << tracker.getMax() << "μs";
-        
-        file_ << getTimestamp() << " [PERF] " << ss.str() << std::endl;
-    }
-
-    // 记录最终报告（汇总统计）
-    void logFinalReport(const LatencyTracker& lat_a, const LatencyTracker& lat_b, 
-            const ArbitrageDetector& detector) {
-        log("=== Final Report ===");
-        logLatency(lat_a);
-        logLatency(lat_b);
-
-        std::ostringstream ss;
-        ss << std::fixed << std::setprecision(2);
-        ss << "SUMMARY | Signals: " << detector.getTotalSignals()
-            << " | Net Profit: $" << detector.getTotalNetProfit();
-        file_ << getTimestamp() << " [SUMMARY] " << ss.str() << std::endl;
-
-        file_.flush();
+        ss << std::fixed << std::setprecision(2) << "SUMMARY | Signals: " << detector.getTotalSignals()
+           << " | Net Profit: $" << detector.getTotalNetProfit() << " | Fees: $" << detector.getTotalFees()
+           << " | Qty: " << std::setprecision(4) << detector.getTotalQty();
+        write("SUMMARY", ss.str(), false, true);
     }
 
     // 强制刷新缓冲区
     void flush() {
-        if (file_.is_open()) {
-            file_.flush();
-        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (file_.is_open()) file_.flush();
     }
 
 private:
-    // 日志目录与文件句柄
+    // 写一行：清洗在锁外完成；时间戳在锁内读取，保证文件中各行（来自不同线程）的时间戳单调不减
+    void write(const char* tag, const std::string& message, bool echo, bool flush_now) {
+        const std::string clean = text_util::sanitize(message);
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Stamp stamp = now();
+        const std::string line = stamp.date + " " + stamp.time + " [" + tag + "] " + clean + "\n";
+        if (file_.is_open()) {
+            file_.write(line.data(), static_cast<std::streamsize>(line.size()));
+            if (flush_now) file_.flush();
+        }
+        if (echo && echo_ != nullptr) {
+            const std::string console = stamp.time + " [" + tag + "] " + clean + "\n";
+            std::fwrite(console.data(), 1, console.size(), echo_);
+            std::fflush(echo_);
+        }
+    }
+
+    static std::string latencyLine(const char* kind, const LatencyTracker& t, const std::string& name = "") {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1) << kind << " | " << (name.empty() ? t.getName() : name)
+           << " | Msgs: " << t.count() << " | Avg: " << t.meanNs() / 1000.0
+           << "µs | P50: " << static_cast<double>(t.percentileNs(0.50)) / 1000.0
+           << "µs | P95: " << static_cast<double>(t.percentileNs(0.95)) / 1000.0
+           << "µs | P99: " << static_cast<double>(t.percentileNs(0.99)) / 1000.0
+           << "µs | Max: " << static_cast<double>(t.maxNs()) / 1000.0 << "µs";
+        return ss.str();
+    }
+
+    struct Stamp {
+        std::string date;  // YYYY-MM-DD
+        std::string time;  // HH:MM:SS.mmm
+    };
+
+    // 当前本地时间（localtime_r：线程安全）
+    static Stamp now() {
+        const auto tp = std::chrono::system_clock::now();
+        const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+        const long long ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count() % 1000;
+        std::tm tm{};
+        localtime_r(&t, &tm);
+        char date[16], time[24];
+        std::strftime(date, sizeof(date), "%Y-%m-%d", &tm);
+        const std::size_t n = std::strftime(time, sizeof(time), "%H:%M:%S", &tm);
+        std::snprintf(time + n, sizeof(time) - n, ".%03lld", ms < 0 ? 0 : ms);
+        return Stamp{date, time};
+    }
+
+    static std::string currentDate() { return now().date; }
+
     std::string log_dir_;
+    std::string path_;
+    std::mutex mutex_;          // 保护 file_ 与 echo_
     std::ofstream file_;
-
-    // 获取精确到毫秒的时间戳
-    static std::string getTimestamp() {
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds> (now.time_since_epoch()) % 1000;
-        
-        std::ostringstream ss;
-        ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
-            << "." << std::setfill('0') << std::setw(3) << ms.count();
-        return ss.str();
-    }
-
-    // 当前日期（用于按天分文件）
-    static std::string getCurrentDate() {
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        std::ostringstream ss;
-        ss << std::put_time(std::localtime(&time), "%Y-%m-%d");
-        return ss.str();
-    }
+    std::FILE* echo_ = nullptr;
 };
