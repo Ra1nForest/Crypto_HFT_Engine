@@ -1305,7 +1305,13 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
     ex.setDropRate(2, 0.02);
     std::array<std::unique_ptr<FeedRunner>, 3> feeds;
     const std::array<Exchange, 3> venues{Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT};
-    for (std::size_t i = 0; i < 3; ++i) feeds[i] = std::make_unique<FeedRunner>(feedConfig(venues[i], ex, ca.path()));
+    for (std::size_t i = 0; i < 3; ++i) {
+        FeedConfig cfg = feedConfig(venues[i], ex, ca.path());
+        // 持续丢包时 Binance 每个缺口都要拉一次 REST 快照，默认的每会话额度（rest_max_attempts = 5，簿连续同步
+        // healthy_session_ms 之后才恢复）用完就会按设计重连。本测试验证同一连接内的恢复，所以放开额度
+        cfg.rest_max_attempts = 1000;
+        feeds[i] = std::make_unique<FeedRunner>(cfg);
+    }
     std::array<BookSnapshot, 3> last{};
     auto pump = [&] {
         for (std::size_t i = 0; i < 3; ++i) {
@@ -1314,15 +1320,23 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
             feeds[i]->feed.checkHealth(hft::nowNs());
         }
     };
+    // 每家攒够缺口就不再对它丢弃。Binance 攒 6 个：同一个会话要拉 7 次 REST 快照（首次同步 + 每个缺口一次），
+    // 多于默认额度——不放开额度时这里必然重连
+    const std::array<std::uint64_t, 3> want_gaps{6, 2, 2};
     const bool gaps_seen = waitFor(
         [&] {
             pump();
-            for (const auto& f : feeds) {
-                if (f->feed.stats().gaps < 2) return false;
+            bool all = true;
+            for (std::size_t i = 0; i < 3; ++i) {
+                if (feeds[i]->feed.stats().gaps >= want_gaps[i]) {
+                    ex.setDropRate(i, 0.0);
+                } else {
+                    all = false;
+                }
             }
-            return true;
+            return all;
         },
-        20000, 2);
+        30000, 2);
     CHECK(gaps_seen);
     // 停止丢弃，让每个 feed 用干净的推送发现可能残留的缺口并完成重同步
     ex.setDropRate(0.0);
@@ -1360,15 +1374,15 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
                     static_cast<unsigned long long>(s.rest_snapshots), static_cast<unsigned long long>(net.requests),
                     static_cast<unsigned long long>(s.reconnects), feedStatusName(feeds[i]->feed.status()));
         CHECK_EQ(feeds[i]->feed.status(), FeedStatus::Live);
-        CHECK_GE(s.gaps, std::uint64_t{2});
+        CHECK_GE(s.gaps, want_gaps[i]);
         CHECK_GE(s.resyncs, s.gaps);
-        CHECK_GE(net.dropped, std::uint64_t{2});
+        CHECK_GE(net.dropped, want_gaps[i]);
         CHECK_EQ(s.checksum_failures, std::uint64_t{0});  // 缺口先于校验和被发现
         CHECK_EQ(s.parse_errors, std::uint64_t{0});
         CHECK_EQ(s.reconnects, std::uint64_t{0});          // 全部在同一连接内恢复
     }
     // Binance：每个缺口重新拉一次 REST 快照；OKX / Bybit：每个缺口一对 unsubscribe + subscribe
-    CHECK_GE(feeds[0]->feed.stats().rest_snapshots, std::uint64_t{3});
+    CHECK_GE(feeds[0]->feed.stats().rest_snapshots, std::uint64_t{1} + want_gaps[0]);
     CHECK_GE(ex.okx().counters().requests, std::uint64_t{1 + 2 * 2});
     CHECK_GE(ex.bybit().counters().requests, std::uint64_t{1 + 2 * 2});
     for (auto& f : feeds) f->stop();
