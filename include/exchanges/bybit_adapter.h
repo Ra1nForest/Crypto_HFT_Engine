@@ -10,7 +10,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -43,25 +42,6 @@ public:
     }
 
     Exchange exchange() const override { return Exchange::BYBIT; }
-
-    std::vector<std::string> onConnected() override {
-        resetState();
-        std::vector<std::string> frames;
-        if (!cfg_.subscribe_msg.empty()) frames.push_back(cfg_.subscribe_msg);
-        return frames;
-    }
-
-    void onMessage(std::string_view payload, AdapterResult& out) override {
-        ++stats_.messages;
-        try {
-            handleMessage(payload, out);
-        } catch (const std::exception& e) {
-            internalError(out, e.what());
-        } catch (...) {
-            internalError(out, "unknown exception");
-        }
-        if (out.book_updated) ++stats_.book_updates;
-    }
 
     std::string pingMessage() const override { return R"({"op":"ping"})"; }
     int pingIntervalMs() const override { return 20000; }
@@ -175,7 +155,7 @@ private:
 
     // ---------------- 处理 ----------------
 
-    void handleMessage(std::string_view payload, AdapterResult& out) {
+    void handleMessage(std::string_view payload, AdapterResult& out) override {
         Msg m;
         if (!parse(payload, m)) {
             malformed(out, "malformed message", payload.size());
@@ -290,13 +270,6 @@ private:
         }
     }
 
-    void trimBook() {
-        if (static_cast<std::size_t>(book_.getBidCount()) > adapter_detail::kMaxBookLevels ||
-            static_cast<std::size_t>(book_.getAskCount()) > adapter_detail::kMaxBookLevels) {
-            book_.truncate(adapter_detail::kMaxBookLevels);
-        }
-    }
-
     // 重同步：清空簿并发送 unsubscribe + subscribe（推导不出退订帧时要求重连）
     void resync(AdapterResult& out) {
         ++stats_.resyncs;
@@ -306,38 +279,15 @@ private:
         last_u_ = 0;
         deltas_since_snapshot_ = 0;
         unsynced_updates_ = 0;
-        if (cfg_.subscribe_msg.empty() || unsubscribe_msg_.empty()) {
-            out.reconnect = true;
-            return;
-        }
-        if (out.send.empty()) {
-            out.send.push_back(unsubscribe_msg_);
-            out.send.push_back(cfg_.subscribe_msg);
-        }
+        requestResubscribe(out, unsubscribe_msg_);
     }
 
-    void resetState() noexcept {
+    void resetState() noexcept override {
         book_.clear();
         synced_ = false;
         last_u_ = 0;
         deltas_since_snapshot_ = 0;
         unsynced_updates_ = 0;
-    }
-
-    void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
-        ++stats_.parse_errors;
-        out.error = adapter_detail::concat({"Bybit: ", what, " (", std::to_string(bytes), " bytes)"});
-    }
-
-    void internalError(AdapterResult& out, const char* what) noexcept {
-        ++stats_.parse_errors;
-        if (!book_.empty()) out.book_updated = true;
-        resetState();
-        out.reconnect = true;
-        try {
-            out.error = std::string("Bybit: internal error: ") + what;
-        } catch (...) {
-        }
     }
 
     std::string unsubscribe_msg_;

@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -45,40 +44,6 @@ public:
     }
 
     Exchange exchange() const override { return Exchange::BINANCE; }
-
-    // 新连接：重置全部协议状态；Binance 通过 URL 路径订阅，subscribe_msg 通常为空
-    std::vector<std::string> onConnected() override {
-        resetState();
-        std::vector<std::string> frames;
-        if (!cfg_.subscribe_msg.empty()) frames.push_back(cfg_.subscribe_msg);
-        return frames;
-    }
-
-    void onMessage(std::string_view payload, AdapterResult& out) override {
-        ++stats_.messages;
-        try {
-            handleMessage(payload, out);
-        } catch (const std::exception& e) {
-            internalError(out, e.what());
-        } catch (...) {
-            internalError(out, "unknown exception");
-        }
-        if (out.book_updated) ++stats_.book_updates;
-    }
-
-    // REST 深度快照响应体（feed 在 need_rest_snapshot 后调用）。拉取失败时 feed 可传入空串或错误体：
-    // 解析失败 / 错误体 {"code":..,"msg":..} → error + need_rest_snapshot（feed 退避后重试）。
-    // 未在等待快照时收到的响应体被忽略。
-    void onRestSnapshot(std::string_view body, AdapterResult& out) override {
-        try {
-            handleRestSnapshot(body, out);
-        } catch (const std::exception& e) {
-            internalError(out, e.what());
-        } catch (...) {
-            internalError(out, "unknown exception");
-        }
-        if (out.book_updated) ++stats_.book_updates;
-    }
 
     bool synced() const override { return synced_; }
 
@@ -218,7 +183,7 @@ private:
 
     // ---------------- WebSocket 消息 ----------------
 
-    void handleMessage(std::string_view payload, AdapterResult& out) {
+    void handleMessage(std::string_view payload, AdapterResult& out) override {
         Msg m;
         if (!parse(payload, m)) {
             malformed(out, "malformed message", payload.size());
@@ -313,7 +278,10 @@ private:
 
     // ---------------- REST 快照 ----------------
 
-    void handleRestSnapshot(std::string_view body, AdapterResult& out) {
+    // REST 深度快照响应体（feed 在 need_rest_snapshot 后经 onRestSnapshot 调用）。拉取失败时 feed 可传入空串或错误体：
+    // 解析失败 / 错误体 {"code":..,"msg":..} → error + need_rest_snapshot（feed 退避后重试）。
+    // 未在等待快照时收到的响应体被忽略。
+    void handleRestSnapshot(std::string_view body, AdapterResult& out) override {
         if (!awaiting_snapshot_) {
             ++stats_.ignored;
             return;
@@ -432,13 +400,6 @@ private:
         local_id_ = update_id;
     }
 
-    void trimBook() {
-        if (static_cast<std::size_t>(book_.getBidCount()) > adapter_detail::kMaxBookLevels ||
-            static_cast<std::size_t>(book_.getAskCount()) > adapter_detail::kMaxBookLevels) {
-            book_.truncate(adapter_detail::kMaxBookLevels);
-        }
-    }
-
     // 丢弃本地簿与缓冲，回到"缓冲事件 + 等待 REST 快照"阶段（之后的 bufferEvent 发起新一轮请求）
     void dropBook(AdapterResult& out) {
         if (!book_.empty()) out.book_updated = true;
@@ -491,29 +452,12 @@ private:
         event_levels_.clear();
     }
 
-    void resetState() noexcept {
+    void resetState() noexcept override {
         book_.clear();
         local_id_ = 0;
         synced_ = false;
         awaiting_snapshot_ = false;
         clearBuffer();
-    }
-
-    void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
-        ++stats_.parse_errors;
-        out.error = adapter_detail::concat({"Binance: ", what, " (", std::to_string(bytes), " bytes)"});
-    }
-
-    // 内部异常（如内存不足）：状态可能不一致，清空一切并要求重连
-    void internalError(AdapterResult& out, const char* what) noexcept {
-        ++stats_.parse_errors;
-        if (!book_.empty()) out.book_updated = true;
-        resetState();
-        out.reconnect = true;
-        try {
-            out.error = std::string("Binance: internal error: ") + what;
-        } catch (...) {
-        }
     }
 
     adapter_detail::JsonReader reader_;

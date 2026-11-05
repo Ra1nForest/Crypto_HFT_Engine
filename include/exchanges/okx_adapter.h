@@ -14,7 +14,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -58,25 +57,6 @@ public:
     }
 
     Exchange exchange() const override { return Exchange::OKX; }
-
-    std::vector<std::string> onConnected() override {
-        resetState();
-        std::vector<std::string> frames;
-        if (!cfg_.subscribe_msg.empty()) frames.push_back(cfg_.subscribe_msg);
-        return frames;
-    }
-
-    void onMessage(std::string_view payload, AdapterResult& out) override {
-        ++stats_.messages;
-        try {
-            handleMessage(payload, out);
-        } catch (const std::exception& e) {
-            internalError(out, e.what());
-        } catch (...) {
-            internalError(out, "unknown exception");
-        }
-        if (out.book_updated) ++stats_.book_updates;
-    }
 
     std::string pingMessage() const override { return "ping"; }
     int pingIntervalMs() const override { return 20000; }
@@ -259,7 +239,7 @@ private:
 
     // ---------------- 处理 ----------------
 
-    void handleMessage(std::string_view payload, AdapterResult& out) {
+    void handleMessage(std::string_view payload, AdapterResult& out) override {
         if (payload == "pong") {
             ++stats_.ignored;
             return;
@@ -503,19 +483,16 @@ private:
         out.error = "OKX: checksum verification disabled: " + why;
     }
 
-    void trimBook() {
-        const std::size_t limit = adapter_detail::kMaxBookLevels;
-        if (static_cast<std::size_t>(book_.getBidCount()) <= limit &&
-            static_cast<std::size_t>(book_.getAskCount()) <= limit) {
-            return;
-        }
+    // 裁剪簿时同步删除被裁掉档位的原始字符串（簿在上限之内时两个循环都不执行）
+    void trimBook() override {
         if (verify_) {
+            const std::size_t limit = adapter_detail::kMaxBookLevels;
             const std::vector<PriceLevel>& bids = book_.getBids();
             const std::vector<PriceLevel>& asks = book_.getAsks();
             for (std::size_t i = limit; i < bids.size(); ++i) bid_text_.erase(adapter_detail::priceKey(bids[i].price));
             for (std::size_t i = limit; i < asks.size(); ++i) ask_text_.erase(adapter_detail::priceKey(asks[i].price));
         }
-        book_.truncate(limit);
+        ExchangeAdapter::trimBook();
     }
 
     // 重同步：清空簿；增量频道发送 unsubscribe + subscribe（推导不出退订帧时要求重连），全量频道等待下一次推送
@@ -530,17 +507,10 @@ private:
         seq_ = 0;
         unsynced_updates_ = 0;
         if (!incremental_) return;
-        if (cfg_.subscribe_msg.empty() || unsubscribe_msg_.empty()) {
-            out.reconnect = true;
-            return;
-        }
-        if (out.send.empty()) {
-            out.send.push_back(unsubscribe_msg_);
-            out.send.push_back(cfg_.subscribe_msg);
-        }
+        requestResubscribe(out, unsubscribe_msg_);
     }
 
-    void resetState() noexcept {
+    void resetState() noexcept override {
         book_.clear();
         bid_text_.clear();
         ask_text_.clear();
@@ -550,23 +520,7 @@ private:
         incremental_ = false;
     }
 
-    void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
-        ++stats_.parse_errors;
-        out.error = adapter_detail::concat({"OKX: ", what, " (", std::to_string(bytes), " bytes)"});
-    }
-
-    void internalError(AdapterResult& out, const char* what) noexcept {
-        ++stats_.parse_errors;
-        if (!book_.empty()) out.book_updated = true;
-        resetState();
-        out.reconnect = true;
-        try {
-            out.error = std::string("OKX: internal error: ") + what;
-        } catch (...) {
-        }
-    }
-
-    bool verify_;                        // checksum 校验是否开启（安全阀触发后永久关闭）
+    bool verify_;                       // checksum 校验是否开启（安全阀触发后永久关闭）
     std::string unsubscribe_msg_;        // 由订阅消息推导出的退订帧（"" = 推导不出）
     TextMap bid_text_;                   // 买盘每档原始字符串
     TextMap ask_text_;                   // 卖盘每档原始字符串

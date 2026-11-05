@@ -5,10 +5,12 @@
 
 #pragma once
 
+#include "exchanges/json_util.h"
 #include "orderbook.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -72,11 +74,15 @@ struct AdapterResult {           // 每条消息复用；使用前先调用 rese
     }
 };
 
-// 适配器基类：
+// 适配器基类（非虚接口：公有入口由基类统一实现，各交易所的协议逻辑写在受保护的虚函数里）：
 // - 每个连接开始时 feed 调用 onConnected()（重置全部协议状态并返回要发送的帧，通常是订阅消息），
 //   之后每读到一条文本消息调用一次 onMessage()。
-// - onMessage / onRestSnapshot 从不抛异常：格式错误计入 stats().parse_errors，内部异常（如内存不足）
-//   会清空簿并要求重连。
+// - onMessage / onRestSnapshot 是非虚函数，从不抛异常：它们在同一个保护层（runGuarded）里调用子类的
+//   handleMessage / handleRestSnapshot，并统一维护 messages / book_updates 计数。格式错误由子类调用
+//   malformed() 计入 stats().parse_errors；处理中抛出的任何异常（如内存不足）由基类捕获：计入 parse_errors、
+//   resetState() 清空簿与协议状态、要求重连。新交易所因此无需（也无法）自己再写一遍这层保护。
+// - 子类必须实现 exchange()、synced()、handleMessage()、resetState()；按需覆盖 onConnected()（默认：重置状态并
+//   发送订阅消息）、handleRestSnapshot()（默认：忽略）、pingMessage() / pingIntervalMs()、trimBook()。
 // - book() 是完整的本地簿（行情线程私有，其他线程不得直接读取；跨线程用 BookSnapshot 传递）。
 // - 统计在适配器的整个生命周期内累计（onConnected 不清零）。
 class ExchangeAdapter {
@@ -86,13 +92,26 @@ public:
     ExchangeAdapter& operator=(const ExchangeAdapter&) = delete;
 
     virtual Exchange exchange() const = 0;
-    virtual std::vector<std::string> onConnected() = 0;   // 重置全部状态，返回要发送的帧
-    virtual void onMessage(std::string_view payload, AdapterResult& out) = 0;
-    // REST 快照响应体（默认空操作；只有 Binance 增量深度模式需要）
-    virtual void onRestSnapshot(std::string_view body, AdapterResult& out) {
-        (void)body;
-        (void)out;
+
+    // 新连接：重置全部协议状态，返回要发送的帧（默认：配置了订阅消息就发送它；Binance 通过 URL 路径订阅，通常为空）
+    virtual std::vector<std::string> onConnected() {
+        resetState();
+        std::vector<std::string> frames;
+        if (!cfg_.subscribe_msg.empty()) frames.push_back(cfg_.subscribe_msg);
+        return frames;
     }
+
+    // 一条 WebSocket 文本消息
+    void onMessage(std::string_view payload, AdapterResult& out) noexcept {
+        ++stats_.messages;
+        runGuarded(out, [&] { handleMessage(payload, out); });
+    }
+
+    // REST 快照响应体（feed 在 need_rest_snapshot 后调用；只有 Binance 增量深度模式需要，其他交易所忽略）
+    void onRestSnapshot(std::string_view body, AdapterResult& out) noexcept {
+        runGuarded(out, [&] { handleRestSnapshot(body, out); });
+    }
+
     virtual std::string pingMessage() const { return std::string(); }  // 应用层心跳消息（"" = 无）
     virtual int pingIntervalMs() const { return 0; }                    // 心跳间隔毫秒（0 = 无）
     virtual bool synced() const = 0;
@@ -107,10 +126,81 @@ protected:
         book_.setSymbol(cfg_.name + ":" + cfg_.symbol);
     }
 
+    // ---------------- 子类实现的协议逻辑 ----------------
+
+    // 处理一条消息。可以抛异常（由 onMessage 捕获并按内部错误处理）；格式错误用 malformed() 报告
+    virtual void handleMessage(std::string_view payload, AdapterResult& out) = 0;
+
+    // 处理 REST 快照响应体（默认：忽略）。异常处理同 handleMessage
+    virtual void handleRestSnapshot(std::string_view body, AdapterResult& out) {
+        (void)body;
+        (void)out;
+    }
+
+    // 重置全部协议状态（清空簿、回到未同步、丢弃缓冲）。onConnected() 与内部错误时调用
+    virtual void resetState() noexcept = 0;
+
+    // 每侧只保留最优的 kMaxBookLevels 档：增量协议会不断带来快照范围之外的远端档位。
+    // 子类可扩展（OKX 同步删除被裁掉档位的原始字符串），扩展时最后调用 ExchangeAdapter::trimBook()
+    virtual void trimBook() {
+        if (static_cast<std::size_t>(book_.getBidCount()) > adapter_detail::kMaxBookLevels ||
+            static_cast<std::size_t>(book_.getAskCount()) > adapter_detail::kMaxBookLevels) {
+            book_.truncate(adapter_detail::kMaxBookLevels);
+        }
+    }
+
+    // ---------------- 子类共用的辅助 ----------------
+
+    // 格式错误：parse_errors++，error = "<交易所>: <what> (<bytes> bytes)"
+    void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
+        ++stats_.parse_errors;
+        out.error =
+            adapter_detail::concat({exchangeName(exchange()), ": ", what, " (", std::to_string(bytes), " bytes)"});
+    }
+
+    // 重同步时重新订阅：send = {unsubscribe, subscribe}（同一条消息里已安排过就不重复）；
+    // 没有订阅消息或推导不出退订帧时改为要求重连。unsubscribe_msg 通常来自 makeUnsubscribeMessage
+    void requestResubscribe(AdapterResult& out, const std::string& unsubscribe_msg) {
+        if (cfg_.subscribe_msg.empty() || unsubscribe_msg.empty()) {
+            out.reconnect = true;
+            return;
+        }
+        if (out.send.empty()) {
+            out.send.push_back(unsubscribe_msg);
+            out.send.push_back(cfg_.subscribe_msg);
+        }
+    }
+
     OrderBook book_;
     LevelBatchScratch batch_;   // book_.applyLevels 的工作区（增量消息批量应用，稳态零分配）
     AdapterStats stats_;
     AdapterConfig cfg_;
+
+private:
+    // onMessage / onRestSnapshot 共用的保护层：任何异常都转为 internalError；之后若簿有变化则 book_updates++
+    template <class Body>
+    void runGuarded(AdapterResult& out, Body&& body) noexcept {
+        try {
+            body();
+        } catch (const std::exception& e) {
+            internalError(out, e.what());
+        } catch (...) {
+            internalError(out, "unknown exception");
+        }
+        if (out.book_updated) ++stats_.book_updates;
+    }
+
+    // 内部异常（如内存不足）：状态可能不一致，清空一切并要求重连
+    void internalError(AdapterResult& out, const char* what) noexcept {
+        ++stats_.parse_errors;
+        if (!book_.empty()) out.book_updated = true;
+        resetState();
+        out.reconnect = true;
+        try {
+            out.error = std::string(exchangeName(exchange())) + ": internal error: " + what;
+        } catch (...) {
+        }
+    }
 };
 
 // 由订阅消息推导退订消息：把 "op":"subscribe" 换成 "op":"unsubscribe"（冒号两侧允许空白）。

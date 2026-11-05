@@ -33,6 +33,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -1062,6 +1063,136 @@ TEST_CASE("adapters: unsubscribe message derivation") {
     CHECK(makeUnsubscribeMessage("").empty());
     CHECK(makeUnsubscribeMessage(R"({"op")").empty());
     CHECK(makeUnsubscribeMessage(R"({"op":)").empty());
+}
+
+// 只按基类接口实现的"第 4 家交易所"：handleMessage / handleRestSnapshot 先改簿（模拟处理到一半），
+// 再按脚本抛异常、报告格式错误或请求重订阅。用来验证非虚的 onMessage / onRestSnapshot 统一提供的保护：
+// 新适配器不写任何 try/catch，异常也不会逃出，统计与错误信息的口径与三家适配器相同。
+class ScriptedAdapter final : public ExchangeAdapter {
+public:
+    enum class Action { Apply, ThrowStd, ThrowOther, Malformed, Resubscribe };
+
+    explicit ScriptedAdapter(const AdapterConfig& cfg)
+        : ExchangeAdapter(cfg), unsubscribe_msg_(makeUnsubscribeMessage(cfg.subscribe_msg)) {}
+
+    Exchange exchange() const override { return Exchange::BYBIT; }
+    bool synced() const override { return synced_; }
+
+    Action action = Action::Apply;
+    int resets = 0;  // resetState() 调用次数
+
+private:
+    void handleMessage(std::string_view payload, AdapterResult& out) override { run(payload, out); }
+    void handleRestSnapshot(std::string_view body, AdapterResult& out) override { run(body, out); }
+
+    void run(std::string_view payload, AdapterResult& out) {
+        book_.setLevel(BookSide::Bid, 100.0, 1.0 + static_cast<double>(payload.size()));
+        book_.setLevel(BookSide::Ask, 101.0, 1.0);
+        synced_ = true;
+        out.book_updated = true;
+        switch (action) {
+            case Action::Apply: break;
+            case Action::ThrowStd: throw std::runtime_error("scripted failure");
+            case Action::ThrowOther: throw 42;
+            case Action::Malformed: malformed(out, "scripted malformed message", payload.size()); break;
+            case Action::Resubscribe:
+                requestResubscribe(out, unsubscribe_msg_);
+                requestResubscribe(out, unsubscribe_msg_);  // 同一条消息里第二次请求不重复安排
+                break;
+        }
+    }
+
+    void resetState() noexcept override {
+        book_.clear();
+        synced_ = false;
+        ++resets;
+    }
+
+    std::string unsubscribe_msg_;
+    bool synced_ = false;
+};
+
+// 三家适配器都没有重新声明 onMessage / onRestSnapshot（成员指针的类型仍属于 ExchangeAdapter）：
+// 它们只能经过基类带保护、带统计的版本
+static_assert(std::is_same_v<decltype(&BinanceAdapter::onMessage), decltype(&ExchangeAdapter::onMessage)>);
+static_assert(std::is_same_v<decltype(&OkxAdapter::onMessage), decltype(&ExchangeAdapter::onMessage)>);
+static_assert(std::is_same_v<decltype(&BybitAdapter::onMessage), decltype(&ExchangeAdapter::onMessage)>);
+static_assert(std::is_same_v<decltype(&BinanceAdapter::onRestSnapshot), decltype(&ExchangeAdapter::onRestSnapshot)>);
+static_assert(std::is_same_v<decltype(&OkxAdapter::onRestSnapshot), decltype(&ExchangeAdapter::onRestSnapshot)>);
+static_assert(std::is_same_v<decltype(&BybitAdapter::onRestSnapshot), decltype(&ExchangeAdapter::onRestSnapshot)>);
+static_assert(noexcept(std::declval<ExchangeAdapter&>().onMessage(std::string_view(), std::declval<AdapterResult&>())));
+static_assert(noexcept(std::declval<ExchangeAdapter&>().onRestSnapshot(std::string_view(), std::declval<AdapterResult&>())));
+
+TEST_CASE("adapters: the base class guards onMessage/onRestSnapshot of any adapter and keeps the stats") {
+    AdapterConfig cfg;
+    cfg.name = "Scripted";
+    cfg.symbol = "X";
+    cfg.subscribe_msg = kBybitSubscribe;
+    ScriptedAdapter a(cfg);
+    // 默认 onConnected：重置协议状态并发送订阅消息
+    const std::vector<std::string> frames = a.onConnected();
+    CHECK_EQ(a.resets, 1);
+    REQUIRE_EQ(frames.size(), 1u);
+    CHECK_EQ(frames[0], std::string(kBybitSubscribe));
+    // 正常处理：messages / book_updates 由基类计数
+    AdapterResult r = feed(a, "ok");
+    CHECK(r.book_updated);
+    CHECK(r.error.empty());
+    CHECK(!r.reconnect);
+    CHECK(a.synced());
+    CHECK_EQ(a.stats().messages, 1u);
+    CHECK_EQ(a.stats().book_updates, 1u);
+    // std::exception：不逃出 onMessage；计入 parse_errors，resetState() 清空簿与状态，要求重连
+    a.action = ScriptedAdapter::Action::ThrowStd;
+    r = feed(a, "boom");
+    CHECK(r.reconnect);
+    CHECK(r.book_updated);  // 簿被清空，需要发布
+    CHECK_EQ(r.error, std::string("Bybit: internal error: scripted failure"));
+    CHECK(a.book().empty());
+    CHECK(!a.synced());
+    CHECK_EQ(a.resets, 2);
+    CHECK_EQ(a.stats().messages, 2u);
+    CHECK_EQ(a.stats().parse_errors, 1u);
+    CHECK_EQ(a.stats().book_updates, 2u);
+    // 不是 std::exception 的异常同样被捕获
+    a.action = ScriptedAdapter::Action::ThrowOther;
+    r = feed(a, "boom");
+    CHECK(r.reconnect);
+    CHECK_EQ(r.error, std::string("Bybit: internal error: unknown exception"));
+    CHECK(a.book().empty());
+    CHECK_EQ(a.stats().parse_errors, 2u);
+    // malformed()：统一的错误格式，只计 parse_errors，不重置状态、不重连
+    a.action = ScriptedAdapter::Action::Malformed;
+    r = feed(a, "12345");
+    CHECK_EQ(r.error, std::string("Bybit: scripted malformed message (5 bytes)"));
+    CHECK(!r.reconnect);
+    CHECK(!a.book().empty());
+    CHECK_EQ(a.resets, 3);
+    CHECK_EQ(a.stats().parse_errors, 3u);
+    // requestResubscribe()：unsubscribe + subscribe，只安排一次
+    a.action = ScriptedAdapter::Action::Resubscribe;
+    r = feed(a, "gap");
+    REQUIRE_EQ(r.send.size(), 2u);
+    CHECK_EQ(r.send[0], std::string(kBybitUnsubscribe));
+    CHECK_EQ(r.send[1], std::string(kBybitSubscribe));
+    CHECK(!r.reconnect);
+    // onRestSnapshot 同样受保护（不计入 messages，WebSocket 消息数不变）
+    a.action = ScriptedAdapter::Action::ThrowStd;
+    r = restSnapshot(a, "{}");
+    CHECK(r.reconnect);
+    CHECK_EQ(r.error, std::string("Bybit: internal error: scripted failure"));
+    CHECK_EQ(a.stats().messages, 5u);
+    CHECK_EQ(a.stats().parse_errors, 4u);
+    CHECK_EQ(a.stats().book_updates, 6u);
+    // 没有订阅消息（或推导不出退订帧）时，重订阅改为重连
+    AdapterConfig no_sub = cfg;
+    no_sub.subscribe_msg.clear();
+    ScriptedAdapter b(no_sub);
+    CHECK(b.onConnected().empty());
+    b.action = ScriptedAdapter::Action::Resubscribe;
+    r = feed(b, "gap");
+    CHECK(r.send.empty());
+    CHECK(r.reconnect);
 }
 
 // ============================================================================
