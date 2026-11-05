@@ -259,7 +259,9 @@ private:
 // （Binance）空闲同样久之后发 WebSocket ping 控制帧。收到的任何帧都算活动（含文本 pong、pong 控制帧与服务器的
 // ping）：刷新停顿看门狗与健康会话判定，所以只有心跳往来的安静会话不会被踢断；对端不回应时看门狗照常踢断。
 // 每次最多一个心跳在途。ping_interval_ms = 0 关闭心跳。
-// 会话结束（任何原因）时若最后发布的簿非空，再发布一个空簿：断线期间消费者不会继续使用过期价格。
+// 会话结束（任何原因）时若消费者最后收到的簿非空，再发布一个空簿：断线期间消费者不会继续使用过期价格。
+// 队列满时这个快照保持待发布，约每 5 ms 重试一次（退避等待、DNS 解析与 TCP 连接的等待中，以及新会话的定时器里），
+// 直到入队或被新会话真正入队的快照取代；重试送出的总是当时的最新状态（新会话已组装过的簿优先于旧的空簿）。
 //
 // 状态：建立连接期间 Connecting；握手完成后 Syncing，adapter.synced() 后 Live；会话结束 → Reconnecting
 // （错误写 stderr 并存入 lastError()），退避 min(max, initial * 2^attempt)（±20% 抖动，结果钳制到
@@ -270,7 +272,7 @@ private:
 //
 // 计数：reconnects = 第一次之后的每次连接尝试；connect_failures = 在 WebSocket 握手完成之前失败的尝试
 // （含证书校验失败、连接超时）；stalls = checkHealth 因无数据踢断的会话数。适配器统计每条消息后复制到原子量。
-// seq 对每次发布尝试递增（含因队列满被丢弃的），消费者看到 seq 跳号即表示丢了快照。
+// seq 对每次发布尝试递增（含因队列满被丢弃的），消费者看到 seq 跳号即表示丢了快照；待发布快照的重试沿用原来的 seq。
 // 处理延迟（getLatencyTracker）= publish_ns - recv_ns，每次发布记录一次；交易所延迟（getExchangeLatency）
 // = wallClockMs() - exchange_ts_ms（纳秒存储，时钟偏差导致的负值记为 0），每条带时间戳的消息记录一次。
 //
@@ -463,6 +465,7 @@ private:
     };
 
     static constexpr std::int64_t kMinTimerDelayNs = 1000000;  // 定时器至少 1 ms 之后才到期：不会空转
+    static constexpr int kPendingRetryMs = 5;                  // 待发布快照的重试间隔
 
     static FeedConfig sanitize(FeedConfig c) {
         c.reconnect_initial_ms = std::max(1, c.reconnect_initial_ms);
@@ -523,10 +526,23 @@ private:
         return delay;
     }
 
-    // 可被 stop() 打断的等待；返回 false 表示已请求停止
+    // 可被 stop() 打断的等待；返回 false 表示已请求停止。有待发布的快照时分片等待，每片之后（锁外）重试入队。
     bool sleepFor(int ms) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
         std::unique_lock<std::mutex> lock(mutex_);
-        return !cv_.wait_for(lock, std::chrono::milliseconds(ms), [this] { return stopRequested(); });
+        for (;;) {
+            if (stopRequested()) return false;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return true;
+            const auto until =
+                publish_pending_ ? std::min(deadline, now + std::chrono::milliseconds(kPendingRetryMs)) : deadline;
+            cv_.wait_until(lock, until, [this] { return stopRequested(); });
+            if (publish_pending_) {
+                lock.unlock();
+                retryPendingPublish();
+                lock.lock();
+            }
+        }
     }
 
     SessionEnd runSessionGuarded() {
@@ -556,7 +572,7 @@ private:
             phase_start_ns_ = 0;
         }
         connected_since_ns_.store(0, std::memory_order_relaxed);
-        if (last_published_nonempty_) publishEmpty();
+        if (delivered_nonempty_ || publish_pending_) publishEmpty();
         copyAdapterStats();
         if (stopRequested() || end.kind == EndKind::Stopped) return;
         status_.store(FeedStatus::Reconnecting, std::memory_order_release);
@@ -584,7 +600,10 @@ private:
 
         stage_ = "DNS resolve";
         tcp::resolver::results_type endpoints;
-        error_code ec = ws_resolver_.resolve(cfg_.host, cfg_.port, endpoints, [this] { return registry_.interrupted(); });
+        error_code ec = ws_resolver_.resolve(cfg_.host, cfg_.port, endpoints, [this] {
+            retryPendingPublish();  // 约每 10 ms 一次
+            return registry_.interrupted();
+        });
         if (ec) return fail("resolve " + where + ": " + hft::net::errorText(ec));
 
         Connection conn(*ssl_ctx_);
@@ -593,6 +612,7 @@ private:
         hft::net::ConnectOptions copt;
         copt.timeout_ms = remainingConnectMs();
         copt.cursor = &ws_cursor_;
+        copt.on_wait = [this] { retryPendingPublish(); };  // 每个空闲的轮询片（<= 50 ms）一次
         ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, conn.registration, nullptr,
                                      copt);
         if (ec == asio::error::timed_out && !registry_.interrupted()) return connectTimeoutEnd();
@@ -754,6 +774,7 @@ private:
             due = std::min(due, std::max(activity_ns_.load(std::memory_order_relaxed), c.last_ping_ns) + c.idle_ping_ns);
         }
         if (c.ping_interval_ns > 0) due = std::min(due, c.last_ping_ns + c.ping_interval_ns);
+        if (publish_pending_) due = std::min(due, now + feed_detail::msToNs(kPendingRetryMs));
         if (due == std::numeric_limits<std::int64_t>::max()) return 0;
         return std::max(due, now + kMinTimerDelayNs);
     }
@@ -772,6 +793,7 @@ private:
         c.timer_armed = false;
         if (c.end || ec) return;
         const std::int64_t now = hft::nowNs();
+        retryPendingPublish();
         maybeSendPing(c, now);
         armTimer(c, now);
     }
@@ -1047,7 +1069,7 @@ private:
         pushSnapshot();
     }
 
-    // 会话结束时发布空簿（不记录处理延迟：不对应任何消息）
+    // 会话结束时发布空簿（不记录处理延迟：不对应任何消息）。队列满时不能丢：保持待发布，之后重试。
     void publishEmpty() noexcept {
         snapshot_.bid_count = 0;
         snapshot_.ask_count = 0;
@@ -1057,17 +1079,35 @@ private:
         snapshot_.exchange_ts_ms = 0;
         snapshot_.recv_ns = hft::nowNs();
         snapshot_.publish_ns = snapshot_.recv_ns;
-        pushSnapshot();
+        if (!pushSnapshot()) publish_pending_ = true;
     }
 
-    void pushSnapshot() noexcept {
+    // 入队 snapshot_；队列满时丢弃（dropped++），绝不阻塞
+    bool pushSnapshot() noexcept {
         constexpr auto r = std::memory_order_relaxed;
-        if (queue_.tryPush(snapshot_)) {
-            published_.store(published_.load(r) + 1, r);
-        } else {
-            dropped_.store(dropped_.load(r) + 1, r);  // 队列满：丢弃，绝不阻塞
+        if (!queue_.tryPush(snapshot_)) {
+            dropped_.store(dropped_.load(r) + 1, r);
+            return false;
         }
-        last_published_nonempty_ = snapshot_.bid_count + snapshot_.ask_count > 0;
+        delivered();
+        return true;
+    }
+
+    // 快照已经入队：记账只跟踪真正送到消费者手里的快照
+    void delivered() noexcept {
+        constexpr auto r = std::memory_order_relaxed;
+        published_.store(published_.load(r) + 1, r);
+        delivered_nonempty_ = snapshot_.bid_count + snapshot_.ask_count > 0;
+        publish_pending_ = false;
+    }
+
+    // 重试没能入队的会话边界快照。snapshot_ 总是最新的状态：断线后是空簿；新会话组装过（但同样没能入队）的簿
+    // 会覆盖它——所以新会话 LIVE 之后不会再送出一个过期的空簿。重试不再计入 dropped，seq 不变；
+    // publish_ns 改为真正入队的时刻（消费者的队列延迟从这里算起）。
+    void retryPendingPublish() noexcept {
+        if (!publish_pending_) return;
+        snapshot_.publish_ns = hft::nowNs();
+        if (queue_.tryPush(snapshot_)) delivered();
     }
 
     void recordExchangeLatency(std::int64_t exchange_ts_ms) noexcept {
@@ -1169,6 +1209,7 @@ private:
     bool synced_ = false;
     bool healthy_ = false;
     std::int64_t live_since_ns_ = 0;
-    bool last_published_nonempty_ = false;
+    bool delivered_nonempty_ = false;                 // 消费者最后收到（真正入队）的快照非空
+    bool publish_pending_ = false;                    // 会话边界的快照因队列满还没入队：需要重试
     const char* stage_ = "setup";                     // 当前步骤（用于错误信息）
 };
