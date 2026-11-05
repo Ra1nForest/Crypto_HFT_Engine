@@ -16,6 +16,11 @@ lock-free SPSC queues. `src/exchange_sim.cpp` drives it with simulated traders.
 - **Prices are integer ticks and quantities integer lots** (`int64_t`). No floating point is
   involved in matching, so results are exact and deterministic. Converting to and from decimal
   prices (for example 0.01 USDT ticks) is the caller's job.
+- **A price level holds at most `INT64_MAX` lots** (`kMaxLevelQty` in `matching/types.h`): the
+  total remaining quantity resting at one price on one side never exceeds it, so level totals
+  in `depth()` and `volumeAt()` are always exact. A request that would push a level past the
+  bound is rejected with `InvalidQuantity` before anything else happens (submit rule 6, modify
+  rule 4). Orders that never rest (IOC, FOK, market) are not subject to it.
 - **Order ids are client-assigned** 64-bit values and must be unique among live (resting)
   orders. An id can be reused once its order has left the book. `0` and `UINT64_MAX` are
   ordinary ids.
@@ -55,7 +60,13 @@ and nothing else:
 | 3 | `post_only` on anything but a limit GTC order | `InvalidFlags` |
 | 4 | `id` is already live | `DuplicateOrderId` |
 | 5 | book holds `max_orders` live orders and the order is limit GTC | `CapacityExceeded` |
-| 6 | `post_only` and the price crosses (or locks) the opposite best price | `PostOnlyWouldCross` |
+| 6 | limit GTC order with `qty > INT64_MAX - volumeAt(side, price)` (resting it would push its level past the bound) | `InvalidQuantity` |
+| 7 | `post_only` and the price crosses (or locks) the opposite best price | `PostOnlyWouldCross` |
+
+Rule 6 is exact. Matching never touches the order's own side, and an order whose price already
+has a level on its own side cannot cross an uncrossed book, so it would rest in full. With no
+level at that price the rule always passes. Because it only fires when such a level exists, it
+never coincides with rule 2 (no level has a price <= 0) or rule 7 (the order cannot cross).
 
 Otherwise the order is accepted (`onAccepted`) and:
 
@@ -89,11 +100,22 @@ same-account order.
 
 - `cancel(id)`: an unknown id is rejected with `UnknownOrder`. Otherwise the order is removed
   and `onCancelled(id, remaining, UserRequested)` is emitted.
-- `modify(id, new_price, new_qty)` sets a new price and a new **remaining** quantity.
-  - Validation order: `UnknownOrder`, `InvalidQuantity`, `InvalidPrice`, then
-    `PostOnlyWouldCross` (a post-only order moved to a crossing price).
+- `modify(id, new_price, new_qty)` sets a new price and a new **remaining** quantity. Validation
+  runs in this order, and the first failing rule produces exactly one
+  `onRejected(id, Modify, reason)` and leaves the order untouched:
+
+  | # | Condition | Reason |
+  |---|-----------|--------|
+  | 1 | `id` is not live | `UnknownOrder` |
+  | 2 | `new_qty <= 0` | `InvalidQuantity` |
+  | 3 | `new_price <= 0` | `InvalidPrice` |
+  | 4 | price change or quantity increase with `new_qty > INT64_MAX - (volumeAt(side, new_price) - (new_price == price ? remaining : 0))` (re-resting would push the target level past the bound; the order's own old quantity does not count) | `InvalidQuantity` |
+  | 5 | post-only order moved to a different price that crosses (or locks) the opposite best price | `PostOnlyWouldCross` |
+
+  Like submit rule 6, rule 4 only fires when the target level already exists on the order's
+  side, so it never coincides with rule 3 or rule 5.
   - **Same price and a smaller or equal quantity**: changed in place, so the order **keeps its
-    time priority**.
+    time priority**. Rule 4 never applies here, because the level total does not grow.
   - **Any price change or a quantity increase**: the order **loses priority**. It is taken out
     of the book, `onModified` is emitted, and it re-enters as an aggressive GTC limit order
     (it may trade) before resting at the back of its new level.
@@ -104,7 +126,8 @@ same-account order.
 `depth(side, n)` (best first: price, total quantity, order count), `ordersAt(side, price)`
 (FIFO order), `findOrder(id)`, `volumeAt(side, price)`, `lastTradeId()`, and
 `checkInvariants(&why)`. The invariant check covers: sides strictly sorted, no empty levels,
-cached level totals and counts correct, every order positive, index consistent, book not crossed.
+cached level totals and counts correct, level totals within `INT64_MAX`, every order positive,
+index consistent, book not crossed.
 
 ## Data structures
 
@@ -123,8 +146,11 @@ cache lines as possible:
   rest, because almost all activity happens near the top of the book.
 - **Order index**: `hft::FlatHashMap<OrderId, Order*>`, an open-addressing map with linear
   probing, a splitmix64 mixer and backward-shift deletion (no tombstones).
-- Integer arithmetic only. The FOK pre-check counts down the still-needed quantity, so large
-  quantities cannot overflow a running sum.
+- Integer arithmetic only, and none of it can overflow. The cached level totals fit in `int64_t`
+  only because of the level-total bound, and the FOK pre-check relies on them: without STP it
+  compares the still-needed quantity against whole levels and subtracts a level's total only when
+  it is smaller, so the count-down stays positive across any number of full levels. (The
+  reference model sums makers one by one, so its fill decisions do not depend on cached totals.)
 
 Capacity is reserved up front (`reserve_orders`, default 1024). While the live order count stays
 below it, `submit`/`cancel`/`modify` perform **zero heap allocations**. The benchmark verifies
@@ -193,8 +219,9 @@ larger windows raise throughput but add queueing delay to the round trip.
   optimized engine.
 - **Differential fuzzing** (`tests/test_matching.cpp`). Millions of random commands from several
   profiles (balanced, aggressive sweeps, STP-heavy, FOK/IOC-heavy, modify-heavy, deep sparse
-  books, capacity-limited books) run on the optimized engine and the reference. Event streams are
-  compared after every command, and full book state plus invariants every 64 commands. Set
+  books, capacity-limited books, extreme quantities whose same-price totals reach and would
+  exceed `INT64_MAX`) run on the optimized engine and the reference. Event streams are compared
+  after every command, and full book state plus invariants every 64 commands. Set
   `HFT_LONG_TESTS=1` for a run ten times longer.
 - **Runner replay** (`tests/test_engine_runner.cpp`). Concurrent gateways submit random streams.
   The commands are replayed on a single-threaded engine in the order the runner processed them,
