@@ -33,6 +33,10 @@ struct LevelBatchScratch {
     };
     std::vector<Item> items;
     std::vector<PriceLevel> merged;
+    // 诊断计数（只增不减）：走批量归并路径的批次数，以及其中输入不是"最优在前、价格严格有序"、
+    // 需要先排序的批次数（交易所的增量正常都已有序，后者应接近 0）
+    std::uint64_t batches = 0;
+    std::uint64_t sorted_batches = 0;
 };
 
 // L2 订单簿：
@@ -44,7 +48,8 @@ struct LevelBatchScratch {
 // - 价格相等用 double 精确比较：相同的交易所字符串经 from_chars（正确舍入）解析出相同的 double。
 // - 设计取舍：扁平 vector 让顶部读取与整簿拷贝极快、缓存友好；代价是在顶部插入/删除新档位需要
 //   memmove 整个一侧（400 档约 6.4 KB，百纳秒级）。修改已有档位的数量不移动内存。
-//   一条增量消息有很多档位变化时用 applyLevels：排序后一次线性归并，避免逐档 memmove（深簿上快一个数量级）。
+//   一条增量消息有很多档位变化时用 applyLevels：一次线性归并（输入不是最优在前时先排序），避免逐档 memmove
+//   （深簿上快一个数量级）。
 // - 非线程安全：由持有者自行同步（行情线程私有，或在锁内拷贝）。
 class OrderBook {
 public:
@@ -87,10 +92,12 @@ public:
     // 批量 upsert：一次性应用一条增量消息中某一侧的全部档位，最终状态与"按顺序逐档 setLevel"完全相同
     // （同一价格以后出现者为准；数量 <= 0 删除；价格或数量非有限值的条目忽略）。
     // - 不超过 kBatchThreshold 条：直接逐档 upsert（顶部附近的少量更新这样最快，返回值也与逐档调用一致）。
-    // - 更多条：按价格排序（下标作次序键，std::sort 原地进行、不分配内存）、同价只保留最后一条，再与现有档位
-    //   做一次线性归并：O(档数 + n log n)，取代逐档插入/删除各自 O(档数) 的 memmove
+    // - 更多条：与现有档位做一次线性归并，取代逐档插入/删除各自 O(档数) 的 memmove
     //   （逐档 upsert 时每个变化在 1000 档的簿上约 0.7 µs、5000 档约 4.5 µs，插入/删除/改量各占 1/3，
     //   见 benchmark/market_data_benchmark.cpp 第 4 节；一条 Binance 100 ms 增量常有上百档变化）。
+    //   交易所的增量实际上都按最优在前、价格严格有序发送（Binance / OKX / Bybit 的文档并未承诺这一点，模拟交易所
+    //   也这样发送）：收集条目时顺带检查，已有序就直接归并，O(档数 + n)；否则先按价格排序（下标作次序键，
+    //   std::sort 原地进行、不分配内存）、同价只保留最后一条，O(档数 + n log n)。两条路径的结果完全相同。
     //   此时返回"最终状态是否与之前不同"：先改后又改回原值的档位不算变化（逐档调用会报告变化）。
     // levels 不得指向本簿自身的存储；qty_of(level) 取出数量（适配器的原始档位类型字段名不同）。
     template <class Level, class QtyOf>
@@ -101,17 +108,8 @@ public:
             for (std::size_t i = 0; i < n; ++i) changed |= setLevel(side, levels[i].price, qty_of(levels[i]));
             return changed;
         }
-        std::vector<LevelBatchScratch::Item>& items = scratch.items;
-        items.clear();
-        items.reserve(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            const double price = levels[i].price;
-            const double qty = qty_of(levels[i]);
-            if (!std::isfinite(price) || !std::isfinite(qty)) continue;  // 与 setLevel 一致：忽略
-            items.push_back({price, qty, static_cast<std::uint32_t>(i)});
-        }
-        if (side == BookSide::Bid) return mergeBatch<true>(bids_, scratch);
-        return mergeBatch<false>(asks_, scratch);
+        if (side == BookSide::Bid) return applyBatch<true>(bids_, levels, n, scratch, qty_of);
+        return applyBatch<false>(asks_, levels, n, scratch, qty_of);
     }
 
     // PriceLevel 数组的便捷重载
@@ -241,17 +239,41 @@ private:
     // upsert 头部顺序查找的档数（之后改用二分查找）
     static constexpr std::size_t kLinearProbe = 8;
 
-    // 批量归并实现：scratch.items 为已过滤的有效更新（原始顺序）。kBid = true 表示买盘（降序）。
+    // 批量路径：过滤掉非有限值的条目放进 scratch.items（保持原始顺序），同时检查剩下的条目是否已按最优在前、
+    // 价格严格有序。kBid = true 表示买盘（降序）。
+    template <bool kBid, class Level, class QtyOf>
+    static bool applyBatch(std::vector<PriceLevel>& v, const Level* levels, std::size_t n, LevelBatchScratch& scratch,
+                           QtyOf& qty_of) {
+        std::vector<LevelBatchScratch::Item>& items = scratch.items;
+        items.clear();
+        items.reserve(n);
+        bool best_first = true;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double price = levels[i].price;
+            const double qty = qty_of(levels[i]);
+            if (!std::isfinite(price) || !std::isfinite(qty)) continue;  // 与 setLevel 一致：忽略
+            if (!items.empty() && !better<kBid>(items.back().price, price)) best_first = false;
+            items.push_back({price, qty, static_cast<std::uint32_t>(i)});
+        }
+        ++scratch.batches;
+        return mergeBatch<kBid>(v, scratch, best_first);
+    }
+
+    // 批量归并实现：scratch.items 为已过滤的有效更新（原始顺序）；best_first 表示它们已按价格严格最优在前，
+    // 此时没有同价重复、排序结果就是原序列，直接跳过排序。kBid = true 表示买盘（降序）。
     template <bool kBid>
-    static bool mergeBatch(std::vector<PriceLevel>& v, LevelBatchScratch& scratch) {
+    static bool mergeBatch(std::vector<PriceLevel>& v, LevelBatchScratch& scratch, bool best_first) {
         std::vector<LevelBatchScratch::Item>& items = scratch.items;
         if (items.empty()) return false;
-        // 最优在前；同价按原始顺序，这样每个同价段的最后一条就是生效的那条
-        std::sort(items.begin(), items.end(),
-                  [](const LevelBatchScratch::Item& a, const LevelBatchScratch::Item& b) {
-                      if (a.price != b.price) return better<kBid>(a.price, b.price);
-                      return a.seq < b.seq;
-                  });
+        if (!best_first) {
+            // 最优在前；同价按原始顺序，这样每个同价段的最后一条就是生效的那条
+            ++scratch.sorted_batches;
+            std::sort(items.begin(), items.end(),
+                      [](const LevelBatchScratch::Item& a, const LevelBatchScratch::Item& b) {
+                          if (a.price != b.price) return better<kBid>(a.price, b.price);
+                          return a.seq < b.seq;
+                      });
+        }
         std::vector<PriceLevel>& out = scratch.merged;
         out.clear();
         out.reserve(v.size() + items.size());

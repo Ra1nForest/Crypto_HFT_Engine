@@ -628,16 +628,63 @@ TEST_CASE("orderbook: garbage input through the public API always leaves a valid
     CHECK(why.empty());
 }
 
+// applyLevels 批次的输入顺序：随机；严格最优在前（交易所的发送顺序，走免排序路径）；严格最差在前；
+// 近乎有序（最优在前之后做少量相邻交换或插入同价重复，必须退回排序路径）
+enum class BatchOrder { Random, BestFirst, WorstFirst, NearlySorted };
+
+// 把批次整理成指定顺序：有限价格的条目去掉同价重复后排好，非有限价格的条目插回随机位置（applyLevels 忽略它们）
+void arrangeBatch(std::vector<PriceLevel>& batch, BookSide side, BatchOrder order, std::mt19937_64& rng) {
+    if (order == BatchOrder::Random) return;
+    std::vector<PriceLevel> finite, other;
+    for (const PriceLevel& l : batch) (std::isfinite(l.price) ? finite : other).push_back(l);
+    std::sort(finite.begin(), finite.end(), [side](const PriceLevel& a, const PriceLevel& b) {
+        return side == BookSide::Bid ? a.price > b.price : a.price < b.price;
+    });
+    const auto same_price = [](const PriceLevel& a, const PriceLevel& b) { return a.price == b.price; };
+    finite.erase(std::unique(finite.begin(), finite.end(), same_price), finite.end());
+    if (order == BatchOrder::WorstFirst) std::reverse(finite.begin(), finite.end());
+    if (order == BatchOrder::NearlySorted && finite.size() >= 2) {
+        const std::size_t edits = 1 + rng() % 3;
+        for (std::size_t k = 0; k < edits; ++k) {
+            const std::size_t i = rng() % (finite.size() - 1);
+            if (rng() % 2 == 0) {
+                std::swap(finite[i], finite[i + 1]);  // 相邻交换
+            } else {
+                const PriceLevel again{finite[i].price, static_cast<double>(rng() % 5)};  // 同价重复：后者生效
+                finite.insert(finite.begin() + static_cast<std::ptrdiff_t>(i + 1), again);
+            }
+        }
+    }
+    for (const PriceLevel& l : other) {
+        finite.insert(finite.begin() + static_cast<std::ptrdiff_t>(rng() % (finite.size() + 1)), l);
+    }
+    batch.swap(finite);
+}
+
+// 独立判断：忽略非有限值的条目之后，批次是否严格最优在前（applyLevels 只在这种情况下不排序）
+bool strictlyBestFirst(const std::vector<PriceLevel>& batch, BookSide side) {
+    const PriceLevel* prev = nullptr;
+    for (const PriceLevel& l : batch) {
+        if (!std::isfinite(l.price) || !std::isfinite(l.quantity)) continue;
+        if (prev != nullptr && !(side == BookSide::Bid ? prev->price > l.price : prev->price < l.price)) return false;
+        prev = &l;
+    }
+    return true;
+}
+
 TEST_CASE("orderbook: applyLevels batch merge equals sequential setLevel (randomized, both sides)") {
     // 随机簿 + 随机批次（同价重复、删除不存在的档位、非有限值、深浅各处），批量应用的最终状态必须与逐档
     // setLevel 逐位相同；小批次（<= kBatchThreshold）返回值与逐档一致，大批次返回"最终状态是否改变"。
+    // 批次轮流取四种顺序（BatchOrder）；大批次是否跳过排序（scratch.sorted_batches 不变）必须与独立判断一致。
     std::mt19937_64 rng(20261105);
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
     LevelBatchScratch scratch;
-    int big_batches = 0, small_batches = 0, unchanged_big = 0;
-    for (int round = 0; round < 3000; ++round) {
+    int big_batches = 0, small_batches = 0, unchanged_big = 0, presorted_big = 0;
+    int orders_big[4] = {0, 0, 0, 0};
+    for (int round = 0; round < 4000; ++round) {
         const BookSide side = (round & 1) ? BookSide::Ask : BookSide::Bid;
+        const BatchOrder order = static_cast<BatchOrder>((round / 2) % 4);
         OrderBook seq_book, batch_book;
         const int depth = static_cast<int>(rng() % 600);
         const double base = 1000.0;
@@ -660,8 +707,12 @@ TEST_CASE("orderbook: applyLevels batch merge equals sequential setLevel (random
             if (!batch.empty() && rng() % 6 == 0) p = batch[rng() % batch.size()].price;  // 同价重复
             batch.push_back({p, q});
         }
+        arrangeBatch(batch, side, order, rng);
+        n = batch.size();
         bool seq_changed = false;
         for (const PriceLevel& l : batch) seq_changed |= seq_book.setLevel(side, l.price, l.quantity);
+        const std::uint64_t batches_before = scratch.batches;
+        const std::uint64_t sorts_before = scratch.sorted_batches;
         const bool batch_changed = batch_book.applyLevels(side, batch.data(), batch.size(), scratch);
         if (!sameLevels(seq_book, batch_book)) {
             FAIL("round " + std::to_string(round) + ": batch result differs from sequential setLevel");
@@ -671,18 +722,32 @@ TEST_CASE("orderbook: applyLevels batch merge equals sequential setLevel (random
         if (n <= OrderBook::kBatchThreshold) {
             ++small_batches;
             CHECK_EQ(batch_changed, seq_changed);
+            CHECK_EQ(scratch.batches, batches_before);  // 小批次逐档 upsert，不走批量路径
         } else {
             ++big_batches;
+            ++orders_big[static_cast<int>(order)];
             const bool final_differs = !sameLevels(before, batch_book);
             CHECK_EQ(batch_changed, final_differs);
             if (!batch_changed) ++unchanged_big;
             if (batch_changed) CHECK(seq_changed);  // 最终有变化 ⇒ 逐档过程中必有变化
+            CHECK_EQ(scratch.batches, batches_before + 1);
+            const bool presorted = strictlyBestFirst(batch, side);
+            if (presorted) ++presorted_big;
+            if (scratch.sorted_batches - sorts_before != (presorted ? 0u : 1u)) {
+                FAIL("round " + std::to_string(round) + ": sorted a batch that was " +
+                     (presorted ? "already best-first" : "not best-first") + " the wrong way");
+            }
+            if (order == BatchOrder::BestFirst) CHECK(presorted);
+            if (order == BatchOrder::WorstFirst && batch.size() > OrderBook::kBatchThreshold + 2) CHECK(!presorted);
         }
     }
-    CHECK_GT(big_batches, 1500);
-    CHECK_GT(small_batches, 300);
-    std::printf("    %d big + %d small batches, %d big batches left the book unchanged\n", big_batches,
-                small_batches, unchanged_big);
+    CHECK_GT(big_batches, 2000);
+    CHECK_GT(small_batches, 400);
+    for (int count : orders_big) CHECK_GT(count, 450);
+    CHECK_GT(presorted_big, 450);
+    CHECK_GT(big_batches - presorted_big, 1200);
+    std::printf("    %d big + %d small batches (%d big ones best-first, sort skipped), %d big batches left the book "
+                "unchanged\n", big_batches, small_batches, presorted_big, unchanged_big);
 }
 
 TEST_CASE("orderbook: applyLevels handles edge batches (empty book, all deletes, duplicates, top inserts)") {
@@ -731,27 +796,90 @@ TEST_CASE("orderbook: applyLevels handles edge batches (empty book, all deletes,
     CHECK(b.validate());
 }
 
+TEST_CASE("orderbook: applyLevels skips the sort only for strictly best-first batches") {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    LevelBatchScratch scratch;
+    OrderBook book, ref;  // ref：逐档 setLevel 的结果
+    for (int i = 0; i < 100; ++i) {
+        book.updateBid(1000.0 - i, 1.0);
+        ref.updateBid(1000.0 - i, 1.0);
+        book.updateAsk(1001.0 + i, 1.0);
+        ref.updateAsk(1001.0 + i, 1.0);
+    }
+    auto apply = [&](BookSide side, const std::vector<PriceLevel>& batch) {
+        for (const PriceLevel& l : batch) ref.setLevel(side, l.price, l.quantity);
+        book.applyLevels(side, batch.data(), batch.size(), scratch);
+        CHECK(sameLevels(book, ref));
+        CHECK(book.validate());
+    };
+    // 买盘最优在前（降序）：新档位、改量、删除混在一起，中间夹着会被忽略的非有限值条目 → 不排序
+    const std::vector<PriceLevel> bids = {{1000.5, 2.0}, {1000.0, 0.0}, {999.0, 3.0}, {998.5, 1.0}, {nan, 1.0},
+                                          {990.0, 0.0},  {950.0, 7.0},  {901.5, 1.0}, {901.0, inf}, {900.0, 2.0}};
+    apply(BookSide::Bid, bids);
+    CHECK_EQ(scratch.batches, 1u);
+    CHECK_EQ(scratch.sorted_batches, 0u);
+    CHECK_EQ(book.getBestBid().price, 1000.5);
+    // 卖盘最优在前是升序 → 同样不排序
+    const std::vector<PriceLevel> asks = {{1000.5, 1.0}, {1001.0, 0.0}, {1001.5, 2.0}, {1002.0, 5.0}, {1003.0, 0.0},
+                                          {1050.0, 1.0}, {1099.0, 0.0}, {1100.0, 3.0}, {1200.0, 1.0}};
+    apply(BookSide::Ask, asks);
+    CHECK_EQ(scratch.batches, 2u);
+    CHECK_EQ(scratch.sorted_batches, 0u);
+    CHECK_EQ(book.getBestAsk().price, 1000.5);
+    // 同价相邻重复：不是严格有序 → 排序，后出现者生效（980 先改后删）
+    const std::vector<PriceLevel> dup = {{999.5, 1.0}, {995.0, 2.0}, {990.5, 1.0}, {985.0, 3.0}, {980.0, 9.0},
+                                         {980.0, 0.0}, {975.5, 1.0}, {970.0, 0.0}, {960.5, 1.0}};
+    apply(BookSide::Bid, dup);
+    CHECK_EQ(scratch.sorted_batches, 1u);
+    // 买盘用了卖盘的顺序（最差在前）→ 排序
+    std::vector<PriceLevel> worst_first(bids.rbegin(), bids.rend());
+    for (PriceLevel& l : worst_first) l.quantity = std::isfinite(l.quantity) ? l.quantity + 1.0 : l.quantity;
+    apply(BookSide::Bid, worst_first);
+    CHECK_EQ(scratch.sorted_batches, 2u);
+    // 只有一个逆序对的近乎有序批次 → 排序
+    std::vector<PriceLevel> nearly = asks;
+    std::swap(nearly[3], nearly[4]);
+    apply(BookSide::Ask, nearly);
+    CHECK_EQ(scratch.sorted_batches, 3u);
+    CHECK_EQ(scratch.batches, 5u);
+    // 不超过 kBatchThreshold 条的小批次逐档 upsert，不计入批量路径
+    const std::vector<PriceLevel> small = {{1000.25, 1.0}, {999.25, 1.0}};
+    apply(BookSide::Bid, small);
+    CHECK_EQ(scratch.batches, 5u);
+}
+
 TEST_CASE("orderbook: applyLevels does not allocate once the scratch and book have grown") {
     LevelBatchScratch scratch;
     OrderBook b;
     std::mt19937_64 rng(7);
     for (int i = 0; i < 1000; ++i) b.updateBid(60000.0 - i * 0.01, 1.0);
     std::vector<PriceLevel> batch(130);
-    // 一轮：130 档随机深度的变化（约 1/3 删除）后补回到约 1000 档
-    auto step = [&] {
+    // 一轮：130 档随机深度的变化（约 1/3 删除）后补回到约 1000 档。轮流使用随机顺序（排序路径）与
+    // 去重后最优在前的顺序（免排序路径），两条路径都必须零分配
+    auto step = [&](bool best_first) {
         for (PriceLevel& l : batch) {
             l.price = 60000.0 - static_cast<double>(rng() % 1000) * 0.01;
             l.quantity = static_cast<double>(rng() % 3);
         }
-        b.applyLevels(BookSide::Bid, batch.data(), batch.size(), scratch);
+        std::size_t n = batch.size();
+        if (best_first) {
+            std::sort(batch.begin(), batch.end(),
+                      [](const PriceLevel& x, const PriceLevel& y) { return x.price > y.price; });
+            const auto same_price = [](const PriceLevel& x, const PriceLevel& y) { return x.price == y.price; };
+            n = static_cast<std::size_t>(std::unique(batch.begin(), batch.end(), same_price) - batch.begin());
+        }
+        b.applyLevels(BookSide::Bid, batch.data(), n, scratch);
         while (b.getBidCount() < 1000) b.updateBid(60000.0 - static_cast<double>(rng() % 1000) * 0.01, 1.0);
     };
-    for (int warm = 0; warm < 300; ++warm) step();  // 预热：簿与工作区两块存储的容量都长到稳态
+    for (int warm = 0; warm < 300; ++warm) step(warm % 2 == 0);  // 预热：簿与工作区两块存储的容量都长到稳态
+    const std::uint64_t sorts_before = scratch.sorted_batches;
     g_alloc_count.store(0);
     g_count_allocs.store(true);
-    for (int i = 0; i < 1000; ++i) step();
+    for (int i = 0; i < 1000; ++i) step(i % 2 == 0);
     g_count_allocs.store(false);
     CHECK_EQ(g_alloc_count.load(), 0u);
+    CHECK_EQ(scratch.sorted_batches - sorts_before, 500u);  // 随机顺序的一半排序，最优在前的一半不排序
     CHECK(b.validate());
 }
 
