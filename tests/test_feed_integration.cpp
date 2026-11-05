@@ -84,7 +84,8 @@ __attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&)
 // ============================================================================
 // getaddrinfo 替换："dual.test" 解析为两个 127.0.0.1 端点（各带端口，忽略 service），模拟第一个地址不通的
 // 多地址主机（本机没有可用的 IPv6，无法用真实的双栈地址）；其他名字交给真正的 getaddrinfo。
-// connect 替换：测试可以让下一次 connect() 停在系统调用之前——正是"套接字已登记、连接尚未发起"的窗口。
+// connect 替换：测试可以让下一次 connect() 停在系统调用之前——正是"套接字已登记、连接尚未发起"的窗口；
+// 也可以记录发往某个端口的每次 connect() 的时刻（见 ConnectTrace）。
 // ============================================================================
 
 namespace {
@@ -93,6 +94,9 @@ std::atomic<int> g_dual_second_port{0};
 std::atomic<bool> g_connect_park{false};     // 下一次 connect() 停住
 std::atomic<bool> g_connect_parked{false};   // 已经停在系统调用之前
 std::atomic<bool> g_connect_release{false};  // 放行
+std::atomic<int> g_connect_trace_port{0};    // 非 0：记录发往这个端口的每次 connect() 的 nowNs()
+std::mutex g_connect_trace_mutex;            // 保护 g_connect_trace_ns
+std::vector<std::int64_t> g_connect_trace_ns;
 
 // 与 glibc 相同：addrinfo 与它的 sockaddr 在同一块内存里（freeaddrinfo 只释放 addrinfo 本身）
 addrinfo* loopbackAddrinfo(int port, addrinfo* next) {
@@ -133,6 +137,13 @@ extern "C" int getaddrinfo(const char* node, const char* service, const struct a
 extern "C" int connect(int fd, const struct sockaddr* addr, socklen_t len) {
     using Fn = int (*)(int, const sockaddr*, socklen_t);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "connect"));
+    const int trace_port = g_connect_trace_port.load();
+    if (trace_port != 0 && addr != nullptr && addr->sa_family == AF_INET &&
+        ntohs(reinterpret_cast<const sockaddr_in*>(addr)->sin_port) == trace_port) {
+        const std::int64_t now = hft::nowNs();
+        std::lock_guard<std::mutex> lock(g_connect_trace_mutex);
+        g_connect_trace_ns.push_back(now);
+    }
     if (g_connect_park.exchange(false)) {
         g_connect_parked.store(true);
         while (!g_connect_release.load()) std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -406,6 +417,31 @@ std::string idsToString(const std::vector<std::uint64_t>& ids) {
     for (std::size_t i = 0; i < ids.size(); ++i) s += (i ? "," : "") + std::to_string(ids[i]);
     return s + "]";
 }
+
+// 记录对象存活期间发往 server 端口的每次 connect()（客户端时刻，按发起顺序）。测试里只有 feed 一个客户端、
+// 服务器一直在监听，所以第 i 次 connect 就是服务器接受的第 i 个连接（HttpRequestInfo::connection）。
+// REST 请求的间隔要按客户端发起连接的时刻量：feed 保证的是请求开始时刻的间隔，而服务器解析到请求的时刻还隔着
+// 各自的 TCP 接受与 TLS 握手（负载下相差几十毫秒），服务器接受连接的时刻也带着接受线程的调度延迟。
+class ConnectTrace {
+public:
+    explicit ConnectTrace(const MockExchangeServer& server) {
+        std::lock_guard<std::mutex> lock(g_connect_trace_mutex);
+        g_connect_trace_ns.clear();
+        g_connect_trace_ns.reserve(256);
+        g_connect_trace_port.store(server.port());
+    }
+    ~ConnectTrace() { g_connect_trace_port.store(0); }
+    ConnectTrace(const ConnectTrace&) = delete;
+    ConnectTrace& operator=(const ConnectTrace&) = delete;
+
+    // 第 k 个与第 k - 1 个 REST 请求的连接发起时刻之差（毫秒）
+    double requestGapMs(const std::vector<HttpRequestInfo>& reqs, std::size_t k) const {
+        std::lock_guard<std::mutex> lock(g_connect_trace_mutex);
+        REQUIRE(k >= 1 && k < reqs.size());
+        REQUIRE(reqs[k].connection < g_connect_trace_ns.size());
+        return ms(g_connect_trace_ns[reqs[k].connection] - g_connect_trace_ns[reqs[k - 1].connection]);
+    }
+};
 
 // 状态观察者：后台线程每 100 µs 采样一次 status()，记录每次变化
 class StatusWatcher {
@@ -939,6 +975,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     cfg.rest_host = "127.0.0.1";
     cfg.rest_port = server.portString();
     cfg.snapshot_path = kBinanceSnapshotPath;
+    const ConnectTrace trace(server);
     FeedRunner runner(cfg);
     SnapshotLog log;
     const bool done = waitFor(
@@ -983,8 +1020,8 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         CHECK_EQ(r.target, std::string(kBinanceSnapshotPath));
         CHECK_EQ(r.user_agent, std::string("crypto_hft_engine/2.0"));
     }
-    // 两次快照请求之间至少相隔 rest_min_interval_ms（20 ms，-20% 抖动下至少 16 ms）
-    CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 15.0);
+    // 两次快照请求（开始时刻）之间至少相隔 rest_min_interval_ms（20 ms，-20% 抖动下至少 16 ms）
+    CHECK_GE(trace.requestGapMs(reqs, 1), 15.0);
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.messages, 5u);
     CHECK_EQ(s.rest_snapshots, 3u);
@@ -2133,12 +2170,13 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
     cfg.snapshot_path = kBinanceSnapshotPath;
     cfg.rest_max_attempts = 3;
     cfg.rest_min_interval_ms = 20;
+    const ConnectTrace trace(server);
     FeedRunner runner(cfg);
     REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
     const std::vector<HttpRequestInfo> reqs = server.httpRequests();
     REQUIRE(reqs.size() >= 3);
-    CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 20 * 0.8 - 2.0);   // 第 1 次重试：20 ms ±20%
-    CHECK_GE(ms(reqs[2].time_ns - reqs[1].time_ns), 40 * 0.8 - 2.0);   // 连续失败 2 次：间隔加倍，40 ms ±20%
+    CHECK_GE(trace.requestGapMs(reqs, 1), 20 * 0.8 - 2.0);  // 第 1 次重试：20 ms ±20%
+    CHECK_GE(trace.requestGapMs(reqs, 2), 40 * 0.8 - 2.0);  // 连续失败 2 次：间隔加倍，40 ms ±20%
     // 第一个会话恰好请求了 rest_max_attempts 次就放弃并重连
     const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
     REQUIRE(sessions.size() >= 2);
@@ -2204,11 +2242,12 @@ TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when ev
     cfg.reconnect_initial_ms = 100;
     cfg.reconnect_max_ms = 100;
     EventLog events;
+    const ConnectTrace trace(server);
     FeedRunner runner(cfg, events.callback());
     REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
     const std::vector<HttpRequestInfo> reqs = firstSessionRequests(server);
     REQUIRE_EQ(reqs.size(), std::size_t{2});  // 之前：一个会话里每个缺口一次，没有上限
-    CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 150 * 0.8 - 2.0);  // 事件每 30 ms 一个，请求却至少相隔 ~150 ms
+    CHECK_GE(trace.requestGapMs(reqs, 1), 150 * 0.8 - 2.0);  // 事件每 30 ms 一个，请求却至少相隔 ~150 ms
     CHECK(contains(runner.feed.lastError(), "REST snapshot request limit reached (rest_max_attempts 2), reconnecting"));
     CHECK(contains(runner.feed.lastError(), "gap"));
     CHECK(events.inOrder({"[Binance] book synced (LIVE)", "[Binance] REST snapshot request limit reached",
