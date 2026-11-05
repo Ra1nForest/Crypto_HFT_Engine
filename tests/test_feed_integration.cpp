@@ -367,6 +367,7 @@ FeedConfig baseConfig(Exchange exchange, MockExchangeServer& server) {
     c.connect_timeout_ms = 10000;
     c.reconnect_initial_ms = 20;
     c.reconnect_max_ms = 200;
+    c.rest_min_interval_ms = 20;
     c.ping_interval_ms = 0;
     c.log_to_stderr = false;
     if (exchange == Exchange::OKX) c.subscribe_msg = kOkxBooks5Sub;
@@ -979,7 +980,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         CHECK_EQ(r.target, std::string(kBinanceSnapshotPath));
         CHECK_EQ(r.user_agent, std::string("crypto_hft_engine/2.0"));
     }
-    // 两次快照请求之间按退避等待（initial 20 ms，-20% 抖动下至少 16 ms）
+    // 两次快照请求之间至少相隔 rest_min_interval_ms（20 ms，-20% 抖动下至少 16 ms）
     CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 15.0);
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.messages, 5u);
@@ -2069,13 +2070,13 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
     cfg.rest_port = server.portString();
     cfg.snapshot_path = kBinanceSnapshotPath;
     cfg.rest_max_attempts = 3;
-    cfg.reconnect_initial_ms = 20;
+    cfg.rest_min_interval_ms = 20;
     FeedRunner runner(cfg);
     REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
     const std::vector<HttpRequestInfo> reqs = server.httpRequests();
     REQUIRE(reqs.size() >= 3);
     CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 20 * 0.8 - 2.0);   // 第 1 次重试：20 ms ±20%
-    CHECK_GE(ms(reqs[2].time_ns - reqs[1].time_ns), 40 * 0.8 - 2.0);   // 第 2 次重试：40 ms ±20%
+    CHECK_GE(ms(reqs[2].time_ns - reqs[1].time_ns), 40 * 0.8 - 2.0);   // 连续失败 2 次：间隔加倍，40 ms ±20%
     // 第一个会话恰好请求了 rest_max_attempts 次就放弃并重连
     const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
     REQUIRE(sessions.size() >= 2);
@@ -2092,6 +2093,99 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
     CHECK_EQ(s.parse_errors, 0u);  // 非 200 不交给适配器解析
     const std::string err = runner.feed.lastError();
     CHECK(contains(err, "HTTP 500"));
+    CHECK(contains(err, "REST snapshot request limit reached (rest_max_attempts 3)"));
+}
+
+namespace {
+
+// Binance 增量深度：第 k 个 REST 请求返回 lastUpdateId = last_update_ids[k] 的快照（之后的请求用最后一个）
+mock_exchange::HttpHandler snapshotsBridging(std::vector<std::uint64_t> last_update_ids) {
+    auto ids = std::make_shared<const std::vector<std::uint64_t>>(std::move(last_update_ids));
+    return [ids](const HttpRequestInfo& info) {
+        const std::uint64_t id = (*ids)[std::min(info.index, ids->size() - 1)];
+        return HttpReply{200, binanceDepth(id, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}})};
+    };
+}
+
+// 第一个 WebSocket 会话期间到达的 REST 请求
+std::vector<HttpRequestInfo> firstSessionRequests(const MockExchangeServer& server) {
+    const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
+    std::vector<HttpRequestInfo> out;
+    for (const HttpRequestInfo& r : server.httpRequests()) {
+        if (r.time_ns > sessions.at(0) && (sessions.size() < 2 || r.time_ns < sessions[1])) out.push_back(r);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when every resync succeeds; requests are spaced") {
+    // 上游每个事件都有缺口：每次 REST 快照都能同步成功，但下一个事件又触发一轮重同步
+    MockExchangeServer server;
+    std::vector<std::uint64_t> ids;
+    for (std::uint64_t k = 0; k < 12; ++k) ids.push_back(100 * (k + 1) + 5);
+    server.setHttpHandler(snapshotsBridging(ids));
+    server.setWebSocketScript([](WsSession& ws) {
+        for (std::uint64_t k = 0; k < 12; ++k) {
+            const std::uint64_t base = 100 * (k + 1);
+            ws.send(binanceDiff(base + 1, base + 10, {{"65000.00", "1.5"}}, {}));
+            ws.sleepMs(30);
+        }
+    });
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = "/ws/btcusdt@depth@100ms";
+    cfg.rest_host = "127.0.0.1";
+    cfg.rest_port = server.portString();
+    cfg.snapshot_path = kBinanceSnapshotPath;
+    cfg.rest_max_attempts = 2;
+    cfg.rest_min_interval_ms = 150;
+    cfg.reconnect_initial_ms = 100;
+    cfg.reconnect_max_ms = 100;
+    EventLog events;
+    FeedRunner runner(cfg, events.callback());
+    REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
+    const std::vector<HttpRequestInfo> reqs = firstSessionRequests(server);
+    REQUIRE_EQ(reqs.size(), std::size_t{2});  // 之前：一个会话里每个缺口一次，没有上限
+    CHECK_GE(ms(reqs[1].time_ns - reqs[0].time_ns), 150 * 0.8 - 2.0);  // 事件每 30 ms 一个，请求却至少相隔 ~150 ms
+    CHECK(contains(runner.feed.lastError(), "REST snapshot request limit reached (rest_max_attempts 2), reconnecting"));
+    CHECK(contains(runner.feed.lastError(), "gap"));
+    CHECK(events.inOrder({"[Binance] book synced (LIVE)", "[Binance] REST snapshot request limit reached",
+                          "[Binance] reconnecting in "}));
+    const FeedStats s = runner.feed.stats();
+    CHECK_GE(s.rest_snapshots, 2u);
+    CHECK_EQ(s.connect_failures, 0u);
+}
+
+TEST_CASE("feed: the per-session REST budget refills once the book has stayed in sync for healthy_session_ms") {
+    // rest_max_attempts = 2：同步（请求 0）→ 连续 400 ms 没有缺口（> healthy 200 ms，额度恢复）→ 缺口（请求 1）
+    // → 缺口（请求 2，额度恢复后的第 2 次）→ 缺口：额度用完，重连。不恢复的话第一个会话只有 2 次请求。
+    MockExchangeServer server;
+    server.setHttpHandler(snapshotsBridging({105, 1005, 2005}));
+    server.setWebSocketScript([](WsSession& ws) {
+        ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {}));
+        for (std::uint64_t j = 0; j < 20; ++j) {  // 不间断的事件：111..120, 121..130, ...
+            ws.sleepMs(20);
+            ws.send(binanceDiff(111 + 10 * j, 120 + 10 * j, {{"65000.00", std::to_string(2 + j)}}, {}));
+        }
+        for (std::uint64_t g = 1; g <= 3; ++g) {  // 三个缺口
+            ws.sleepMs(100);
+            ws.send(binanceDiff(1000 * g + 1, 1000 * g + 10, {{"65000.00", "1.0"}}, {}));
+        }
+    });
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = "/ws/btcusdt@depth@100ms";
+    cfg.rest_host = "127.0.0.1";
+    cfg.rest_port = server.portString();
+    cfg.snapshot_path = kBinanceSnapshotPath;
+    cfg.rest_max_attempts = 2;
+    cfg.rest_min_interval_ms = 50;
+    cfg.healthy_session_ms = 200;
+    FeedRunner runner(cfg);
+    REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
+    const std::vector<HttpRequestInfo> reqs = firstSessionRequests(server);
+    CHECK_EQ(reqs.size(), std::size_t{3});
+    CHECK(contains(runner.feed.lastError(), "REST snapshot request limit reached (rest_max_attempts 2)"));
+    CHECK_GE(runner.feed.stats().gaps, 3u);
 }
 
 TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never completes the TLS handshake") {

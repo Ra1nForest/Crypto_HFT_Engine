@@ -87,7 +87,10 @@ struct FeedConfig {
     int ping_interval_ms = -1;         // 心跳间隔：< 0 用适配器默认值（OKX/Bybit 20000，Binance 无），0 关闭心跳，
                                        // > 0 覆盖。空闲 min(间隔, stall_timeout_ms / 2) 即发心跳（见类注释）
     int healthy_session_ms = 30000;    // 会话连续 LIVE 超过这么久即视为健康：退避计数清零
-    int rest_max_attempts = 5;         // 每个会话 REST 快照最多尝试次数，超过则重连
+    int rest_max_attempts = 5;         // 每个会话最多 REST 快照请求次数，用完即结束会话重连；簿连续同步
+                                       // healthy_session_ms 之后额度恢复
+    int rest_min_interval_ms = 1000;   // 同一会话内两次 REST 快照请求（开始时刻）的最小间隔；连续失败时按 2 倍
+                                       // 递增（±20% 抖动，上限 reconnect_max_ms；每次等待不超过 stall_timeout_ms / 2）
     std::size_t max_buffered_events = 2000;   // Binance 同步前事件缓冲上限（AdapterConfig）
     bool log_to_stderr = true;         // 会话结束的错误是否写 stderr（测试可关闭）
 };
@@ -252,7 +255,8 @@ private:
 //   reconnect → 结束会话并立即重连（不退避）；need_rest_snapshot → 在读处理器里同步执行 HTTPS GET
 //   rest_host:rest_port/snapshot_path（同样的校验规则，响应体上限 16 MiB；其间 io_context 暂停，
 //   WebSocket 数据暂存在内核缓冲区），200 的响应体交给 onRestSnapshot，非 200 / 传输失败视为失败；
-//   适配器继续要求时按退避重试，每会话最多 rest_max_attempts 次，之后重连。
+//   适配器继续要求时重试。每个会话最多 rest_max_attempts 次请求（簿连续同步 healthy_session_ms 之后额度恢复），
+//   用完即结束会话重连；同一会话内两次请求至少相隔 rest_min_interval_ms，连续失败时间隔按 2 倍递增。
 //   （先发布、后拉 REST：缺口导致的空簿立即让消费者知道，不必等待 REST 往返。）
 // 心跳：有应用层心跳的交易所（OKX "ping"、Bybit {"op":"ping"}）在 idle_ping = min(心跳间隔, stall_timeout_ms / 2)
 // 内没有收到任何帧时发送 pingMessage()，数据一直在来也至少每个心跳间隔发一次；没有应用层心跳的交易所
@@ -471,6 +475,7 @@ private:
         c.reconnect_initial_ms = std::max(1, c.reconnect_initial_ms);
         c.reconnect_max_ms = std::max(c.reconnect_initial_ms, c.reconnect_max_ms);
         c.rest_max_attempts = std::max(1, c.rest_max_attempts);
+        c.rest_min_interval_ms = std::max(1, c.rest_min_interval_ms);
         c.publish_levels = std::clamp(c.publish_levels, 0, BookSnapshot::kMaxLevels);
         if (c.path.empty()) c.path = "/";
         return c;
@@ -896,6 +901,9 @@ private:
         synced_ = false;
         healthy_ = false;
         live_since_ns_ = 0;
+        rest_requests_ = 0;
+        rest_failures_ = 0;
+        last_rest_ns_ = 0;
         status_.store(FeedStatus::Syncing, std::memory_order_release);
         return true;
     }
@@ -916,7 +924,9 @@ private:
         return std::nullopt;
     }
 
-    // 拉取 REST 快照直到适配器满意；失败按退避重试，超过 rest_max_attempts 次结束会话
+    // 拉取 REST 快照直到适配器满意。每个会话最多 rest_max_attempts 次请求，用完即结束会话（之后按退避重连）；
+    // 簿连续同步 healthy_session_ms 之后额度恢复（长时间运行的会话偶尔出现缺口不会因此重连）。
+    // 请求之间的间隔见 waitRestSpacing：持续出现缺口的上游不会让我们密集地请求 REST。
     std::optional<SessionEnd> fetchRestSnapshot(Connection& c) {
         if (cfg_.rest_host.empty() || cfg_.snapshot_path.empty()) {
             return SessionEnd{EndKind::Error,
@@ -932,19 +942,29 @@ private:
         rq.body_limit = adapter_detail::kMaxMessageBytes;
         rq.connect_timeout_ms = restConnectBudgetMs();
         rq.endpoint_cursor = &rest_cursor_;
-        for (int attempt = 1;; ++attempt) {
-            activity_ns_.store(hft::nowNs(), std::memory_order_relaxed);
+        std::string problem = out_.error;  // 触发这一轮的原因（例如缺口）
+        for (;;) {
+            if (rest_requests_ >= cfg_.rest_max_attempts) {
+                return SessionEnd{EndKind::Error, "REST snapshot request limit reached (rest_max_attempts " +
+                                                      std::to_string(cfg_.rest_max_attempts) + "), reconnecting" +
+                                                      (problem.empty() ? std::string()
+                                                                       : " (last error: " + problem + ")")};
+            }
+            if (auto end = waitRestSpacing()) return end;
+            ++rest_requests_;
+            last_rest_ns_ = hft::nowNs();
+            activity_ns_.store(last_rest_ns_, std::memory_order_relaxed);
             const hft::net::HttpResult http = hft::net::httpsGet(ioc_, *ssl_ctx_, rest_resolver_, registry_, rq);
             const std::int64_t recv_ns = hft::nowNs();
             activity_ns_.store(recv_ns, std::memory_order_relaxed);
             if (registry_.interrupted()) return interruptedEnd();
-            std::string problem;
             if (http.ok && http.status == 200) {
                 rest_out_.reset();
                 adapter_->onRestSnapshot(http.body, rest_out_);
                 copyAdapterStats();
                 if (auto end = processResult(c, rest_out_, recv_ns)) return end;  // 已记录 rest_out_.error
                 if (!rest_out_.need_rest_snapshot) {
+                    rest_failures_ = 0;
                     stage_ = saved_stage;
                     return std::nullopt;
                 }
@@ -956,17 +976,25 @@ private:
                                   : "REST snapshot request failed: " + http.error;
                 noteError(problem);
             }
-            if (attempt >= cfg_.rest_max_attempts) {
-                return SessionEnd{EndKind::Error, "REST snapshot failed " + std::to_string(attempt) +
-                                                      " times, reconnecting (last error: " + problem + ")"};
-            }
-            std::uniform_real_distribution<double> jitter(-1.0, 1.0);
-            int delay = backoffDelayMs(attempt - 1, cfg_.reconnect_initial_ms, cfg_.reconnect_max_ms, jitter(rng_));
-            // 退避期间不读 WebSocket：等待不超过停顿阈值的一半，避免看门狗把这段等待当成停顿
-            if (cfg_.stall_timeout_ms > 0) delay = std::min(delay, std::max(1, cfg_.stall_timeout_ms / 2));
-            if (!sleepFor(delay)) return SessionEnd{EndKind::Stopped, std::string()};
-            if (registry_.interrupted()) return interruptedEnd();
+            ++rest_failures_;
         }
+    }
+
+    // 同一会话内两次 REST 请求的开始时刻至少相隔 rest_min_interval_ms；连续失败 k 次之后为它的 2^(k-1) 倍
+    // （±20% 抖动，上限 reconnect_max_ms）。本会话的第一次请求不等待。等待期间不读 WebSocket：每次等待
+    // 不超过停顿阈值的一半，避免看门狗把这段等待当成停顿。
+    std::optional<SessionEnd> waitRestSpacing() {
+        if (last_rest_ns_ == 0) return std::nullopt;
+        std::uniform_real_distribution<double> jitter(-1.0, 1.0);
+        const int spacing = backoffDelayMs(std::max(0, rest_failures_ - 1), cfg_.rest_min_interval_ms,
+                                           cfg_.reconnect_max_ms, jitter(rng_));
+        const std::int64_t wait_ns = last_rest_ns_ + feed_detail::msToNs(spacing) - hft::nowNs();
+        if (wait_ns <= 0) return std::nullopt;
+        int delay = static_cast<int>(std::min<std::int64_t>((wait_ns + 999999) / 1000000, spacing));
+        if (cfg_.stall_timeout_ms > 0) delay = std::min(delay, std::max(1, cfg_.stall_timeout_ms / 2));
+        if (!sleepFor(delay)) return SessionEnd{EndKind::Stopped, std::string()};
+        if (registry_.interrupted()) return interruptedEnd();
+        return std::nullopt;
     }
 
     SessionEnd readFailed(const feed_detail::error_code& ec, WsStream& ws) const {
@@ -1046,11 +1074,15 @@ private:
     // 会话连续 Live 超过 healthy_session_ms：退避计数清零。每次活动（消息、控制帧）都检查一次，
     // 所以只有心跳往来的安静会话同样会被认定为健康。
     void updateHealthy(std::int64_t now) noexcept {
-        if (synced_ && !healthy_ && now - live_since_ns_ >= feed_detail::msToNs(cfg_.healthy_session_ms)) {
+        if (!synced_ || now - live_since_ns_ < feed_detail::msToNs(cfg_.healthy_session_ms)) return;
+        if (!healthy_) {
             healthy_ = true;
             attempt_ = 0;
             immediate_budget_ = kMaxImmediateReconnects;
         }
+        // 簿自上次（重新）同步以来已连续同步这么久：本会话的 REST 额度恢复
+        rest_requests_ = 0;
+        rest_failures_ = 0;
     }
 
     // ---------------- 发布 ----------------
@@ -1209,6 +1241,9 @@ private:
     bool synced_ = false;
     bool healthy_ = false;
     std::int64_t live_since_ns_ = 0;
+    int rest_requests_ = 0;                           // 本会话（额度恢复以来）的 REST 快照请求数
+    int rest_failures_ = 0;                           // 连续失败的 REST 请求数（同步成功后清零）
+    std::int64_t last_rest_ns_ = 0;                   // 本会话上一次 REST 请求的开始时刻（0 = 还没有）
     bool delivered_nonempty_ = false;                 // 消费者最后收到（真正入队）的快照非空
     bool publish_pending_ = false;                    // 会话边界的快照因队列满还没入队：需要重试
     const char* stage_ = "setup";                     // 当前步骤（用于错误信息）
