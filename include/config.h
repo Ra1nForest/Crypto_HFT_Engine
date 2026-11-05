@@ -60,7 +60,7 @@ struct DisplayConfig {
 struct ConnectionConfig {
     bool tls_verify = true;          // 校验证书链与主机名
     std::string ca_file;             // 额外信任的 CA（PEM）；"" = 只用系统 CA（离线模拟交易所演示用）
-    int stall_timeout_ms = 15000;    // 已连接但这么久没有数据 → 踢断重连
+    int stall_timeout_ms = 15000;    // 已连接但这么久没有收到任何帧（含心跳回应）→ 踢断重连
     int reconnect_initial_ms = 500;  // 指数退避初始值
     int reconnect_max_ms = 30000;    // 指数退避上限
 };

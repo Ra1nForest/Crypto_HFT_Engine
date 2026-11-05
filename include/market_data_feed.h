@@ -75,7 +75,7 @@ struct FeedConfig {
     bool tls_verify = true;          // 校验服务器证书链与主机名
     std::string ca_file;             // 额外信任的 CA（PEM，测试用）；"" = 只用系统默认 CA
     bool verify_checksum = true;     // OKX books checksum
-    int stall_timeout_ms = 15000;    // 已连接但这么久没有数据 → 踢断连接（checkHealth；<= 0 关闭）
+    int stall_timeout_ms = 15000;    // 已连接但这么久没有收到任何帧（含心跳回应）→ 踢断连接（checkHealth；<= 0 关闭）
     int reconnect_initial_ms = 500;  // 指数退避（±20% 抖动），健康会话后重置
     int reconnect_max_ms = 30000;
     int publish_levels = BookSnapshot::kMaxLevels;   // 每侧发布的档位数（钳制到 [0, kMaxLevels]）
