@@ -10,7 +10,8 @@
 #   tools/run_mock_demo.sh 60                    # 交互终端里显示 TUI，运行 60 s
 #   tools/run_mock_demo.sh 30 --fee-rate 0.001   # 收 0.1% 手续费：只有大错位时才出现套利信号
 #   tools/run_mock_demo.sh 20 --headless         # 无 TUI，每秒一行状态（stdout 不是终端时自动启用）
-#   tools/run_mock_demo.sh 30 --drop-rate 0.02   # 故障注入：随机丢推送，监控程序显示缺口与重同步
+#   tools/run_mock_demo.sh 30 --drop-rate 0.02   # 故障注入：随机丢推送，监控程序显示缺口与重同步；
+#                                                  持续丢包时 Binance 偶尔重连（每会话的 REST 快照额度用完）
 # Ctrl+C：监控程序与模拟交易所都收到 SIGINT，各自正常退出并打印汇总。
 #
 
@@ -35,7 +36,9 @@ for SECONDS, then stops the mock exchange and prints its summary.
                    with 0.001 signals only appear during the occasional large dislocations)
   --seed N         mock exchange RNG seed (default 1)
   --drop-rate P    mock exchange fault injection: withhold each pushed message from a session with
-                   probability P, so the monitor sees gaps and resyncs (default 0)
+                   probability P, so the monitor sees gaps and resyncs (default 0). Sustained loss
+                   also makes Binance reconnect now and then: each gap costs a REST snapshot, and a
+                   session may fetch at most 5 unless its book stays in sync for 30 s in between
   --build-dir DIR  directory with mock_exchange and crypto_hft_engine (default build)
   --help           show this help
 EOF
