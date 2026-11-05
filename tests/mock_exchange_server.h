@@ -66,6 +66,8 @@
 // 因此客户端发来的帧随时被接收、记录（WebSocket ping 自动应答）。异步处理器只访问 WsSession 的成员，
 // 脚本因异常提前结束也不会留下悬空引用。stop()（析构）关闭监听套接字，各连接在约 10 ms 内结束并被 join。
 // 脚本必须通过 WsSession 的方法等待，不要直接 sleep 线程（否则停止时要等它返回）。
+// 其他线程产生了需要推送的数据时，可通过 WsSession::waker() 取得的 SessionWaker 立即唤醒正在等待的脚本。
+// 长期运行的服务器（tools/mock_exchange.h）把脚本、HTTP 处理与升级过滤直接放进 ServerOptions，开始监听之前即生效。
 namespace mock_exchange {
 
 namespace asio = boost::asio;
@@ -306,20 +308,66 @@ struct ServerOptions {
     std::optional<TlsIdentity> identity;   // 未提供时按 certificate 生成
     CertificateOptions certificate;
     int handshake_timeout_ms = 5000;       // TLS 握手 / 读取 HTTP 请求 / WebSocket 升级的时限
+    // 初始行为：在开始监听之前就生效（长期运行的服务器不存在"已开始接受连接、行为尚未设置"的窗口）。
+    // 之后仍可用 setWebSocketScript / setHttpHandler / setUpgradeFilter 修改。
+    WsScript script;
+    HttpHandler http_handler;
+    std::function<bool(const std::string&)> upgrade_filter;
 };
 
 class MockExchangeServer;
+class WsSession;
 
-// 一个服务器端连接；WebSocket 升级后作为脚本的句柄。只在所属连接线程上使用。
+// 跨线程唤醒句柄（可复制）：wake() 可在任意线程调用，让该会话线程上正在进行的等待（waitUntil / sleepMs /
+// expectText ...）立即重新检查条件，而不必等到下一个 10 ms 的轮询片。会话结束之后调用是空操作，
+// 因此持有者无需与会话的生命周期同步。默认构造的句柄什么也不做。
+class SessionWaker {
+public:
+    SessionWaker() = default;
+
+    void wake() const noexcept {
+        if (!state_) return;
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->ioc == nullptr) return;
+        try {
+            asio::post(*state_->ioc, [] {});
+        } catch (...) {
+        }
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(state_); }
+
+private:
+    friend class WsSession;
+    struct State {
+        std::mutex mutex;
+        asio::io_context* ioc = nullptr;  // 会话结束（teardown）时清空
+    };
+    explicit SessionWaker(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+    std::shared_ptr<State> state_;
+};
+
+// 一个服务器端连接；WebSocket 升级后作为脚本的句柄。只在所属连接线程上使用（waker() 返回的句柄除外）。
 class WsSession {
 public:
     WsSession(const WsSession&) = delete;
     WsSession& operator=(const WsSession&) = delete;
+    ~WsSession() { detachWaker(); }
 
     std::size_t connectionIndex() const noexcept { return connection_; }   // TCP 连接编号（接受顺序）
     std::size_t sessionIndex() const noexcept { return session_; }         // WebSocket 会话编号
     const std::string& target() const noexcept { return target_; }         // 升级请求的路径
     inline MockExchangeServer& server() noexcept;
+
+    // 本会话的跨线程唤醒句柄（首次调用时创建；之后返回指向同一状态的句柄）
+    SessionWaker waker() {
+        if (!wake_state_) {
+            wake_state_ = std::make_shared<SessionWaker::State>();
+            wake_state_->ioc = &ioc_;
+        }
+        return SessionWaker(wake_state_);
+    }
 
     // 发送一个文本帧（阻塞到写完）；连接已断开时抛出 ConnectionClosed
     void send(std::string_view text) {
@@ -486,8 +534,16 @@ private:
         sock.close(ec);
     }
 
+    // 唤醒句柄从此失效（之后的 wake() 为空操作）；io_context 销毁之前必须调用
+    void detachWaker() noexcept {
+        if (!wake_state_) return;
+        std::lock_guard<std::mutex> lock(wake_state_->mutex);
+        wake_state_->ioc = nullptr;
+    }
+
     // 结束连接：关闭套接字并让所有挂起的处理器（已被取消）执行完毕
     void teardown() noexcept {
+        detachWaker();
         open_ = false;
         error_code ec;
         beast::get_lowest_layer(ws_).shutdown(tcp::socket::shutdown_both, ec);
@@ -523,6 +579,7 @@ private:
     bool reading_ = false;
     bool peer_closed_ = false;  // WebSocket 读循环已结束（客户端关闭或连接出错）
     bool open_ = false;         // WebSocket 已建立且尚未由服务器关闭
+    std::shared_ptr<SessionWaker::State> wake_state_;  // waker() 的共享状态（未调用时为空）
 };
 
 // ---------------------------------------------------------------------------
@@ -543,6 +600,9 @@ public:
         ssl_ctx_.set_options(ssl::context::default_workarounds);
         ssl_ctx_.use_certificate_chain(asio::buffer(identity_.cert_pem));
         ssl_ctx_.use_private_key(asio::buffer(identity_.key_pem), ssl::context::pem);
+        if (opt_.script) scripts_.assign(1, opt_.script);
+        http_handler_ = opt_.http_handler;
+        upgrade_filter_ = opt_.upgrade_filter;
         const tcp::endpoint ep(asio::ip::make_address(opt_.bind_address), opt_.port);
         acceptor_.open(ep.protocol());
         acceptor_.set_option(asio::socket_base::reuse_address(true));

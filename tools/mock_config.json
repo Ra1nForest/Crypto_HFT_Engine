@@ -1,0 +1,15 @@
+{
+  "binance": {"enabled": true, "host": "localhost", "port": "19443",
+              "path": "/ws/btcusdt@depth@100ms", "symbol": "BTCUSDT",
+              "rest_host": "localhost", "rest_port": "19443",
+              "snapshot_path": "/api/v3/depth?symbol=BTCUSDT&limit=1000"},
+  "okx":     {"enabled": true, "host": "localhost", "port": "18443", "path": "/ws/v5/public",
+              "symbol": "BTCUSDT",
+              "subscribe": "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"books\",\"instId\":\"BTC-USDT\"}]}"},
+  "bybit":   {"enabled": true, "host": "localhost", "port": "18444", "path": "/v5/public/spot",
+              "symbol": "BTCUSDT", "subscribe": "{\"op\":\"subscribe\",\"args\":[\"orderbook.50.BTCUSDT\"]}"},
+  "arbitrage": {"fee_rate": 0.0, "min_profit": 0.01, "max_qty": 0.0, "max_levels": 20},
+  "display": {"refresh_ms": 200, "levels": 5, "spread_log_interval": 50},
+  "connection": {"tls_verify": true, "ca_file": "/tmp/mock_exchange_ca.pem", "stall_timeout_ms": 5000,
+                 "reconnect_initial_ms": 250, "reconnect_max_ms": 5000}
+}

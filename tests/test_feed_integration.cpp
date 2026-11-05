@@ -1219,6 +1219,8 @@ TEST_CASE("feed: tls_verify=false connects to the self-signed server without any
     REQUIRE(waitFor([&] { log.pump(runner.feed); return !log.all.empty(); }, 5000));
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);
+    // 脚本不等订阅帧就推送：服务器线程只在下一次运行 io_context 时才记录客户端的帧，先等它记录下来
+    CHECK(waitFor([&] { return !server.framesReceived(0).empty(); }, 2000));
     CHECK_EQ(server.framesReceived(0), std::vector<std::string>{kOkxBooks5Sub});
 }
 

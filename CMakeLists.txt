@@ -62,6 +62,12 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/exchange_sim.cpp)
     target_link_libraries(exchange_sim PRIVATE hft_core)
 endif()
 
+# 离线模拟交易所（源文件存在时才构建）：三家交易所协议的 TLS WebSocket + REST 服务器，供监控程序端到端演示
+if(EXISTS ${CMAKE_SOURCE_DIR}/tools/mock_exchange.cpp)
+    add_executable(mock_exchange tools/mock_exchange.cpp)
+    target_link_libraries(mock_exchange PRIVATE market_data)
+endif()
+
 # 测试：tests/<name>.cpp 存在时注册为 CTest 用例，工作目录为仓库根目录
 if(HFT_BUILD_TESTS)
     enable_testing()
@@ -78,6 +84,7 @@ if(HFT_BUILD_TESTS)
     hft_add_test(test_engine_runner hft_core)
     hft_add_test(test_market_data market_data)
     hft_add_test(test_feed_integration market_data)
+    hft_add_test(test_mock_exchange market_data)
     hft_add_test(test_app market_data)
 endif()
 
