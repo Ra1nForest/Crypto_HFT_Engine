@@ -38,7 +38,7 @@ struct ArbitrageSignal {
 };
 
 // 一次扫单的结果。
-// 规格写作 net = revenue - cost - fees；数学上与这里的 gross - fees 相同。gross 按每一步的 (bid - ask) × q 累加：
+// 定义为 net = revenue - cost - fees；数学上与这里的 gross - fees 相同。gross 按每一步的 (bid - ask) × q 累加：
 // 每侧一档时它就是 v1 的 (sell - buy) × qty，逐位相等（revenue - cost 两个大数相减会多一次舍入，做不到）。
 struct SweepResult {
     double qty = 0.0;       // 总数量

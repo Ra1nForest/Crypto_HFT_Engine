@@ -1,6 +1,6 @@
 //
 // reference_order_book.h
-// 撮合引擎参考模型（测试预言机）：用最朴素的 std 容器逐条实现设计文档 2.4 的规则，
+// 撮合引擎参考模型（测试预言机）：用最朴素的 std 容器逐条实现 docs/MATCHING_ENGINE.md「Semantics」中的规则，
 // 作为差分测试的标准答案。正确性一目了然优先，完全不考虑性能。
 //
 
@@ -25,7 +25,7 @@ namespace hft::matching {
 
 // 命名空间：ReferenceOrderBook 与优化版 LimitOrderBook 并列放在 hft::matching，
 // 类名即可区分两种实现；它只存在于 tests/ 目录，不进入生产代码。
-// 接口与 LimitOrderBook 完全一致（设计文档 2.3），因此同一套规范测试可以原样运行在两者之上。
+// 接口与 LimitOrderBook 完全一致（docs/MATCHING_ENGINE.md），因此同一套规范测试可以原样运行在两者之上。
 //
 // 数据结构（刻意保持朴素）：
 // - 每侧一个 std::map<Price, std::list<OrderInfo>>，比较器保证 begin() 恒为最优档
@@ -58,7 +58,7 @@ public:
     ReferenceOrderBook(const ReferenceOrderBook&) = delete;
     ReferenceOrderBook& operator=(const ReferenceOrderBook&) = delete;
 
-    // ---- 新订单（规范 2.4 submit）----
+    // ---- 新订单（docs/MATCHING_ENGINE.md「submit」）----
     void submit(const OrderRequest& req) {
         // 校验：按规范顺序检查，第一条失败的规则生效，且只发出这一个拒单事件
         if (req.qty <= 0) {

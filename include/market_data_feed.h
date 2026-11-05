@@ -81,7 +81,7 @@ struct FeedConfig {
     int publish_levels = BookSnapshot::kMaxLevels;   // 每侧发布的档位数（钳制到 [0, kMaxLevels]）
     std::size_t queue_capacity = 1024;               // SPSC 队列容量（向上取整到 2 的幂；最后一个槽位留给空簿）
 
-    // ---- 以下为规格之外的扩展：默认值即生产行为，测试用来缩短时间 ----
+    // ---- 以下为扩展参数：默认值即生产行为，测试用来缩短时间 ----
     int connect_timeout_ms = 10000;    // 解析 + TCP + TLS + WebSocket 握手的总时限（checkHealth 踢断；<= 0 关闭）；
                                        // TCP 连接时每个地址另有 max(1 s, 剩余时限 / 地址数) 的时限
     int ping_interval_ms = -1;         // 心跳间隔：< 0 用适配器默认值（OKX/Bybit 20000，Binance 无），0 关闭心跳，

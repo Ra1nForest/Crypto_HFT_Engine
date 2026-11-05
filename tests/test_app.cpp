@@ -156,7 +156,7 @@ std::string jsonString(const std::string& s) {
     return out + "\"";
 }
 
-// 以 spec 5.1 的完整配置为基础，按块 / 键覆盖原始 JSON 值，生成配置文本
+// 以随仓库发布的完整 config.json 为基础，按块 / 键覆盖原始 JSON 值，生成配置文本
 class ConfigText {
 public:
     ConfigText() {
@@ -335,7 +335,7 @@ TEST_CASE("config: the shipped config.json loads without warnings and equals the
     CHECK_EQ(c.connection.stall_timeout_ms, d.connection.stall_timeout_ms);
     CHECK_EQ(c.connection.reconnect_initial_ms, d.connection.reconnect_initial_ms);
     CHECK_EQ(c.connection.reconnect_max_ms, d.connection.reconnect_max_ms);
-    // 默认值即 spec 5.1 的取值
+    // 默认值即随仓库发布的 config.json 的取值
     CHECK_EQ(d.venues[0].path, std::string("/ws/btcusdt@depth@100ms"));
     CHECK_EQ(d.venues[0].snapshot_path, std::string("/api/v3/depth?symbol=BTCUSDT&limit=1000"));
     CHECK_EQ(d.venues[2].port, std::string("443"));

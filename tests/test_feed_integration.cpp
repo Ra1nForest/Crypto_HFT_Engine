@@ -1,12 +1,13 @@
 //
 // test_feed_integration.cpp
-// 行情连接管理器集成测试：进程内 TLS 模拟交易所（tests/mock_exchange_server.h）驱动真实的 MarketDataFeed，
+// 行情连接管理器集成测试：进程内 TLS 模拟交易所（tools/mock_exchange_server.h）驱动真实的 MarketDataFeed，
 // 覆盖 Binance 增量同步、OKX 校验和与缺口重订阅、Bybit 心跳、断线退避重连、停顿踢断、stop 的及时性与证书校验。
 //
 
 // 启用库内调试断言（必须在包含任何 hft 头文件之前定义）
 #define HFT_ENABLE_ASSERTS
 
+#include "hft/alloc_counter.h"
 #include "test_framework.h"
 
 #include "hft/crc32.h"
@@ -46,40 +47,7 @@
 // 全局 operator new 计数（只统计被跟踪的线程）：验证 feed 线程稳态下每条消息零堆分配
 // ============================================================================
 
-namespace {
-std::atomic<std::uint64_t> g_alloc_thread{0};  // 被跟踪线程的 pthread_self()，0 = 不统计
-std::atomic<std::uint64_t> g_alloc_count{0};
-
-inline void countAllocation() noexcept {
-    const std::uint64_t tracked = g_alloc_thread.load(std::memory_order_relaxed);
-    if (tracked != 0 && tracked == static_cast<std::uint64_t>(pthread_self())) {
-        g_alloc_count.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-}  // namespace
-
-// 替换函数标记 noinline：否则 GCC 把 free 内联进调用点后会误报 -Wmismatched-new-delete
-// （与 tests/test_market_data.cpp 相同；nothrow 版本也替换，保证同一分配器配对）
-__attribute__((noinline)) void* operator new(std::size_t n) {
-    countAllocation();
-    void* p = std::malloc(n == 0 ? 1 : n);
-    if (p == nullptr) throw std::bad_alloc();
-    return p;
-}
-__attribute__((noinline)) void* operator new[](std::size_t n) { return ::operator new(n); }
-__attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    countAllocation();
-    return std::malloc(n == 0 ? 1 : n);
-}
-__attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
-    return ::operator new(n, t);
-}
-__attribute__((noinline)) void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+// 堆分配计数见 hft/alloc_counter.h（startWindow(线程) / stopWindow() 只统计被跟踪的线程）
 
 // ============================================================================
 // getaddrinfo 替换："dual.test" 解析为两个 127.0.0.1 端点（各带端口，忽略 service），模拟第一个地址不通的
@@ -2542,8 +2510,7 @@ TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, ad
         },
         20000));
     const std::size_t pings_before = server.framesReceived(0).size();
-    g_alloc_count.store(0);
-    g_alloc_thread.store(static_cast<std::uint64_t>(runner.thread.native_handle()));
+    hft::alloc_counter::startWindow(static_cast<std::uint64_t>(runner.thread.native_handle()));
     const std::int64_t t0 = hft::nowNs();
     go->store(true);
     REQUIRE(waitFor(
@@ -2553,8 +2520,7 @@ TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, ad
         },
         30000));
     const std::int64_t t1 = hft::nowNs();
-    g_alloc_thread.store(0);
-    const std::uint64_t allocs = g_alloc_count.load();
+    const std::uint64_t allocs = hft::alloc_counter::stopWindow();
     const std::size_t pings_during = server.framesReceived(0).size() - pings_before;
     CHECK_EQ(allocs, 0u);
     CHECK_GT(pings_during, std::size_t{0});  // 测量区间内确实发送过心跳

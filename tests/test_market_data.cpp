@@ -7,6 +7,7 @@
 // 启用库内调试断言（必须在包含任何 hft 头文件之前定义）
 #define HFT_ENABLE_ASSERTS
 
+#include "hft/alloc_counter.h"
 #include "test_framework.h"
 
 #include "book_snapshot.h"
@@ -44,35 +45,11 @@
 // 全局 operator new 计数：用于验证适配器预热后每条消息零堆分配
 // ============================================================================
 
+// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-std::atomic<bool> g_count_allocs{false};
-std::atomic<std::uint64_t> g_alloc_count{0};
+std::atomic<bool>& g_count_allocs = hft::alloc_counter::g_window_on;
+std::atomic<std::uint64_t>& g_alloc_count = hft::alloc_counter::g_window_count;
 }  // namespace
-
-// 替换函数标记 noinline：否则 GCC 把 free 内联进调用点后会对"operator new 返回的指针被 free"
-// 误报 -Wmismatched-new-delete（替换 operator new/delete 本身就是标准允许的用法）
-__attribute__((noinline)) void* operator new(std::size_t n) {
-    if (g_count_allocs.load(std::memory_order_relaxed)) g_alloc_count.fetch_add(1, std::memory_order_relaxed);
-    void* p = std::malloc(n == 0 ? 1 : n);
-    if (p == nullptr) throw std::bad_alloc();
-    return p;
-}
-__attribute__((noinline)) void* operator new[](std::size_t n) { return ::operator new(n); }
-__attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-// nothrow 版本也必须替换：否则（例如在 ASan 下）simdjson 的 new (std::nothrow) 来自另一个分配器，
-// 却由上面的 operator delete[] 用 free 释放
-__attribute__((noinline)) void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    if (g_count_allocs.load(std::memory_order_relaxed)) g_alloc_count.fetch_add(1, std::memory_order_relaxed);
-    return std::malloc(n == 0 ? 1 : n);
-}
-__attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
-    return ::operator new(n, t);
-}
-__attribute__((noinline)) void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 namespace {
 

@@ -5,6 +5,7 @@
 // 用法：./build/exchange_sim [--orders N] [--gateways G] [--symbols S] [--seed X] [--pin] [--help]（其余选项见 --help）
 //
 
+#include "hft/alloc_counter.h"
 #include "cli_util.h"
 #include "hft/common.h"
 #include "hft/latency_histogram.h"
@@ -31,41 +32,10 @@
 #include <sched.h>
 #endif
 
-// ---- 计数版全局分配函数：报告运行期间（全部线程）的堆分配次数，验证热路径零分配 ----
+// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-
-std::atomic<std::uint64_t> g_heap_allocations{0};
-
-void* countedAlloc(std::size_t n) {
-    g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
-    if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
-    throw std::bad_alloc();
-}
-
-void* countedAlignedAlloc(std::size_t n, std::align_val_t align) {
-    g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
-    const std::size_t a = static_cast<std::size_t>(align);
-    const std::size_t rounded = n == 0 ? a : (n + a - 1) / a * a;  // aligned_alloc 要求大小是对齐的整数倍
-    if (void* p = std::aligned_alloc(a, rounded)) return p;
-    throw std::bad_alloc();
-}
-
+std::atomic<std::uint64_t>& g_heap_allocations = hft::alloc_counter::g_total;
 }  // namespace
-
-// noinline：-O1（sanitizer 构建）下 GCC 会把这些替换函数内联进调用点，看到 operator new 与 free 配对后
-// 误报 -Wmismatched-new-delete；不内联即可（底层本来就是 malloc/free 配对）。
-__attribute__((noinline)) void* operator new(std::size_t n) { return countedAlloc(n); }
-__attribute__((noinline)) void* operator new[](std::size_t n) { return countedAlloc(n); }
-__attribute__((noinline)) void* operator new(std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-__attribute__((noinline)) void* operator new[](std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-__attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
 namespace {
 

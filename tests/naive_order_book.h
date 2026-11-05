@@ -29,7 +29,7 @@ namespace hft::matching::test {
 //   看能否完全成交 —— 这同时验证了规范中"预检按撮合顺序遍历"的描述与撮合循环本身一致
 // - 档位总量上限（kMaxLevelQty）不用"上限减去现有总量"，而是把目标价位上其他挂单逐单加到请求数量上、
 //   检测加法溢出；改单时按 id 排除订单自己，而不是减去它原来的数量
-// 接口与 ReferenceOrderBook / LimitOrderBook 相同（设计文档 2.3）。仅用于测试，性能无关紧要。
+// 接口与 ReferenceOrderBook / LimitOrderBook 相同（docs/MATCHING_ENGINE.md）。仅用于测试，性能无关紧要。
 template <class Listener>
 class NaiveOrderBook {
 public:

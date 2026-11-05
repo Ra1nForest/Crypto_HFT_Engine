@@ -9,7 +9,7 @@
 
 #include "test_framework.h"
 
-#include "../tools/mock_exchange.h"
+#include "mock_exchange.h"
 #include "exchanges/adapters.h"
 #include "exchanges/json_util.h"
 #include "hft/timing.h"
@@ -157,7 +157,7 @@ AdapterConfig adapterConfig(const char* name, const std::string& subscribe = std
     return c;
 }
 
-// 每家交易所在规范 5.1 的配置里使用的订阅；测试里同样使用
+// 每家交易所在 config.json / tools/mock_config.json 里使用的订阅；测试里同样使用
 FeedConfig feedConfig(Exchange exchange, const MockExchange& ex, const std::string& ca_file) {
     FeedConfig c;
     c.exchange = exchange;
@@ -324,7 +324,7 @@ hft::net::HttpResult restGet(unsigned short port, const std::string& target, con
     return hft::net::httpsGet(ioc, *ctx, resolver, registry, rq);
 }
 
-// 跨所扫单（与规范 5.2 相同的规则，测试自带的独立实现）：在 i 买、在 j 卖，逐档推进直到边际单位不再盈利
+// 跨所扫单（与 ArbitrageDetector::sweep 相同的规则，测试自带的独立实现）：在 i 买、在 j 卖，逐档推进直到边际单位不再盈利
 double sweepNet(const sim::Venue& buy, const sim::Venue& sell, double fee, std::size_t max_levels = 20) {
     const wire::Levels asks = buy.depth(Side::Sell, max_levels);
     const wire::Levels bids = sell.depth(Side::Buy, max_levels);

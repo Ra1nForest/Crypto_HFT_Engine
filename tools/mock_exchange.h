@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "../tests/mock_exchange_server.h"
+#include "mock_exchange_server.h"
 #include "hft/timing.h"
 #include "mock_market.h"
 #include "mock_publishers.h"

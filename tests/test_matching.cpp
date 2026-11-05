@@ -7,6 +7,7 @@
 // 启用 hft 头文件中的调试断言：必须在包含任何 hft 头文件之前定义
 #define HFT_ENABLE_ASSERTS 1
 
+#include "hft/alloc_counter.h"
 #include "matching/matching_engine.h"
 #include "matching/order_book.h"
 #include "matching/types.h"
@@ -892,43 +893,11 @@ TEST_CASE("reference: long FIFO queues and deep books") {
 // 与参考模型的多场景差分模糊测试、回调时刻的簿状态、零分配、白盒不变量、极端数值、多交易对路由
 // ============================================================================
 
-// ---- 计数版全局分配函数：验证热路径零分配 ----
-// 本测试程序是单个翻译单元；这里替换全局 operator new/delete 只为计数，底层仍是 malloc/free
-// （ASan/UBSan 照常拦截 malloc）。计数器用 relaxed 原子量，测试本身是单线程的。
+// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-
-std::atomic<std::uint64_t> g_heap_allocations{0};
-
-void* countedAlloc(std::size_t n) {
-    g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
-    if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
-    throw std::bad_alloc();
-}
-
-void* countedAlignedAlloc(std::size_t n, std::align_val_t align) {
-    g_heap_allocations.fetch_add(1, std::memory_order_relaxed);
-    const std::size_t a = static_cast<std::size_t>(align);
-    const std::size_t rounded = n == 0 ? a : (n + a - 1) / a * a;  // aligned_alloc 要求大小是对齐的整数倍
-    if (void* p = std::aligned_alloc(a, rounded)) return p;
-    throw std::bad_alloc();
-}
-
-std::uint64_t heapAllocations() { return g_heap_allocations.load(std::memory_order_relaxed); }
-
+std::atomic<std::uint64_t>& g_heap_allocations = hft::alloc_counter::g_total;
+std::uint64_t heapAllocations() { return hft::alloc_counter::total(); }
 }  // namespace
-
-void* operator new(std::size_t n) { return countedAlloc(n); }
-void* operator new[](std::size_t n) { return countedAlloc(n); }
-void* operator new(std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-void* operator new[](std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
 // ---- 白盒访问：故意破坏优化引擎的内部结构，验证 checkInvariants() 能发现每一种问题 ----
 namespace hft::matching::detail {

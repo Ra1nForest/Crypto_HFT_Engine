@@ -2,7 +2,7 @@
 // types.h
 // 撮合引擎公共类型：订单请求、成交回报、深度/订单查询行，以及枚举的字符串化与相等比较。
 // 参考模型（tests/reference_order_book.h）与优化引擎（matching/order_book.h）共用本文件，
-// 两者必须对同一命令序列产生完全相同的事件流（语义见设计文档 2.4）。
+// 两者必须对同一命令序列产生完全相同的事件流（语义见 docs/MATCHING_ENGINE.md「Semantics」）。
 //
 
 #pragma once

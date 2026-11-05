@@ -26,6 +26,7 @@
 // 用法：./build/market_data_benchmark [--quick] [--cold]
 //
 
+#include "hft/alloc_counter.h"
 #include "book_snapshot.h"
 #include "exchanges/adapters.h"
 #include "hft/crc32.h"
@@ -55,34 +56,10 @@
 #include <utility>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// 堆分配计数（单线程基准，普通计数器即可）
-// ---------------------------------------------------------------------------
+// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-std::uint64_t g_allocs = 0;
-}
-__attribute__((noinline)) void* operator new(std::size_t n) {
-    ++g_allocs;
-    void* p = std::malloc(n == 0 ? 1 : n);
-    if (p == nullptr) throw std::bad_alloc();
-    return p;
-}
-__attribute__((noinline)) void* operator new[](std::size_t n) { return ::operator new(n); }
-__attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-// nothrow 版本也必须替换：否则（例如在 ASan 下）simdjson 的 new (std::nothrow) 来自另一个分配器，
-// 却由上面的 operator delete[] 用 free 释放
-__attribute__((noinline)) void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    ++g_allocs;
-    return std::malloc(n == 0 ? 1 : n);
-}
-__attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
-    return ::operator new(n, t);
-}
-__attribute__((noinline)) void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
-__attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+std::atomic<std::uint64_t>& g_allocs = hft::alloc_counter::g_total;
+}  // namespace
 
 namespace {
 

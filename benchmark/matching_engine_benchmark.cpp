@@ -12,13 +12,14 @@
 //   --reps   吞吐量测量的重复次数（取中位数，默认 3）
 //
 
+#include "hft/alloc_counter.h"
 #include "hft/latency_histogram.h"
 #include "hft/timing.h"
 #include "matching/order_book.h"
 #include "matching/types.h"
 
-#include "../tests/matching_test_util.h"
-#include "../tests/reference_order_book.h"
+#include "matching_test_util.h"      // tests/（CMake 为本目标加入的 include 目录）
+#include "reference_order_book.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -31,37 +32,10 @@
 #include <string>
 #include <vector>
 
-// ---- 计数版全局分配函数（单线程基准，普通计数器即可）----
+// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-std::uint64_t g_allocations = 0;
-
-void* countedAlloc(std::size_t n) {
-    ++g_allocations;
-    if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
-    throw std::bad_alloc();
-}
-
-void* countedAlignedAlloc(std::size_t n, std::align_val_t align) {
-    ++g_allocations;
-    const std::size_t a = static_cast<std::size_t>(align);
-    const std::size_t rounded = n == 0 ? a : (n + a - 1) / a * a;
-    if (void* p = std::aligned_alloc(a, rounded)) return p;
-    throw std::bad_alloc();
-}
+std::atomic<std::uint64_t>& g_allocations = hft::alloc_counter::g_total;
 }  // namespace
-
-void* operator new(std::size_t n) { return countedAlloc(n); }
-void* operator new[](std::size_t n) { return countedAlloc(n); }
-void* operator new(std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-void* operator new[](std::size_t n, std::align_val_t a) { return countedAlignedAlloc(n, a); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
 namespace {
 

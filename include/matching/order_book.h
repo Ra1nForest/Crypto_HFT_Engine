@@ -1,7 +1,7 @@
 //
 // order_book.h
 // 优化版限价订单簿（撮合核心）：池化订单 + 侵入式 FIFO 链表、池化价位、每侧最优档在末尾的有序扁平数组、
-// 整数 id 开放寻址索引；预留容量之后热路径零堆分配。事件流与参考模型逐条一致（设计文档 2.3 / 2.4）。
+// 整数 id 开放寻址索引；预留容量之后热路径零堆分配。事件流与参考模型逐条一致（接口与语义见 docs/MATCHING_ENGINE.md）。
 //
 
 #pragma once
@@ -28,7 +28,7 @@ struct OrderBookTestPeer;
 }  // namespace detail
 
 // ============================================================================
-// 数据结构（在设计文档 2.5 推荐方案的基础上做了两处改进，理由见各条）：
+// 数据结构（推荐方案见 docs/MATCHING_ENGINE.md「Data structures」；在其基础上做了两处改进，理由见各条）：
 //
 // - 订单 Order：来自 hft::ObjectPool<Order>（地址稳定、LIFO 复用），48 字节；同一价位的订单用
 //   prev/next 侵入式双向链表串成 FIFO（头部时间优先级最高）。订单不存价格，价格在所属 Level 中。
@@ -153,7 +153,7 @@ public:
     LimitOrderBook& operator=(LimitOrderBook&&) = delete;
     ~LimitOrderBook() = default;  // Order/Level 都是平凡析构类型，对象池直接释放内存
 
-    // ---------------------------------------------------------------- 新订单（规范 2.4 submit）
+    // ---------------------------------------------------------------- 新订单（docs/MATCHING_ENGINE.md「submit」）
     void submit(const OrderRequest& req) {
         // 校验：按规范顺序，第一条失败的规则生效，只发出这一个拒单事件
         if (req.qty <= 0) return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);

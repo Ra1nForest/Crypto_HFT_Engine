@@ -65,6 +65,7 @@ endif()
 # 离线模拟交易所（源文件存在时才构建）：三家交易所协议的 TLS WebSocket + REST 服务器，供监控程序端到端演示
 if(EXISTS ${CMAKE_SOURCE_DIR}/tools/mock_exchange.cpp)
     add_executable(mock_exchange tools/mock_exchange.cpp)
+    target_include_directories(mock_exchange PRIVATE ${CMAKE_SOURCE_DIR}/tools)
     target_link_libraries(mock_exchange PRIVATE market_data)
 endif()
 
@@ -74,7 +75,8 @@ if(HFT_BUILD_TESTS)
     function(hft_add_test name dep)
         if(EXISTS ${CMAKE_SOURCE_DIR}/tests/${name}.cpp)
             add_executable(${name} tests/${name}.cpp)
-            target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+            # tests/：测试框架与参考模型；tools/：模拟交易所（mock_exchange_server.h 等，测试与 mock_exchange 共用）
+            target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/tools)
             target_link_libraries(${name} PRIVATE ${dep})
             add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
         endif()
@@ -106,6 +108,10 @@ if(HFT_BUILD_BENCHMARKS)
     hft_add_bench(matching_engine_benchmark hft_core)
     hft_add_bench(market_data_benchmark market_data)
     # 行情基准用模拟交易所的市场仿真与发布状态机（tools/mock_market.h、tools/mock_publishers.h）生成真实形状的行情流
+    # 撮合基准以 tests/ 中的参考模型作对照
+    if(TARGET matching_engine_benchmark)
+        target_include_directories(matching_engine_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+    endif()
     if(TARGET market_data_benchmark)
         target_include_directories(market_data_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/tools)
     endif()

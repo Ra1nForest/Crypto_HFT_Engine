@@ -20,7 +20,8 @@
 // - combined stream 包装 {"stream":"...","data":{...}} → 处理 data。
 // - 部分深度 {"lastUpdateId":N,"bids":[...],"asks":[...]} → 替换整簿，update id = N，已同步（无时间戳）。
 // - 增量深度 {"e":"depthUpdate","E":ms,"U":first,"u":last,"b":[...],"a":[...]}，官方流程
-//   （docs/binance_ws.md "How to manage a local order book correctly"）：
+//   （https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams
+//   "How to manage a local order book correctly"）：
 //   1. 未同步时缓冲事件（上限 max_buffered_events，溢出 → 丢弃缓冲、计一次 gap、重新请求快照），
 //      每轮尝试只置一次 need_rest_snapshot；feed 拉取 REST 快照后调用 onRestSnapshot。
 //   2. 快照 lastUpdateId L < 第一条缓冲事件的 U → 快照太旧，再次请求（缓冲保留）。
