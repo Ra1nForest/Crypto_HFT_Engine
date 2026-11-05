@@ -11,6 +11,7 @@
 
 #include "app.h"
 #include "arbitrage_detector.h"
+#include "cli_util.h"
 #include "config.h"
 #include "display.h"
 #include "hft/crc32.h"
@@ -1561,6 +1562,18 @@ TEST_CASE("display: number formatting helpers keep fixed widths") {
     CHECK_EQ(Display::formatDuration(-5.0), std::string("00:00:00"));
 }
 
+TEST_CASE("display: one shared plain-number formatter and cursor sequences usable with write(2)") {
+    // headless 状态行与报告共用同一个格式化函数
+    CHECK_EQ(Display::plainNumber(99.9, 3), std::string("99.900"));
+    CHECK_EQ(Display::plainNumber(-1.005, 2), std::string("-1.00"));
+    CHECK_EQ(Display::plainNumber(1234.4, 0), std::string("1234"));
+    // 光标序列是字符数组：sizeof - 1 是长度，信号处理函数里可以直接 write(fd, kShowCursor, sizeof - 1)
+    static_assert(sizeof(Display::kHideCursor) == 7, "kHideCursor must be a char array");
+    static_assert(sizeof(Display::kShowCursor) == 7, "kShowCursor must be a char array");
+    CHECK_EQ(std::string(Display::kHideCursor), std::string("\033[?25l"));
+    CHECK_EQ(std::string(Display::kShowCursor), std::string("\033[?25h"));
+}
+
 TEST_CASE("display: max_rows shrinks the frame step by step and cuts it with a notice only as a last resort") {
     DisplayFixture fx(3);
     FrameOptions fo;
@@ -1800,6 +1813,22 @@ TEST_CASE("cli: errors for unknown options, missing values, bad durations and po
     CHECK(!parse({"--configs", "x"}, o, err));
 }
 
+TEST_CASE("cli: cli_util::parseUnsigned shared by exchange_sim and mock_exchange") {
+    std::uint64_t v = 7;
+    CHECK(cli_util::parseUnsigned("0", v));
+    CHECK_EQ(v, 0u);
+    CHECK(cli_util::parseUnsigned("65535", v));
+    CHECK_EQ(v, 65535u);
+    CHECK(cli_util::parseUnsigned("18446744073709551615", v));
+    CHECK_EQ(v, std::numeric_limits<std::uint64_t>::max());
+    v = 7;
+    for (const char* bad : {"", "-1", "+1", "12x", "0x10", "1.5", "18446744073709551616"}) {
+        CHECK(!cli_util::parseUnsigned(bad, v));
+    }
+    CHECK(!cli_util::parseUnsigned(nullptr, v));
+    CHECK_EQ(v, 7u);  // 失败时不改写输出
+}
+
 // ============================================================================
 // 端到端：模拟交易所 → 真实 MarketDataFeed → MonitorApp 事件循环
 // ============================================================================
@@ -1931,6 +1960,35 @@ TEST_CASE("app: feedConfigFor carries venue, connection and logging settings int
     const FeedConfig o = MonitorApp::feedConfigFor(c, c.venues[1], 0);
     CHECK_EQ(o.subscribe_msg, c.venues[1].subscribe_msg);
     CHECK(o.exchange == Exchange::OKX);
+}
+
+TEST_CASE("app: the venue list is AppConfig::enabledVenues() of the app's own copy, so a temporary config is safe") {
+    TempPath logs("test_app_logs");
+    Logger logger(logs.str(), false);
+    auto disabledBinance = [] {
+        AppConfig c = ConfigReader::getDefaults();
+        c.venues[0].enabled = false;
+        c.venues[2].name = "Bybit-X";
+        c.venues[2].fee_rate = 0.0025;
+        return c;
+    };
+    // 临时 AppConfig：构造结束后即被销毁，MonitorApp 只能引用自己的副本（ASan 下悬空指针会被发现）
+    MonitorApp app(disabledBinance(), logger, RunOptions{});
+    const AppConfig expect = disabledBinance();
+    const std::vector<const VenueConfig*> enabled = expect.enabledVenues();
+    REQUIRE_EQ(app.venueCount(), enabled.size());
+    REQUIRE_EQ(app.venueCount(), 2u);
+    for (std::size_t i = 0; i < enabled.size(); ++i) {
+        CHECK_EQ(app.venueConfig(i).name, enabled[i]->name);
+        CHECK(app.venueConfig(i).exchange == enabled[i]->exchange);
+        CHECK_EQ(app.feed(i).getName(), enabled[i]->name);
+        CHECK_EQ(app.feed(i).venueId(), static_cast<std::uint32_t>(i));
+        CHECK_EQ(app.book(i).getSymbol(), enabled[i]->name + ":" + enabled[i]->symbol);
+    }
+    CHECK_EQ(app.venueConfig(1).name, std::string("Bybit-X"));
+    CHECK_EQ(app.detector().feeRate(1), 0.0025);
+    const std::vector<VenueView> views = app.collectViews();
+    CHECK_EQ(views[1].fee_rate, 0.0025);
 }
 
 TEST_CASE("app: three mock venues end to end - REST sync, checksummed books, event-driven signals, logs, report") {

@@ -471,15 +471,6 @@ inline bool parseBinanceStream(std::string_view name, std::string_view symbol_lo
     return true;
 }
 
-// 规范化的流名（同一个频道的不同写法映射到同一个名字："@1000ms" 等同于不写）
-inline std::string binanceCanonicalStream(std::string_view symbol_lower, const BinanceStream& s) {
-    std::string name(symbol_lower);
-    name += "@depth";
-    if (s.levels > 0) appendInt(name, s.levels);
-    if (s.period_ms == 100) name += "@100ms";
-    return name;
-}
-
 // Bybit 主题 orderbook.<depth>.<symbol>，depth 取 1 / 50 / 200（现货公共频道支持的档数）
 inline bool parseBybitTopic(std::string_view topic, std::string_view symbol, int& depth) {
     constexpr std::string_view kPrefix = "orderbook.";

@@ -5,6 +5,7 @@
 
 #include "app.h"
 #include "config.h"
+#include "display.h"
 #include "logger.h"
 #include "text_util.h"
 
@@ -33,8 +34,9 @@ void onSignal(int sig) {
     g_stop.store(true, std::memory_order_release);
     if (g_signal_count.fetch_add(1, std::memory_order_relaxed) == 0) return;
     if (g_tui_active.load(std::memory_order_relaxed)) {
-        static const char kShowCursor[] = "\033[?25h\n";
-        const ssize_t r = ::write(STDOUT_FILENO, kShowCursor, sizeof(kShowCursor) - 1);
+        // 与 MonitorApp::restoreCursor 相同：显示光标并换行
+        ssize_t r = ::write(STDOUT_FILENO, Display::kShowCursor, sizeof(Display::kShowCursor) - 1);
+        r = ::write(STDOUT_FILENO, "\n", 1);
         (void)r;
     }
     static const char kMsg[] = "[Signal] second signal received, exiting immediately\n";

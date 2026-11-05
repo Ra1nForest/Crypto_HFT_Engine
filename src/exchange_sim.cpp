@@ -5,6 +5,7 @@
 // 用法：./build/exchange_sim [--orders N] [--gateways G] [--symbols S] [--seed X] [--pin] [--help]（其余选项见 --help）
 //
 
+#include "cli_util.h"
 #include "hft/common.h"
 #include "hft/latency_histogram.h"
 #include "hft/timing.h"
@@ -13,7 +14,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstddef>
@@ -117,15 +117,7 @@ void printUsage(std::FILE* out) {
                  kMaxSimGateways);
 }
 
-bool parseUnsigned(const char* text, std::uint64_t& out) {
-    if (text == nullptr || *text == '\0' || *text == '-' || *text == '+') return false;
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    out = static_cast<std::uint64_t>(v);
-    return true;
-}
+using cli_util::parseUnsigned;
 
 // 返回 0 = 继续运行，1 = 已打印帮助（正常退出），2 = 参数错误
 int parseOptions(int argc, char** argv, Options& o) {

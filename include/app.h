@@ -180,12 +180,13 @@ public:
         : cfg_(cfg),
           logger_(logger),
           opt_(opt),
-          enabled_(enabledVenues(cfg)),
-          detector_(feeRates(cfg, enabled_), cfg.arbitrage.min_profit, cfg.arbitrage.max_qty, cfg.arbitrage.max_levels) {
+          enabled_(cfg_.enabledVenues()),  // 指向成员 cfg_ 的 venues（cfg_ 先初始化，之后不再修改）
+          detector_(feeRates(cfg_, enabled_), cfg_.arbitrage.min_profit, cfg_.arbitrage.max_qty,
+                    cfg_.arbitrage.max_levels) {
         if (opt_.out == nullptr) opt_.out = stdout;
         books_.reserve(enabled_.size());
         for (std::size_t i = 0; i < enabled_.size(); ++i) {
-            const VenueConfig& v = enabled_[i];
+            const VenueConfig& v = *enabled_[i];
             feeds_.push_back(std::make_unique<MarketDataFeed>(feedConfigFor(cfg_, v, static_cast<std::uint32_t>(i))));
             books_.emplace_back(v.name + ":" + v.symbol);
             books_.back().reserve(BookSnapshot::kMaxLevels);
@@ -294,7 +295,7 @@ public:
     // ---------------- 访问器（主线程 / 测试；run() 返回后读取）----------------
 
     std::size_t venueCount() const noexcept { return feeds_.size(); }
-    const VenueConfig& venueConfig(std::size_t i) const { return enabled_.at(i); }
+    const VenueConfig& venueConfig(std::size_t i) const { return *enabled_.at(i); }
     const MarketDataFeed& feed(std::size_t i) const { return *feeds_.at(i); }
     const OrderBook& book(std::size_t i) const { return books_.at(i); }
     const LatencyTracker& queueLatency(std::size_t i) const { return *queue_latency_.at(i); }
@@ -310,7 +311,7 @@ public:
         for (std::size_t i = 0; i < feeds_.size(); ++i) {
             const MarketDataFeed& f = *feeds_[i];
             VenueView v;
-            v.name = enabled_[i].name;
+            v.name = enabled_[i]->name;
             v.book = &books_[i];
             v.status = f.status();
             v.stats = f.stats();
@@ -319,7 +320,7 @@ public:
             v.processing = &f.getLatencyTracker();
             v.exchange = &f.getExchangeLatency();
             v.queue = queue_latency_[i].get();
-            v.fee_rate = cfg_.feeRate(enabled_[i]);
+            v.fee_rate = cfg_.feeRate(*enabled_[i]);
             views.push_back(std::move(v));
         }
         return views;
@@ -331,17 +332,9 @@ private:
         int cols = 0;
     };
 
-    static std::vector<VenueConfig> enabledVenues(const AppConfig& cfg) {
-        std::vector<VenueConfig> out;
-        for (const VenueConfig& v : cfg.venues) {
-            if (v.enabled) out.push_back(v);
-        }
-        return out;
-    }
-
-    static std::vector<double> feeRates(const AppConfig& cfg, const std::vector<VenueConfig>& venues) {
+    static std::vector<double> feeRates(const AppConfig& cfg, const std::vector<const VenueConfig*>& venues) {
         std::vector<double> fees;
-        for (const VenueConfig& v : venues) fees.push_back(cfg.feeRate(v));
+        for (const VenueConfig* v : venues) fees.push_back(cfg.feeRate(*v));
         return fees;
     }
 
@@ -356,12 +349,12 @@ private:
         std::fflush(opt_.out);
     }
 
-    // 终端模式结束（或异常退出）时显示光标；不分配内存、不抛异常
+    // 终端模式结束（或异常退出）时显示光标并换行；不分配内存、不抛异常
     void restoreCursor() noexcept {
         if (!cursor_hidden_) return;
         cursor_hidden_ = false;
-        static const char kShow[] = "\033[?25h\n";
-        std::fwrite(kShow, 1, sizeof(kShow) - 1, opt_.out);
+        std::fwrite(Display::kShowCursor, 1, sizeof(Display::kShowCursor) - 1, opt_.out);
+        std::fputc('\n', opt_.out);
         std::fflush(opt_.out);
     }
 
@@ -441,7 +434,7 @@ private:
             return false;
         }
         std::string names;
-        for (std::size_t i = 0; i < enabled_.size(); ++i) names += (i > 0 ? ", " : "") + enabled_[i].name;
+        for (std::size_t i = 0; i < enabled_.size(); ++i) names += (i > 0 ? ", " : "") + enabled_[i]->name;
         logger_.log("Started " + std::to_string(feeds_.size()) + " market data feed" + (feeds_.size() == 1 ? "" : "s") +
                     ": " + names);
         return true;
@@ -503,7 +496,7 @@ private:
                 const std::vector<PriceLevel>& asks = books_[buy].getAsks();
                 const std::vector<PriceLevel>& bids = books_[sell].getBids();
                 if (asks.empty() || bids.empty()) continue;
-                logger_.logSpread(enabled_[buy].name, asks[0].price, enabled_[sell].name, bids[0].price,
+                logger_.logSpread(enabled_[buy]->name, asks[0].price, enabled_[sell]->name, bids[0].price,
                                   bids[0].price - asks[0].price);
             }
         }
@@ -532,13 +525,14 @@ private:
             std::string bbo = "--/--";
             if (!b.getBids().empty() && !b.getAsks().empty()) {
                 const int prec = Display::pricePrecision(b.getBids()[0].price);
-                bbo = fixed(b.getBids()[0].price, prec) + "/" + fixed(b.getAsks()[0].price, prec);
+                bbo = Display::plainNumber(b.getBids()[0].price, prec) + "/" +
+                      Display::plainNumber(b.getAsks()[0].price, prec);
             }
-            line += (i > 0 ? " | " : " ") + enabled_[i].name + " " + feedStatusName(feeds_[i]->status()) + " " + bbo +
+            line += (i > 0 ? " | " : " ") + enabled_[i]->name + " " + feedStatusName(feeds_[i]->status()) + " " + bbo +
                     " (" + std::to_string(feeds_[i]->stats().messages) + " msgs)";
         }
         line += " | signals " + std::to_string(detector_.getTotalSignals()) + ", net $" +
-                fixed(detector_.getTotalNetProfit(), 2);
+                Display::plainNumber(detector_.getTotalNetProfit(), 2);
         writeOut(line + "\n");
     }
 
@@ -549,16 +543,10 @@ private:
         logger_.logFinalReport(views, detector_);
     }
 
-    static std::string fixed(double v, int precision) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", precision, v);
-        return buf;
-    }
-
     const AppConfig cfg_;
     Logger& logger_;
     RunOptions opt_;
-    const std::vector<VenueConfig> enabled_;   // 已启用的交易所（下标 = venue id）
+    const std::vector<const VenueConfig*> enabled_;   // 已启用的交易所，指向 cfg_.venues（下标 = venue id）
     ArbitrageDetector detector_;
     std::vector<std::unique_ptr<MarketDataFeed>> feeds_;
     std::vector<std::thread> threads_;

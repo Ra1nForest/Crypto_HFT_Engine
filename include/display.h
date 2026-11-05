@@ -97,8 +97,9 @@ public:
     static constexpr std::size_t kBookInner = 43;      // 订单簿框内宽（两个框 + 1 列间隔 = 91）
     static constexpr std::size_t kWideInner = 89;      // 通栏框内宽
     static constexpr std::size_t kLatencyInner = 42;   // 最终报告延迟表内宽（两个表 + 3 列间隔 = 91）
-    static constexpr const char* kHideCursor = "\033[?25l";
-    static constexpr const char* kShowCursor = "\033[?25h";
+    // 隐藏 / 显示光标。字符数组（不是指针）：sizeof - 1 就是长度，信号处理函数可以直接用 write(2) 写出
+    static constexpr char kHideCursor[] = "\033[?25l";
+    static constexpr char kShowCursor[] = "\033[?25h";
 
     // ---------------- 实时画面 ----------------
 
@@ -220,6 +221,13 @@ public:
         return std::string(width, '#');
     }
 
+    // 固定 precision 位小数（"%.*f"），不填充、不限宽（headless 状态行与报告里的数值共用）
+    static std::string plainNumber(double v, int precision) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.*f", precision, v);
+        return buf;
+    }
+
     // 价格的小数位：至少 5 位有效数字，2..8 位小数（67000 → 2，2.5 → 4，0.12 → 5）
     static int pricePrecision(double price) noexcept {
         const double a = std::fabs(price);
@@ -321,12 +329,6 @@ private:
     // 右对齐到恰好 width 列（过宽时截断，表格的列宽永远不变）
     static std::string cell(const std::string& s, std::size_t width) {
         return text_util::padLeft(text_util::truncateVisible(s, width, "…"), width);
-    }
-
-    static std::string plainNumber(double v, int precision) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.*f", precision, v);
-        return buf;
     }
 
     static std::string fmtCount(std::uint64_t n) { return std::to_string(n); }

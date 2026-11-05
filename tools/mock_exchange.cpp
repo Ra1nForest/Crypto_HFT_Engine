@@ -5,6 +5,7 @@
 // 用法：./build/mock_exchange [--binance-port N] [--okx-port N] [--bybit-port N] [--duration S] [--seed X] [--help]
 //
 
+#include "cli_util.h"
 #include "mock_exchange.h"
 
 #include <algorithm>
@@ -73,15 +74,7 @@ void printUsage(std::FILE* out) {
                  "Exit status: 0 = clean shutdown, 1 = startup failure (e.g. port in use), 2 = bad command line.\n");
 }
 
-bool parseUnsigned(const char* text, std::uint64_t& out) {
-    if (text == nullptr || *text == '\0' || *text == '-' || *text == '+') return false;
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    out = static_cast<std::uint64_t>(v);
-    return true;
-}
+using cli_util::parseUnsigned;
 
 bool parseSeconds(const char* text, double& out) {
     if (text == nullptr || *text == '\0') return false;
