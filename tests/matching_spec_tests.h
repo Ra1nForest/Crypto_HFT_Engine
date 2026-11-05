@@ -1596,6 +1596,34 @@ void registerQuerySpecs(const SpecRegistrar& add) {
         CHECK_EQ(h.book.volumeAt(S::Buy, 101), 0);
     });
 
+    add("queries: orders at the minimum and the maximum price", __LINE__, [] {
+        // 每一步之后 verify() 都要对挂在最高价 INT64_MAX 的卖单、价格 1 的买单做完整的查询一致性检查
+        H h;
+        constexpr Price kTop = INT64_MAX;
+        const OrderRequest a1 = sell(1, kTop, 3).account(kA);
+        const OrderRequest b2 = buy(2, 1, 4).account(kB);
+        PLACE(h, a1);
+        PLACE(h, b2);
+        PLACE(h, sell(3, kTop - 1, 1).account(kA));
+        CHECK_TOP(h.book, 1, kTop - 1);
+        CHECK_DEPTH(h.book, S::Sell, {kTop - 1, 1, 1}, {kTop, 3, 1});
+        CHECK_DEPTH(h.book, S::Buy, {1, 4, 1});
+        CHECK_EQ(h.book.volumeAt(S::Sell, kTop), 3);
+        CHECK_ORDERS_AT(h.book, S::Sell, kTop, infoOf(a1));
+        // 限价 INT64_MAX 的买单扫过两档卖单，剩余量挂在最高价
+        const OrderRequest t = buy(4, kTop, 5).account(kC);
+        CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 3, 4, kA, kC, S::Buy, kTop - 1, 1, 0, 4),
+                     trade(2, 1, 4, kA, kC, S::Buy, kTop, 3, 0, 1));
+        CHECK_TOP(h.book, kTop, std::nullopt);
+        CHECK_DEPTH(h.book, S::Buy, {kTop, 1, 1}, {1, 4, 1});
+        // 限价 1 的卖单从最高价一路扫到价格 1，剩余量挂在价格 1
+        const OrderRequest s = sell(5, 1, 6).account(kD);
+        CHECK_EVENTS(h.submit(s), accepted(s), trade(3, 4, 5, kC, kD, S::Sell, kTop, 1, 0, 5),
+                     trade(4, 2, 5, kB, kD, S::Sell, 1, 4, 0, 1));
+        CHECK_TOP(h.book, std::nullopt, 1);
+        CHECK_ORDER(h.book, 5, infoOf(s, 1));
+    });
+
     add("queries: best prices follow the book as levels appear and disappear", __LINE__, [] {
         H h;
         PLACE(h, buy(1, 100, 1).account(kA));

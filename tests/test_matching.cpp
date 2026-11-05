@@ -585,6 +585,28 @@ struct TamperedBook {
     TradeId lastTradeId() const { return inner.lastTradeId() + (fault == Fault::LastTradeId ? 1 : 0); }
 };
 
+// 包装一个真实订单簿，记下按价格查询（ordersAt / volumeAt）时传入的每个价格
+template <class Inner>
+struct ProbeRecordingBook {
+    const Inner& inner;
+    mutable std::vector<Price> probed;
+
+    std::optional<Price> bestBid() const { return inner.bestBid(); }
+    std::optional<Price> bestAsk() const { return inner.bestAsk(); }
+    std::size_t orderCount() const { return inner.orderCount(); }
+    std::size_t levelCount(Side s) const { return inner.levelCount(s); }
+    std::vector<LevelInfo> depth(Side s, std::size_t n = SIZE_MAX) const { return inner.depth(s, n); }
+    std::vector<OrderInfo> ordersAt(Side s, Price p) const {
+        probed.push_back(p);
+        return inner.ordersAt(s, p);
+    }
+    std::optional<OrderInfo> findOrder(OrderId id) const { return inner.findOrder(id); }
+    Qty volumeAt(Side s, Price p) const {
+        probed.push_back(p);
+        return inner.volumeAt(s, p);
+    }
+};
+
 }  // namespace
 
 TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") {
@@ -622,6 +644,24 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
         CHECK(!sameState(s.book, bad, &why));
         CHECK(!why.empty());
     }
+}
+
+TEST_CASE("tools: queriesConsistent never computes a price beyond the representable range") {
+    // 卖盘最差价为 INT64_MAX、买盘最差价为 1：检查"最差档之外没有幻影档位"时不能计算 INT64_MAX + 1
+    Stepper<RefBook> s;
+    s.run(Command::newOrder(sell(1, INT64_MAX, 2)));
+    s.run(Command::newOrder(sell(2, INT64_MAX - 1, 1)));
+    s.run(Command::newOrder(buy(3, 1, 5).account(2)));
+    REQUIRE_EQ(s.book.orderCount(), 3u);
+    ProbeRecordingBook<RefBook> probe{s.book, {}};
+    std::string why;
+    CHECK(queriesConsistent(probe, &why));
+    REQUIRE(!probe.probed.empty());
+    // 合法的簿上所有价格都 > 0；买盘最差档之外的探测价格是 0，因此任何负数都是算越界后回绕的结果
+    const Price lowest = *std::min_element(probe.probed.begin(), probe.probed.end());
+    if (lowest < 0)
+        ::hft_test::reportFailure(__FILE__, __LINE__,
+                                  "queriesConsistent probed price " + std::to_string(lowest) + " (overflowed)");
 }
 
 TEST_CASE("tools: sameState detects a real divergence between two books") {
@@ -1628,7 +1668,9 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
     DUAL_VERIFY(d);
     // 价格为 INT64_MAX 的卖单与限价 INT64_MAX 的买单
     DUAL_RUN(d, Command::newOrder(sell(6, kTop, 7).account(1)));
+    DUAL_VERIFY(d);  // 卖盘最差价为 INT64_MAX 时的完整查询一致性检查
     DUAL_RUN(d, Command::newOrder(sell(7, kTop - 1, 5).account(1)));
+    DUAL_VERIFY(d);
     const OrderRequest i1 = buy(8, kTop, kMax).ioc().account(2);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(i1)), accepted(i1),
                  trade(2, 7, 8, 1, 2, Side::Buy, kTop - 1, 5, 0, kMax - 5),

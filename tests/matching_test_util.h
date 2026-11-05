@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -562,6 +563,9 @@ bool queriesConsistent(const Book& book, std::string* why) {
                 if (!found || *found != o)
                     return fail("findOrder(" + std::to_string(o.id) + ") = " + str(found) +
                                 " but ordersAt lists " + str(o));
+                // 被检查的簿可能有错：累加前先判断是否越界（sum >= 0 且 remaining > 0，减法不会溢出）
+                if (o.remaining > std::numeric_limits<Qty>::max() - sum)
+                    return fail(name + ": orders at " + std::to_string(level.price) + " sum past INT64_MAX");
                 sum += o.remaining;
                 ++total_orders;
             }
@@ -570,10 +574,16 @@ bool queriesConsistent(const Book& book, std::string* why) {
                             std::to_string(sum) + " but depth says " + std::to_string(level.qty));
         }
         if (!levels.empty()) {
-            // 最差档之外的价格必须没有档位
-            const Price beyond = side == Side::Buy ? levels.back().price - 1 : levels.back().price + 1;
-            if (book.volumeAt(side, beyond) != 0 || !book.ordersAt(side, beyond).empty())
-                return fail(name + ": phantom level at " + std::to_string(beyond));
+            // 最差档之外的价格必须没有档位。最差卖价为 INT64_MAX（或最差买价为 INT64_MIN）时其外没有
+            // 可表示的价格，不再探测（否则 price + 1 有符号溢出）
+            const Price worst = levels.back().price;
+            const bool has_beyond = side == Side::Buy ? worst > std::numeric_limits<Price>::min()
+                                                      : worst < std::numeric_limits<Price>::max();
+            if (has_beyond) {
+                const Price beyond = side == Side::Buy ? worst - 1 : worst + 1;
+                if (book.volumeAt(side, beyond) != 0 || !book.ordersAt(side, beyond).empty())
+                    return fail(name + ": phantom level at " + std::to_string(beyond));
+            }
         }
     }
     if (total_orders != book.orderCount())
