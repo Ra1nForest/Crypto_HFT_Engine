@@ -88,7 +88,8 @@ struct Palette {
 //   只含 SGR 颜色序列与换行，不含光标控制；present() 加上归位 / 行尾擦除后一次 fwrite 写出（不清屏，减少闪烁）。
 // - 布局：标题栏；订单簿两个一行（43 列内宽的框）；套利监控（每个有序交易所对一行 + 汇总 + 最近信号）；
 //   行情源性能（状态、消息数、处理延迟 p50/p99 µs、交易所延迟 p50/p99 ms、重连、缺口/校验失败/重同步、丢弃）。
-// - 空簿（断线时 feed 会发布空簿）表示"无数据"：价格与差价显示 "--"。
+// - 空簿（断线时 feed 会发布空簿）表示"无数据"：价格与差价显示 "--"。套利监控的交易所对行里，状态不是 LIVE 的
+//   交易所同样按"无数据"显示（它不参与检测）；它的订单簿框照常显示最后收到的簿与状态。
 // - 终端宽度至少需要 kFrameWidth 列；高度不够时见 FrameOptions::max_rows。
 class Display {
 public:
@@ -534,8 +535,9 @@ private:
         using namespace text_util;
         const OrderBook* bb = venues[buy].book;
         const OrderBook* sb = venues[sell].book;
-        const bool have_ask = bb != nullptr && !bb->getAsks().empty();
-        const bool have_bid = sb != nullptr && !sb->getBids().empty();
+        // 不是 LIVE 的交易所不参与检测（它的簿可能已过期，见 MonitorApp::participates）：这一侧按"无数据"显示
+        const bool have_ask = venues[buy].status == FeedStatus::Live && bb != nullptr && !bb->getAsks().empty();
+        const bool have_bid = venues[sell].status == FeedStatus::Live && sb != nullptr && !sb->getBids().empty();
         const double ask = have_ask ? bb->getAsks()[0].price : 0.0;
         const double bid = have_bid ? sb->getBids()[0].price : 0.0;
         const int prec = pricePrecision(have_ask ? ask : bid);

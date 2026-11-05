@@ -21,7 +21,10 @@
 #include "orderbook.h"
 #include "text_util.h"
 
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -39,6 +42,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -1562,6 +1566,60 @@ TEST_CASE("display: number formatting helpers keep fixed widths") {
     CHECK_EQ(Display::formatDuration(-5.0), std::string("00:00:00"));
 }
 
+TEST_CASE("display: pair rows show '--' for a venue that is not LIVE, even while its last book is still there") {
+    // 两个交易所的簿交叉：在 A 以 100.00 买、在 B 以 100.50 卖，两者都 LIVE 时检测器出过一次信号
+    std::vector<OrderBook> books;
+    books.push_back(makeBook("A:BTCUSDT", {{99.90, 1.0}}, {{100.00, 1.0}}));
+    books.push_back(makeBook("B:BTCUSDT", {{100.50, 2.0}}, {{100.60, 2.0}}));
+    ArbitrageDetector det(std::vector<double>{0.0, 0.0}, 0.01, 0.0, 20);
+    det.detectAll(books);
+    REQUIRE_EQ(det.getTotalSignals(), 1u);
+    std::vector<VenueView> views(2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        views[i].name = i == 0 ? "A" : "B";
+        views[i].book = &books[i];
+        views[i].status = FeedStatus::Live;
+    }
+    // 交易所对行（买方、卖方两列名字之后是 Best Ask / Best Bid / Diff / Net / Qty / Signals）
+    auto pairRow = [&](const std::string& buy, const std::string& sell) {
+        FrameOptions fo;
+        fo.color = false;
+        const std::string frame = Display::renderFrame(views, det, fo);
+        const std::string key = "│  " + text_util::padRight(buy, 9) + text_util::padRight(sell, 9);
+        for (const std::string& line : splitLines(frame)) {
+            if (contains(line, key)) return line;
+        }
+        return std::string();
+    };
+    std::string ab = pairRow("A", "B");
+    REQUIRE(!ab.empty());
+    CHECK(contains(ab, "100.00"));
+    CHECK(contains(ab, "100.50"));
+    CHECK(contains(ab, "+0.50"));
+    CHECK_EQ(countOf(ab, " --"), 0u);
+    for (FeedStatus s : {FeedStatus::Reconnecting, FeedStatus::Syncing, FeedStatus::Connecting, FeedStatus::Stopped}) {
+        views[1].status = s;
+        ab = pairRow("A", "B");
+        REQUIRE(!ab.empty());
+        CHECK(contains(ab, "100.00"));    // A 仍是 LIVE：它的卖一照常显示
+        CHECK(!contains(ab, "100.50"));   // B 的买一（已过期）不显示
+        CHECK(!contains(ab, "+0.50"));
+        CHECK_EQ(countOf(ab, " --"), 4u);  // Best Bid、Diff、Net、Qty
+        CHECK(contains(ab, "--        1"));  // 累计信号数照常显示
+        const std::string ba = pairRow("B", "A");
+        CHECK(!contains(ba, "100.60"));
+        CHECK(contains(ba, "99.90"));
+        CHECK_EQ(countOf(ba, " --"), 4u);  // Best Ask、Diff、Net、Qty
+    }
+    // 订单簿框照常显示 B 最后的簿与状态
+    FrameOptions fo;
+    fo.color = false;
+    const std::string frame = Display::renderFrame(views, det, fo);
+    CHECK(contains(frame, "B:BTCUSDT  STOPPED"));
+    CHECK(contains(frame, "100.60"));
+    checkFrame(frame, 2, false);
+}
+
 TEST_CASE("display: one shared plain-number formatter and cursor sequences usable with write(2)") {
     // headless 状态行与报告共用同一个格式化函数
     CHECK_EQ(Display::plainNumber(99.9, 3), std::string("99.900"));
@@ -1933,6 +1991,95 @@ int runApp(MonitorApp& app, Done done, int min_ms, int timeout_ms, double* stop_
     return rc;
 }
 
+// 管道：写端交给被测代码（fdopen 成 FILE*，或 dup2 成子进程的 stdout/stderr），后台线程读取读端。
+// 可以暂停读取来模拟被阻塞的终端（Ctrl+S 流控、卡住的 SSH 会话）：管道写满后写入方阻塞在 write(2) 里。
+class PipeReader {
+public:
+    // capacity > 0：把管道容量设为至少 capacity 字节（F_SETPIPE_SZ，按页取整）
+    explicit PipeReader(int capacity = 0, bool start_reading = true) : reading_(start_reading) {
+        int fds[2];
+        if (::pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2 failed");
+        read_fd_ = fds[0];
+        write_fd_ = fds[1];
+        if (capacity > 0) ::fcntl(write_fd_, F_SETPIPE_SZ, capacity);
+        capacity_ = ::fcntl(write_fd_, F_GETPIPE_SZ);
+        reader_ = std::thread([this] { readLoop(); });
+    }
+
+    ~PipeReader() {
+        closeWriteEnd();
+        quit_.store(true);
+        reader_.join();
+        ::close(read_fd_);
+    }
+
+    PipeReader(const PipeReader&) = delete;
+    PipeReader& operator=(const PipeReader&) = delete;
+
+    int writeFd() const noexcept { return write_fd_; }
+    // 写端已交给别人（例如 fdopen 之后由 fclose 关闭）：本对象不再关闭它
+    int releaseWriteFd() noexcept { return std::exchange(write_fd_, -1); }
+    void closeWriteEnd() noexcept {
+        if (write_fd_ >= 0) ::close(std::exchange(write_fd_, -1));
+    }
+
+    int capacity() const noexcept { return capacity_; }
+    void setReading(bool on) noexcept { reading_.store(on); }
+    // 管道中尚未读取的字节数
+    int buffered() const noexcept {
+        int n = 0;
+        return ::ioctl(read_fd_, FIONREAD, &n) == 0 ? n : -1;
+    }
+    bool eof() const noexcept { return eof_.load(); }
+
+    std::string text() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return text_;
+    }
+    // 等到输出（从 from 字节起）出现 part
+    bool waitForText(const std::string& part, int timeout_ms, std::size_t from = 0) const {
+        return mock_exchange::waitFor(
+            [&] {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return text_.find(part, std::min(from, text_.size())) != std::string::npos;
+            },
+            timeout_ms, 2);
+    }
+    bool waitEof(int timeout_ms) const {
+        return mock_exchange::waitFor([this] { return eof_.load(); }, timeout_ms, 2);
+    }
+
+private:
+    void readLoop() {
+        char buf[16384];
+        while (!quit_.load()) {
+            if (!reading_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            pollfd p{read_fd_, POLLIN, 0};
+            if (::poll(&p, 1, 10) <= 0) continue;
+            const ssize_t n = ::read(read_fd_, buf, sizeof(buf));
+            if (n <= 0) {
+                eof_.store(true);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            text_.append(buf, static_cast<std::size_t>(n));
+        }
+    }
+
+    int read_fd_ = -1;
+    int write_fd_ = -1;
+    int capacity_ = 0;
+    std::atomic<bool> reading_;
+    std::atomic<bool> quit_{false};
+    std::atomic<bool> eof_{false};
+    mutable std::mutex mutex_;
+    std::string text_;
+    std::thread reader_;
+};
+
 TEST_CASE("app: feedConfigFor carries venue, connection and logging settings into FeedConfig") {
     AppConfig c = ConfigReader::getDefaults();
     c.connection.tls_verify = false;
@@ -2193,6 +2340,90 @@ TEST_CASE("app: a venue that disconnects publishes an empty book -> no data, no 
     CHECK(contains(plain, "Binance -> OKX"));  // 最近信号
     CHECK(contains(text, "Shutting down (stop requested after"));
     CHECK(contains(text, "Final Report"));
+}
+
+TEST_CASE("app: a stale book drained after its venue left LIVE never pairs for arbitrage (blocked terminal output)") {
+    // 终端输出被阻塞（Ctrl+S 流控、卡住的 SSH）：管道事先写满，主线程在第一次输出（隐藏光标）时就阻塞，还没有排空过队列。
+    // 期间 OKX 推送一本与 Binance 交叉的簿（在 Binance 以 100.00 买、在 OKX 以 100.50 卖）后断线，之后的会话保持静默
+    // （状态停在 SYNCING）。输出恢复后主线程才依次取出 Binance 的簿、OKX 过期的簿与断线空簿：这时 OKX 已不是 LIVE，
+    // 过期的簿不能配对出信号。
+    MockExchangeServer server;
+    std::atomic<bool> okx_closed{false};
+    std::atomic<int> okx_sessions{0};
+    server.setWebSocketScript([&](WsSession& ws) {
+        if (ws.target() == kBinancePartialPath) {
+            ws.send(binanceDepth(1, {{"99.90", "1"}}, {{"100.00", "1"}}));
+        } else if (ws.target() == kOkxPath) {
+            ws.expectText(kOkxBooks5Sub);
+            if (okx_sessions.fetch_add(1) == 0) {
+                ws.send(okxBooks5({{"100.5", "2"}}, {{"100.6", "2"}}));
+                ws.sleepMs(100);
+                ws.close(1001, "going away");
+                okx_closed.store(true);
+            }
+            // 重连后的会话保持静默
+        }
+    });
+    AppConfig cfg = mockAppConfig(server);
+    cfg.venues[0].path = kBinancePartialPath;
+    cfg.venues[0].rest_host.clear();
+    cfg.venues[0].snapshot_path.clear();
+    cfg.venues[1].subscribe_msg = kOkxBooks5Sub;
+    cfg.venues[2].enabled = false;
+    TempPath logs("test_app_e2e_logs");
+    PipeReader pipe(4096, false);  // 先不读
+    REQUIRE(pipe.capacity() > 0);
+    const std::string filler(static_cast<std::size_t>(pipe.capacity()), '.');
+    REQUIRE_EQ(::write(pipe.writeFd(), filler.data(), filler.size()), static_cast<ssize_t>(filler.size()));
+    REQUIRE_EQ(pipe.buffered(), pipe.capacity());  // 管道已满：之后的任何写入都会阻塞
+    std::FILE* out = ::fdopen(pipe.releaseWriteFd(), "w");
+    REQUIRE(out != nullptr);
+    std::string log_path;
+    {
+        Logger logger(logs.str(), false);
+        log_path = logger.path();
+        RunOptions opt;
+        opt.headless = false;
+        opt.color = false;
+        opt.out = out;
+        MonitorApp app(cfg, logger, opt);
+        REQUIRE_EQ(app.venueCount(), 2u);
+        std::atomic<bool> stop{false};
+        std::atomic<bool> sequence_ok{false};
+        std::thread controller([&] {
+            // 1) 两本簿与断线空簿都已入队，OKX 已重连到静默会话（不再是 LIVE）
+            sequence_ok.store(waitFor(
+                [&] {
+                    return okx_closed.load() && okx_sessions.load() >= 2 && app.feed(1).status() != FeedStatus::Live &&
+                           app.feed(1).stats().published >= 2 && app.feed(0).stats().published >= 1;
+                },
+                10000, 2));
+            // 2) 恢复输出：主线程（进入事件循环之前就阻塞在隐藏光标的写入里）这才开始排空积压的快照
+            pipe.setReading(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            stop.store(true);
+        });
+        const int rc = app.run(stop);
+        controller.join();
+        CHECK_EQ(rc, 0);
+        CHECK(sequence_ok.load());
+        const ArbitrageDetector& det = app.detector();
+        CHECK_EQ(det.getTotalSignals(), 0u);
+        CHECK_EQ(det.pairState(0, 1).signals, 0u);
+        CHECK(!det.pairState(0, 1).has_data);
+        CHECK_GE(app.snapshotsApplied(1), 2u);  // 过期的簿与空簿都被应用过
+        CHECK(app.book(1).empty());
+        CHECK_EQ(app.book(0).getBestAsk().price, 100.0);
+        CHECK(app.feed(0).stats().dropped_snapshots == 0 && app.feed(1).stats().dropped_snapshots == 0);
+    }
+    std::fclose(out);
+    CHECK(pipe.waitEof(5000));
+    const std::string text = text_util::stripAnsi(pipe.text());
+    CHECK(contains(text, "Binance:BTCUSDT  LIVE"));
+    CHECK(contains(text, "-- no data --"));
+    CHECK(contains(text, "Final Report"));
+    CHECK_EQ(countOf(readFile(log_path), "[SIGNAL]"), 0u);
+    CHECK(server.errors().empty());
 }
 
 TEST_CASE("app: no enabled venue -> exit code 1 without starting anything") {

@@ -159,7 +159,8 @@ struct RunOptions {
 // - 事件循环（只在主线程）：
 //   1) 排空每个 feed 的 SPSC 队列（每轮每个 feed 最多 kMaxDrainPerVenue 个，防止单个 feed 饿死其他工作）：
 //      记录队列延迟 nowNs() - publish_ns，快照直接从队列槽位复制进本地簿，然后立即检测涉及该交易所的
-//      所有有序交易所对（事件驱动：每次簿更新都检测），新信号写日志。断线时 feed 发布的空簿使相关交易所对变为"无数据"。
+//      所有有序交易所对（事件驱动：每次簿更新都检测），新信号写日志。断线时 feed 发布的空簿使相关交易所对变为"无数据"；
+//      此外只有行情源状态为 LIVE 的交易所参与检测与价差日志，即使空簿晚到，过期的簿也不会产生信号（见 participates）。
 //   2) 每 refresh_ms 一次 tick：对每个 feed 调用 checkHealth(nowNs())（停顿 / 连接超时恢复依赖它），
 //      终端模式下渲染一帧，每 spread_log_interval 次 tick 记录一次所有有序交易所对的价差（headless 模式没有渲染，
 //      按 tick 计数，频率相同），并刷新日志。tick 落后时不补跑（下一次从当前时刻起算）。
@@ -471,12 +472,31 @@ private:
         queue_latency_[v]->recordNs(queued > 0 ? static_cast<std::uint64_t>(queued) : 0);
         s.copyTo(books_[v]);
         ++applied_[v];
-        const std::size_t found = detector_.detectVenue(v, books_);
+        const std::size_t found = detectVenue(v);
         if (found > 0) {
             // detectVenue 的新信号是 getSignals() 的最后 found 条（found <= 2(N-1)，远小于 deque 上限）
             const std::deque<ArbitrageSignal>& signals = detector_.getSignals();
             for (std::size_t k = signals.size() - found; k < signals.size(); ++k) logger_.logSignal(signals[k]);
         }
+    }
+
+    // 交易所 v 是否参与套利检测与价差日志：只有行情源状态为 LIVE 时才参与（簿还必须非空，由检测器判断）。
+    // 不是 LIVE 时本地簿可能已经过期：例如主线程曾被阻塞，断线时发布的空簿还排在队列里、在过期的簿之后。
+    // 状态在取出快照时读取：feed 先更新状态再发布，所以它至少与取出的快照一样新。
+    bool participates(std::size_t v) const noexcept { return feeds_[v]->status() == FeedStatus::Live; }
+
+    // 检测涉及 v 的所有有序交易所对（顺序同 ArbitrageDetector::detectVenue）。不参与检测的交易所用空簿代替：
+    // 该交易所对按"无数据"处理（不出信号，pairState().has_data = false）。返回新信号数。
+    std::size_t detectVenue(std::size_t v) {
+        const OrderBook& mine = participates(v) ? books_[v] : no_data_;
+        std::size_t found = 0;
+        for (std::size_t other = 0; other < books_.size(); ++other) {
+            if (other == v) continue;
+            const OrderBook& theirs = participates(other) ? books_[other] : no_data_;
+            if (detector_.detectPair(v, other, mine, theirs) != nullptr) ++found;
+            if (detector_.detectPair(other, v, theirs, mine) != nullptr) ++found;
+        }
+        return found;
     }
 
     void onTick(std::int64_t now) {
@@ -487,12 +507,13 @@ private:
         logger_.flush();
     }
 
-    // 所有有序交易所对（在 buy 买、在 sell 卖）的最优价差；无数据的交易所对跳过
+    // 所有有序交易所对（在 buy 买、在 sell 卖）的最优价差；无数据或有一方不是 LIVE 的交易所对跳过
     void logSpreads() {
         const std::size_t n = books_.size();
         for (std::size_t buy = 0; buy < n; ++buy) {
+            if (!participates(buy)) continue;
             for (std::size_t sell = 0; sell < n; ++sell) {
-                if (buy == sell) continue;
+                if (buy == sell || !participates(sell)) continue;
                 const std::vector<PriceLevel>& asks = books_[buy].getAsks();
                 const std::vector<PriceLevel>& bids = books_[sell].getBids();
                 if (asks.empty() || bids.empty()) continue;
@@ -551,6 +572,7 @@ private:
     std::vector<std::unique_ptr<MarketDataFeed>> feeds_;
     std::vector<std::thread> threads_;
     std::vector<OrderBook> books_;                                 // 主线程的本地簿（下标 = venue id）
+    const OrderBook no_data_;                                      // 不是 LIVE 的交易所在检测中的替身（空簿）
     std::vector<std::unique_ptr<LatencyTracker>> queue_latency_;   // 队列延迟：publish_ns → 主线程取出
     std::vector<std::uint64_t> applied_;                           // 每个交易所已应用的快照数
     std::int64_t start_ns_ = 0;
