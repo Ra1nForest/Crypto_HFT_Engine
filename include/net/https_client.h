@@ -17,14 +17,19 @@
 #include <openssl/x509_vfy.h>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -49,9 +54,12 @@ enum class KickReason : int { None = 0, Stop = 1, Stall = 2, ConnectTimeout = 3 
 // ---------------------------------------------------------------------------
 // SocketRegistry：活动套接字登记表（"踢断"机制）
 // ---------------------------------------------------------------------------
-// 同步 Boost.Beast 的阻塞调用（connect / TLS 握手 / read / write）没有超时也无法取消。其他线程调用 kick()
-// 时，对登记的每个套接字执行 ::shutdown(SHUT_RDWR)：阻塞在其上的系统调用立即返回（connect 以
-// ECONNRESET 失败，recv 返回 EOF），会话随之结束。
+// 同步 Boost.Beast 的阻塞调用（TLS 握手 / read / write）没有超时也无法取消。其他线程调用 kick() 时，对登记的
+// 每个套接字执行 ::shutdown(SHUT_RDWR)：阻塞在已连接（或正在连接、SYN_SENT）的套接字上的系统调用立即返回
+// （recv 返回 EOF，进行中的连接以 ECONNRESET 失败），会话随之结束。
+// 注意：Linux 上对还没有发起连接（TCP_CLOSE）的套接字 shutdown 只返回 ENOTCONN，并不阻止之后的 connect()。
+// 所以 connectSocket 从不调用阻塞的 connect()：它用非阻塞 connect + 分片 poll，每片之间检查 interrupted()，
+// 踢断落在任何时刻都会在一个轮询片之内生效。
 // fd 复用竞争：登记时保存的是 fd 的副本（fcntl(F_DUPFD_CLOEXEC)）。shutdown 作用于套接字本身，
 // 对副本调用与对原 fd 调用效果完全相同；副本在注销前一直打开，它的编号不可能被别的套接字复用，
 // 因此即使原 fd 已被关闭（Beast 在收到 close 帧或协议错误时会在 teardown 里自行关闭套接字），踢断也
@@ -208,8 +216,9 @@ inline std::string hostHeader(const std::string& host, const std::string& port, 
     return h;
 }
 
-// 先注销再关闭套接字
-inline void closeSocket(tcp::socket& sock, SocketRegistration& reg) noexcept {
+// 先注销再关闭套接字（Socket：任意执行器的 TCP 套接字）
+template <class Socket>
+void closeSocket(Socket& sock, SocketRegistration& reg) noexcept {
     reg.release();
     boost::system::error_code ignored;
     sock.close(ignored);
@@ -377,32 +386,132 @@ private:
 // TCP 连接
 // ---------------------------------------------------------------------------
 
-// 依次尝试每个端点：先自己 open 套接字并登记（保证阻塞的 connect() 能被踢断），再 connect。
-// 成功时 sock 已连接、reg 已登记；被踢断时返回 operation_aborted；全部失败时返回最后一个错误。
-inline boost::system::error_code connectSocket(tcp::socket& sock, const tcp::resolver::results_type& endpoints,
-                                               SocketRegistry& registry, SocketRegistration& reg,
-                                               tcp::endpoint* connected = nullptr) {
-    boost::system::error_code last = asio::error::host_not_found;
-    for (const auto& entry : endpoints) {
-        const tcp::endpoint ep = entry.endpoint();
-        closeSocket(sock, reg);
-        boost::system::error_code ec;
-        sock.open(ep.protocol(), ec);
-        if (ec) {
-            last = ec;
+// connectSocket 的时限与端点轮转
+struct ConnectOptions {
+    int timeout_ms = 0;             // 全部端点的总时限（<= 0：不限，每个端点一直等到内核放弃）
+    int min_endpoint_ms = 1000;     // 单个端点的时限 = max(min_endpoint_ms, timeout_ms / 端点数)，且不超过剩余总时限
+    std::size_t* cursor = nullptr;  // 可选的轮转游标：从第 *cursor % 端点数 个端点开始依次尝试；返回时成功 = 连上的
+                                    // 端点，失败 = 最后尝试的端点的下一个（调用方据此让下一次从别的地址开始）
+    std::function<void()> on_wait;  // 可选：等待连接完成期间每个空闲的轮询片（<= 50 ms）之后调用一次
+};
+
+namespace detail {
+
+constexpr int kConnectPollSliceMs = 50;  // 等待连接时检查踢断状态与时限的粒度
+
+// 等待非阻塞 connect 完成：每片最多 50 ms 的 poll(POLLOUT)，片与片之间检查踢断状态（踢断的 shutdown 也会
+// 立即唤醒 poll）。返回 0 = 已连接；ECANCELED = 已被踢断；ETIMEDOUT = 到达 deadline；其他 = 连接错误（errno）
+inline int waitForConnect(int fd, const SocketRegistry& registry, std::chrono::steady_clock::time_point deadline,
+                          const std::function<void()>& on_wait) {
+    using Clock = std::chrono::steady_clock;
+    for (;;) {
+        if (registry.interrupted()) return ECANCELED;
+        int slice_ms = kConnectPollSliceMs;
+        if (deadline != Clock::time_point::max()) {
+            const Clock::time_point now = Clock::now();
+            if (now >= deadline) return ETIMEDOUT;
+            // 向上取整到毫秒：剩余不足 1 ms 时也等满 1 ms，不会空转
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count() + 1;
+            if (left < slice_ms) slice_ms = static_cast<int>(left);
+        }
+        pollfd p{fd, POLLOUT, 0};
+        const int r = ::poll(&p, 1, slice_ms);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (r == 0) {
+            if (on_wait) on_wait();
             continue;
         }
-        if (!reg.attach(registry, sock.native_handle())) {
-            closeSocket(sock, reg);
-            return registry.interrupted() ? asio::error::operation_aborted : asio::error::no_descriptors;
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) return errno;
+        return so_error;
+    }
+}
+
+// 连接一个端点：open → 登记 → 非阻塞 ::connect → 分片等待完成 → 恢复阻塞模式。
+// 踢断在任何时刻落下都不会丢：登记之前 → add() 拒绝；落在登记与 ::connect 之间（此时 shutdown 是空操作）→
+// 下一次检查 interrupted() 时发现；落在 SYN_SENT 或已连接之后 → shutdown 直接让连接失败并唤醒 poll。
+template <class Socket>
+boost::system::error_code connectEndpoint(Socket& sock, const tcp::endpoint& ep, SocketRegistry& registry,
+                                          SocketRegistration& reg, std::chrono::steady_clock::time_point deadline,
+                                          const std::function<void()>& on_wait) {
+    boost::system::error_code ec;
+    sock.open(ep.protocol(), ec);
+    if (ec) return ec;
+    if (!reg.attach(registry, sock.native_handle())) {
+        return registry.interrupted() ? asio::error::operation_aborted : asio::error::no_descriptors;
+    }
+    // asio 的同步 connect 即使在非阻塞套接字上也会无限期 poll，所以直接调用 ::connect
+    sock.native_non_blocking(true, ec);
+    if (ec) return ec;
+    const int fd = sock.native_handle();
+    int err = ::connect(fd, ep.data(), static_cast<socklen_t>(ep.size())) == 0 ? 0 : errno;
+    if (err == EINPROGRESS || err == EINTR) err = waitForConnect(fd, registry, deadline, on_wait);
+    if (err != 0) return boost::system::error_code(err, asio::error::get_system_category());
+    sock.native_non_blocking(false, ec);  // 之后的同步 TLS / WebSocket 调用保持阻塞语义
+    if (ec) return ec;
+    if (registry.interrupted()) return asio::error::operation_aborted;
+    return ec;
+}
+
+}  // namespace detail
+
+// 依次尝试每个端点（从 opt.cursor 指定的位置开始轮转）。每个端点都先自己 open 套接字并登记、再发起非阻塞连接，
+// 分片等待完成（见 detail::connectEndpoint），所以 stop() / 看门狗的踢断随时都能打断它。
+// 每个端点有自己的时限（见 ConnectOptions），超时就关闭套接字换下一个地址：第一个地址不通（SYN 被静默丢弃）
+// 时不会耗尽整个连接时限。成功时 sock 已连接（阻塞模式）、reg 已登记；被踢断时返回 operation_aborted；
+// 总时限用完返回 timed_out；全部失败时返回最后一个错误。
+template <class Socket>
+boost::system::error_code connectSocket(Socket& sock, const tcp::resolver::results_type& endpoints,
+                                        SocketRegistry& registry, SocketRegistration& reg,
+                                        tcp::endpoint* connected = nullptr,
+                                        const ConnectOptions& opt = ConnectOptions()) {
+    using Clock = std::chrono::steady_clock;
+    const std::size_t n = endpoints.size();
+    boost::system::error_code last = asio::error::host_not_found;
+    if (n == 0) return last;
+    Clock::time_point overall = Clock::time_point::max();
+    Clock::duration per_endpoint = Clock::duration::max();
+    if (opt.timeout_ms > 0) {
+        overall = Clock::now() + std::chrono::milliseconds(opt.timeout_ms);
+        const long long share = static_cast<long long>(opt.timeout_ms) / static_cast<long long>(n);
+        per_endpoint = std::chrono::milliseconds(std::max<long long>(opt.min_endpoint_ms, share));
+    }
+    std::size_t index = opt.cursor != nullptr ? *opt.cursor % n : 0;
+    auto it = endpoints.begin();
+    std::advance(it, static_cast<std::ptrdiff_t>(index));
+    for (std::size_t k = 0; k < n; ++k) {
+        if (k > 0) {
+            ++it;
+            ++index;
+            if (it == endpoints.end()) {
+                it = endpoints.begin();
+                index = 0;
+            }
         }
-        sock.connect(ep, ec);
+        Clock::time_point deadline = Clock::time_point::max();
+        if (opt.timeout_ms > 0) {
+            const Clock::time_point now = Clock::now();
+            if (now >= overall) {
+                last = asio::error::timed_out;  // 游标保持在这个还没尝试的端点上
+                break;
+            }
+            deadline = overall - now > per_endpoint ? now + per_endpoint : overall;
+        }
+        const tcp::endpoint ep = it->endpoint();
+        closeSocket(sock, reg);
+        const boost::system::error_code ec = detail::connectEndpoint(sock, ep, registry, reg, deadline, opt.on_wait);
         if (!ec) {
             if (connected != nullptr) *connected = ep;
+            if (opt.cursor != nullptr) *opt.cursor = index;
             return ec;
         }
         last = ec;
         closeSocket(sock, reg);
+        if (opt.cursor != nullptr) *opt.cursor = (index + 1) % n;
         if (registry.interrupted()) return asio::error::operation_aborted;
     }
     return last;
@@ -418,6 +527,8 @@ struct HttpsGetRequest {
     std::string target = "/";
     bool verify = true;                          // 与 makeClientContext 的 verify 保持一致
     std::size_t body_limit = std::size_t{16} << 20;  // 响应体上限（默认 16 MiB）
+    int connect_timeout_ms = 0;                  // TCP 连接（全部端点）的总时限，<= 0 不限；单个端点的时限见 ConnectOptions
+    std::size_t* endpoint_cursor = nullptr;      // 可选的端点轮转游标（见 ConnectOptions::cursor），由调用方跨请求保存
 };
 
 struct HttpResult {
@@ -445,7 +556,10 @@ inline HttpResult httpsGet(asio::io_context& ioc, ssl::context& ctx, Resolver& r
     beast::ssl_stream<tcp::socket> stream(ioc, ctx);
     SocketRegistration reg;  // 声明在 stream 之后：析构时先注销、再由 stream 关闭套接字
     tcp::socket& sock = beast::get_lowest_layer(stream);
-    ec = connectSocket(sock, endpoints, registry, reg);
+    ConnectOptions copt;
+    copt.timeout_ms = rq.connect_timeout_ms;
+    copt.cursor = rq.endpoint_cursor;
+    ec = connectSocket(sock, endpoints, registry, reg, nullptr, copt);
     if (ec) {
         r.error = "connect " + where + ": " + errorText(ec);
         return r;

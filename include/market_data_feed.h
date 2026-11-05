@@ -78,7 +78,8 @@ struct FeedConfig {
     std::size_t queue_capacity = 1024;               // SPSC 队列容量（向上取整到 2 的幂）
 
     // ---- 以下为规格之外的扩展：默认值即生产行为，测试用来缩短时间 ----
-    int connect_timeout_ms = 10000;    // 解析 + TCP + TLS + WebSocket 握手的总时限（checkHealth 踢断；<= 0 关闭）
+    int connect_timeout_ms = 10000;    // 解析 + TCP + TLS + WebSocket 握手的总时限（checkHealth 踢断；<= 0 关闭）；
+                                       // TCP 连接时每个地址另有 max(1 s, 剩余时限 / 地址数) 的时限
     int ping_interval_ms = -1;         // 应用层心跳间隔：< 0 用适配器默认值（OKX/Bybit 20000），0 关闭，> 0 覆盖
     int healthy_session_ms = 30000;    // 会话连续 LIVE 超过这么久即视为健康：退避计数清零
     int rest_max_attempts = 5;         // 每个会话 REST 快照最多尝试次数，超过则重连
@@ -121,9 +122,14 @@ inline std::string bodySnippet(const std::string& body) {
 // 行情连接管理器。
 // 设计决定：保持同步 Boost.Beast，每个 feed 一个阻塞线程（简单、延迟低：读到数据立即在本线程处理）。
 // 阻塞调用没有超时，及时退出与停顿恢复靠"踢断"：所有活动套接字登记在 hft::net::SocketRegistry 中，
-// stop() 与 checkHealth() 对它们 ::shutdown(SHUT_RDWR)，阻塞的 connect/handshake/read/write 立即失败。
-// 每个套接字都是先 open、先登记，再开始阻塞的 connect()（不用 net::connect），REST 快照的套接字同样登记；
-// 注销总在关闭之前（见 SocketRegistry 关于 fd 复用的说明）。DNS 解析在后台线程中进行，可被踢断状态中断。
+// stop() 与 checkHealth() 对它们 ::shutdown(SHUT_RDWR)，阻塞的 handshake/read/write 立即失败。
+// 每个套接字都是先 open、先登记，再发起非阻塞连接并分片等待（hft::net::connectSocket，每片之间检查踢断状态），
+// 踢断落在连接过程的任何时刻都在约 50 ms 内生效；REST 快照的套接字同样登记。注销总在关闭之前
+// （见 SocketRegistry 关于 fd 复用的说明）。DNS 解析在后台线程中进行，可被踢断状态中断。
+// 多地址主机：每个地址有自己的连接时限 max(1 s, 总时限 / 地址数)，超时换下一个地址；连接超时结束的会话
+// 让下一次从下一个地址开始（WebSocket 与 REST 各有一个轮转游标），连上之后下次仍从这个地址开始。
+// WebSocket 的总时限是 connect_timeout_ms 的剩余部分；REST 的总时限是 connect_timeout_ms 与
+// stall_timeout_ms / 2 中较小的（REST 请求期间停顿看门狗照常计时，连接必须远早于它完成）。
 //
 // 会话流程：解析 → 打开并登记套接字 → connect → TCP_NODELAY → SNI → （tls_verify：系统 CA + 可选 ca_file、
 // verify_peer、host_name_verification）→ TLS 握手 → WebSocket 握手（User-Agent: crypto_hft_engine/2.0）
@@ -190,7 +196,8 @@ public:
         status_.store(FeedStatus::Stopped, std::memory_order_release);
     }
 
-    // 任意线程：请求停止。踢断所有套接字（阻塞的读写/握手/连接立即返回）并唤醒退避等待。
+    // 任意线程：请求停止。踢断所有套接字（阻塞的读写/握手立即返回，进行中的 TCP 连接在一个轮询片
+    // ——不超过 50 ms——之内返回）并唤醒退避等待。
     void stop() noexcept {
         stop_requested_.store(true, std::memory_order_release);
         registry_.close();
@@ -366,14 +373,21 @@ private:
 
     SessionEnd runSessionGuarded() {
         session_established_ = false;
+        tcp_connected_ = false;
         stage_ = "setup";
+        SessionEnd end;
         try {
-            return runSession();
+            end = runSession();
         } catch (const std::exception& e) {
-            return fail(std::string("unexpected error during ") + stage_ + ": " + e.what());
+            end = fail(std::string("unexpected error during ") + stage_ + ": " + e.what());
         } catch (...) {
-            return fail(std::string("unexpected non-standard exception during ") + stage_);
+            end = fail(std::string("unexpected non-standard exception during ") + stage_);
         }
+        // TCP 已连上、但 TLS / WebSocket 握手超时：下一次从下一个地址开始（TCP 连接超时由 connectSocket 自己轮转）
+        if (tcp_connected_ && !session_established_ && registry_.reason() == hft::net::KickReason::ConnectTimeout) {
+            ++ws_cursor_;
+        }
+        return end;
     }
 
     // 会话结束后的清理与上报（此时套接字已注销并关闭）
@@ -418,8 +432,13 @@ private:
         WsStream ws(ioc_, *ssl_ctx_);
         hft::net::SocketRegistration registration;  // 声明在 ws 之后：析构时先注销、再关闭套接字
         stage_ = "TCP connect";
-        ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, registration);
+        hft::net::ConnectOptions copt;
+        copt.timeout_ms = remainingConnectMs();
+        copt.cursor = &ws_cursor_;
+        ec = hft::net::connectSocket(beast::get_lowest_layer(ws), endpoints, registry_, registration, nullptr, copt);
+        if (ec == asio::error::timed_out && !registry_.interrupted()) return connectTimeoutEnd();
         if (ec) return fail("connect " + where + ": " + hft::net::errorText(ec));
+        tcp_connected_ = true;
         beast::get_lowest_layer(ws).set_option(tcp::no_delay(true), ec);
 
         stage_ = "TLS handshake";
@@ -496,6 +515,26 @@ private:
         phase_start_ns_ = hft::nowNs();
     }
 
+    // 连接阶段剩余的时限（毫秒，向上取整，至少 1）；connect_timeout_ms <= 0 时为 0（不限）。
+    // phase_start_ns_ 只由 feed 线程写，这里在 feed 线程上读，不需要加锁。
+    int remainingConnectMs() const noexcept {
+        if (cfg_.connect_timeout_ms <= 0) return 0;
+        const std::int64_t left =
+            feed_detail::msToNs(cfg_.connect_timeout_ms) - (hft::nowNs() - phase_start_ns_);
+        if (left <= 0) return 1;
+        return static_cast<int>(std::min<std::int64_t>((left + 999999) / 1000000, cfg_.connect_timeout_ms));
+    }
+
+    // REST 请求的 TCP 连接总时限：connect_timeout_ms 与 stall_timeout_ms / 2 中较小的正值（都关闭时不限）
+    int restConnectBudgetMs() const noexcept {
+        int budget = cfg_.connect_timeout_ms > 0 ? cfg_.connect_timeout_ms : 0;
+        if (cfg_.stall_timeout_ms > 0) {
+            const int half = std::max(1, cfg_.stall_timeout_ms / 2);
+            budget = budget > 0 ? std::min(budget, half) : half;
+        }
+        return budget;
+    }
+
     // 握手完成：进入 Streaming。若此前已被踢断（连接超时恰好在握手完成时触发）则返回 false。
     bool beginStreaming() {
         const std::int64_t now = hft::nowNs();
@@ -549,6 +588,8 @@ private:
         rq.target = cfg_.snapshot_path;
         rq.verify = cfg_.tls_verify;
         rq.body_limit = adapter_detail::kMaxMessageBytes;
+        rq.connect_timeout_ms = restConnectBudgetMs();
+        rq.endpoint_cursor = &rest_cursor_;
         for (int attempt = 1;; ++attempt) {
             activity_ns_.store(hft::nowNs(), std::memory_order_relaxed);
             const hft::net::HttpResult http = hft::net::httpsGet(ioc_, *ssl_ctx_, rest_resolver_, registry_, rq);
@@ -616,13 +657,16 @@ private:
                 return SessionEnd{EndKind::Error, "stalled: no data for more than " +
                                                       std::to_string(cfg_.stall_timeout_ms) + " ms during " + stage_ +
                                                       ", connection kicked"};
-            case hft::net::KickReason::ConnectTimeout:
-                return SessionEnd{EndKind::Error, std::string("connect timeout: ") + stage_ +
-                                                      " did not complete within " +
-                                                      std::to_string(cfg_.connect_timeout_ms) + " ms"};
+            case hft::net::KickReason::ConnectTimeout: return connectTimeoutEnd();
             case hft::net::KickReason::None: break;
         }
         return SessionEnd{EndKind::Error, std::string("interrupted during ") + stage_};
+    }
+
+    // 连接阶段超时（看门狗踢断，或 connectSocket 自己用完了时限）
+    SessionEnd connectTimeoutEnd() const {
+        return SessionEnd{EndKind::Error, std::string("connect timeout: ") + stage_ + " did not complete within " +
+                                              std::to_string(cfg_.connect_timeout_ms) + " ms"};
     }
 
     // ---------------- 每条消息的记账（只有 feed 线程写，relaxed 存储，无 RMW）----------------
@@ -792,6 +836,9 @@ private:
     int attempt_ = 0;                                 // 退避指数
     int immediate_budget_ = kMaxImmediateReconnects;  // 剩余的立即重连次数
     bool session_established_ = false;
+    bool tcp_connected_ = false;                      // 本会话的 TCP 连接已建立
+    std::size_t ws_cursor_ = 0;                       // WebSocket 地址轮转游标（见 hft::net::ConnectOptions::cursor）
+    std::size_t rest_cursor_ = 0;                     // REST 地址轮转游标
     bool synced_ = false;
     bool healthy_ = false;
     std::int64_t live_since_ns_ = 0;

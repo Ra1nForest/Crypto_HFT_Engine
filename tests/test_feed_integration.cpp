@@ -16,6 +16,8 @@
 #include "net/https_client.h"
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -27,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -77,6 +80,65 @@ __attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow
 }
 __attribute__((noinline)) void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 __attribute__((noinline)) void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+
+// ============================================================================
+// getaddrinfo 替换："dual.test" 解析为两个 127.0.0.1 端点（各带端口，忽略 service），模拟第一个地址不通的
+// 多地址主机（本机没有可用的 IPv6，无法用真实的双栈地址）；其他名字交给真正的 getaddrinfo。
+// connect 替换：测试可以让下一次 connect() 停在系统调用之前——正是"套接字已登记、连接尚未发起"的窗口。
+// ============================================================================
+
+namespace {
+std::atomic<int> g_dual_first_port{0};   // 0 = 不替换 "dual.test"
+std::atomic<int> g_dual_second_port{0};
+std::atomic<bool> g_connect_park{false};     // 下一次 connect() 停住
+std::atomic<bool> g_connect_parked{false};   // 已经停在系统调用之前
+std::atomic<bool> g_connect_release{false};  // 放行
+
+// 与 glibc 相同：addrinfo 与它的 sockaddr 在同一块内存里（freeaddrinfo 只释放 addrinfo 本身）
+addrinfo* loopbackAddrinfo(int port, addrinfo* next) {
+    void* block = std::calloc(1, sizeof(addrinfo) + sizeof(sockaddr_in));
+    if (block == nullptr) return nullptr;
+    auto* ai = static_cast<addrinfo*>(block);
+    auto* sa = reinterpret_cast<sockaddr_in*>(static_cast<char*>(block) + sizeof(addrinfo));
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons(static_cast<std::uint16_t>(port));
+    sa->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ai->ai_family = AF_INET;
+    ai->ai_socktype = SOCK_STREAM;
+    ai->ai_protocol = IPPROTO_TCP;
+    ai->ai_addrlen = sizeof(sockaddr_in);
+    ai->ai_addr = reinterpret_cast<sockaddr*>(sa);
+    ai->ai_next = next;
+    return ai;
+}
+}  // namespace
+
+extern "C" int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints,
+                           struct addrinfo** res) {
+    using Fn = int (*)(const char*, const char*, const addrinfo*, addrinfo**);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "getaddrinfo"));
+    if (node != nullptr && std::strcmp(node, "dual.test") == 0 && g_dual_first_port.load() != 0) {
+        addrinfo* second = loopbackAddrinfo(g_dual_second_port.load(), nullptr);
+        addrinfo* first = second != nullptr ? loopbackAddrinfo(g_dual_first_port.load(), second) : nullptr;
+        if (first == nullptr) {
+            std::free(second);
+            return EAI_MEMORY;
+        }
+        *res = first;
+        return 0;
+    }
+    return real(node, service, hints, res);
+}
+
+extern "C" int connect(int fd, const struct sockaddr* addr, socklen_t len) {
+    using Fn = int (*)(int, const sockaddr*, socklen_t);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "connect"));
+    if (g_connect_park.exchange(false)) {
+        g_connect_parked.store(true);
+        while (!g_connect_release.load()) std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return real(fd, addr, len);
+}
 
 namespace {
 
@@ -423,6 +485,7 @@ public:
         if (listen_fd_ >= 0) ::close(listen_fd_);
     }
     bool ok() const { return ok_; }
+    unsigned short port() const { return port_; }
     std::string portString() const { return std::to_string(port_); }
 
 private:
@@ -431,6 +494,54 @@ private:
     bool ok_ = false;
     std::vector<int> fillers_;
 };
+
+// 在 127.0.0.1 上监听、从不 accept 的端口（队列足够长）：内核替它完成三次握手，connect() 立即成功
+class OpenListener {
+public:
+    OpenListener() {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t len = sizeof(addr);
+        ok_ = fd_ >= 0 && ::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+              ::listen(fd_, 64) == 0 && ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+        port_ = ntohs(addr.sin_port);
+    }
+    ~OpenListener() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    OpenListener(const OpenListener&) = delete;
+    OpenListener& operator=(const OpenListener&) = delete;
+    bool ok() const { return ok_; }
+    unsigned short port() const { return port_; }
+
+private:
+    int fd_ = -1;
+    unsigned short port_ = 0;
+    bool ok_ = false;
+};
+
+// 作用域内 "dual.test" 解析为 [127.0.0.1:first, 127.0.0.1:second]（见文件开头的 getaddrinfo 替换）
+struct DualHost {
+    DualHost(unsigned short first, unsigned short second) {
+        g_dual_second_port.store(second);
+        g_dual_first_port.store(first);
+    }
+    ~DualHost() {
+        g_dual_first_port.store(0);
+        g_dual_second_port.store(0);
+    }
+    DualHost(const DualHost&) = delete;
+    DualHost& operator=(const DualHost&) = delete;
+};
+
+// 证书 SAN 同时包含 "dual.test" 的模拟服务器选项（tls_verify 照常开启）
+mock_exchange::ServerOptions dualHostServerOptions() {
+    mock_exchange::ServerOptions opt;
+    opt.certificate.dns_names = {"localhost", "dual.test"};
+    return opt;
+}
 
 // 检查 feed 宣布的重连等待序列：第 i 次等待 ∈ [0.8, 1.2] x expected[i]（钳制到 max_ms；0 = 立即重连），
 // 且第 i+1 个 TCP 连接确实在宣布之后至少等待了这么久才到达（每次尝试恰好产生一个连接）
@@ -581,7 +692,7 @@ TEST_CASE("registry: a blocking TCP connect stuck in SYN_SENT is aborted by kick
         done.store(true);
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    CHECK(!done.load());  // 仍阻塞在 connect 中
+    CHECK(!done.load());  // 仍在等待连接完成（没有时限）
     const std::int64_t t0 = hft::nowNs();
     reg.kick(hft::net::KickReason::ConnectTimeout);
     t.join();
@@ -589,6 +700,117 @@ TEST_CASE("registry: a blocking TCP connect stuck in SYN_SENT is aborted by kick
     CHECK(ec == boost::asio::error::operation_aborted);
     CHECK(!sock.is_open());
     CHECK(!registration.attached());
+    CHECK_EQ(reg.size(), std::size_t{0});
+}
+
+TEST_CASE("net: a kick landing between socket registration and connect() still aborts the connect (200 trials)") {
+    // Linux 上对尚未发起连接的套接字 shutdown 是空操作：踢断若只靠 shutdown，落在这个窗口里就会丢失，
+    // connect 随后在 SYN_SENT 里一直等到内核放弃（约 2 分钟）。每次试验在登记出现的瞬间踢断（close / kick 交替）。
+    BlackholeListener hole;
+    REQUIRE(hole.ok());
+    hft::net::Resolver resolver;
+    hft::net::tcp::resolver::results_type endpoints;
+    REQUIRE(!resolver.resolve("127.0.0.1", hole.portString(), endpoints, [] { return false; }));
+    int lost = 0;
+    int aborted = 0;
+    double worst_ms = 0.0;
+    for (int trial = 0; trial < 200; ++trial) {
+        hft::net::SocketRegistry reg;
+        boost::asio::io_context ioc;
+        hft::net::tcp::socket sock(ioc);
+        hft::net::SocketRegistration registration;
+        boost::system::error_code ec;
+        std::atomic<bool> done{false};
+        std::thread worker([&] {
+            ec = hft::net::connectSocket(sock, endpoints, reg, registration);
+            done.store(true);
+        });
+        while (reg.size() == 0) {
+        }
+        const std::int64_t t0 = hft::nowNs();
+        if (trial % 2 == 0) {
+            reg.close();
+        } else {
+            reg.kick(hft::net::KickReason::ConnectTimeout);
+        }
+        if (!waitFor([&] { return done.load(); }, 250)) {
+            ++lost;
+            reg.close();  // 救援：套接字此时已在 SYN_SENT，再 shutdown 一次就能让它返回
+        }
+        worker.join();
+        worst_ms = std::max(worst_ms, ms(hft::nowNs() - t0));
+        if (ec == boost::asio::error::operation_aborted) ++aborted;
+        CHECK(!registration.attached());
+    }
+    CHECK_EQ(lost, 0);
+    CHECK_EQ(aborted, 200);
+    std::printf("    200 kicks at registration time: %d lost, worst return %.1f ms\n", lost, worst_ms);
+}
+
+TEST_CASE("net: connectSocket gives every address its own deadline, falls through a blackhole and rotates its cursor") {
+    BlackholeListener hole;
+    OpenListener good;
+    REQUIRE(hole.ok());
+    REQUIRE(good.ok());
+    const DualHost dual(hole.port(), good.port());
+    hft::net::Resolver resolver;
+    hft::net::tcp::resolver::results_type endpoints;
+    REQUIRE(!resolver.resolve("dual.test", "443", endpoints, [] { return false; }));
+    REQUIRE_EQ(endpoints.size(), std::size_t{2});
+    hft::net::SocketRegistry reg;
+    boost::asio::io_context ioc;
+    auto attempt = [&](int timeout_ms, std::size_t& cursor, boost::asio::ip::tcp::endpoint& connected, int& waits,
+                       double& took_ms) {
+        hft::net::tcp::socket sock(ioc);
+        hft::net::SocketRegistration registration;
+        hft::net::ConnectOptions opt;
+        opt.timeout_ms = timeout_ms;
+        opt.cursor = &cursor;
+        waits = 0;
+        opt.on_wait = [&waits] { ++waits; };
+        const std::int64_t t0 = hft::nowNs();
+        const boost::system::error_code ec = hft::net::connectSocket(sock, endpoints, reg, registration, &connected, opt);
+        took_ms = ms(hft::nowNs() - t0);
+        CHECK_EQ(registration.attached(), !ec);
+        CHECK_EQ(sock.is_open(), !ec);
+        hft::net::closeSocket(sock, registration);
+        return ec;
+    };
+    boost::asio::ip::tcp::endpoint connected;
+    int waits = 0;
+    double took = 0.0;
+    // [黑洞, 好]：第一个地址用满自己的时限 max(1000, 1500 / 2) = 1000 ms，然后连上第二个；游标指向连上的地址
+    std::size_t cursor = 0;
+    boost::system::error_code ec = attempt(1500, cursor, connected, waits, took);
+    CHECK(!ec);
+    CHECK_EQ(connected.port(), good.port());
+    CHECK_EQ(cursor, std::size_t{1});
+    CHECK_GE(took, 990.0);
+    CHECK_LT(took, 1400.0);
+    CHECK_GE(waits, 10);  // 等待期间每个空闲的轮询片（<= 50 ms）回调一次
+    // 游标 = 1：直接从好地址开始，立即连上，游标不变
+    ec = attempt(1500, cursor, connected, waits, took);
+    CHECK(!ec);
+    CHECK_EQ(cursor, std::size_t{1});
+    CHECK_LT(took, 200.0);
+    // 总时限比单个地址的下限还短：第一个地址用完全部时限，返回 timed_out，游标指向下一个（没来得及试的）地址
+    cursor = 0;
+    ec = attempt(300, cursor, connected, waits, took);
+    CHECK(ec == boost::asio::error::timed_out);
+    CHECK_EQ(cursor, std::size_t{1});
+    CHECK_GE(took, 290.0);
+    CHECK_LT(took, 700.0);
+    // 没有时限：游标从 2 % 2 = 0 开始也一样，被踢断时及时返回 operation_aborted，游标指向下一个地址
+    cursor = 2;
+    std::thread kicker([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        reg.kick(hft::net::KickReason::ConnectTimeout);
+    });
+    ec = attempt(0, cursor, connected, waits, took);
+    kicker.join();
+    CHECK(ec == boost::asio::error::operation_aborted);
+    CHECK_EQ(cursor, std::size_t{1});
+    CHECK_LT(took, 400.0);
     CHECK_EQ(reg.size(), std::size_t{0});
 }
 
@@ -1136,6 +1358,157 @@ TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS hand
         CHECK_EQ(feed.status(), FeedStatus::Stopped);
         CHECK_EQ(feed.stats().reconnects, 0u);
     }
+}
+
+TEST_CASE("feed: stop() during a blackholed TCP connect returns within 200 ms, also when it lands before connect() starts") {
+    BlackholeListener hole;
+    REQUIRE(hole.ok());
+    FeedConfig cfg;
+    cfg.exchange = Exchange::OKX;
+    cfg.name = "OKX";
+    cfg.host = "127.0.0.1";
+    cfg.port = hole.portString();
+    cfg.tls_verify = false;
+    cfg.log_to_stderr = false;
+    {  // 已在 SYN_SENT 中
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Connecting; }, 2000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
+        CHECK_LT(runner.stop(), 200.0);
+        CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
+    }
+    {  // feed 线程停在 connect() 系统调用之前（套接字已登记）：此刻的 shutdown 对套接字是空操作
+        g_connect_parked.store(false);
+        g_connect_release.store(false);
+        g_connect_park.store(true);
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([] { return g_connect_parked.load(); }, 2000));
+        const std::int64_t t0 = hft::nowNs();
+        runner.feed.stop();
+        g_connect_release.store(true);
+        const bool stopped = waitFor([&] { return runner.feed.status() == FeedStatus::Stopped; }, 1000);
+        CHECK(stopped);
+        CHECK_LT(ms(hft::nowNs() - t0), 200.0);
+        CHECK_EQ(runner.feed.stats().connect_failures, 0u);
+    }
+    {  // 连接超时的踢断落在同一个窗口里：这次尝试仍在约一个轮询片内结束（而不是等内核放弃 SYN 重传）
+        FeedConfig c = cfg;
+        c.connect_timeout_ms = 300;
+        c.reconnect_initial_ms = 5000;
+        c.reconnect_max_ms = 5000;
+        g_connect_parked.store(false);
+        g_connect_release.store(false);
+        g_connect_park.store(true);
+        FeedRunner runner(c);
+        REQUIRE(waitFor([] { return g_connect_parked.load(); }, 2000));
+        const std::int64_t t0 = hft::nowNs();
+        runner.feed.checkHealth(hft::nowNs() + std::int64_t{10} * 1000000000);  // 连接时限早已过去
+        g_connect_release.store(true);
+        REQUIRE(waitFor([&] { return runner.feed.stats().connect_failures == 1 && !runner.feed.lastError().empty(); },
+                        1000));
+        CHECK_LT(ms(hft::nowNs() - t0), 200.0);
+        CHECK_EQ(runner.feed.status(), FeedStatus::Reconnecting);
+        CHECK(contains(runner.feed.lastError(), "connect timeout: TCP connect did not complete within 300 ms"));
+        CHECK_LT(runner.stop(), 200.0);  // 退避等待中
+    }
+    g_connect_release.store(true);
+}
+
+TEST_CASE("feed: a blackholed first address falls through to the next one within connect_timeout_ms (WebSocket host)") {
+    MockExchangeServer server(dualHostServerOptions());
+    server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });
+    BlackholeListener hole;
+    REQUIRE(hole.ok());
+    const DualHost dual(hole.port(), server.port());
+    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    cfg.host = "dual.test";
+    cfg.connect_timeout_ms = 2000;  // 每个地址 max(1000, 2000 / 2) = 1000 ms
+    FeedRunner runner(cfg);
+    const std::int64_t t0 = hft::nowNs();
+    REQUIRE(waitFor(
+        [&] {
+            runner.feed.checkHealth(hft::nowNs());  // 模拟主线程每次刷新调用
+            return runner.feed.status() == FeedStatus::Live;
+        },
+        5000, 10));
+    const double took = ms(hft::nowNs() - t0);
+    CHECK_GE(took, 990.0);   // 黑洞地址用满了自己的时限
+    CHECK_LT(took, 2000.0);  // 同一个会话、在总时限之内换到了第二个地址
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.connect_failures, 0u);
+    CHECK_EQ(s.reconnects, 0u);
+    CHECK_EQ(server.acceptCount(), std::size_t{1});
+    CHECK(server.errors().empty());
+}
+
+TEST_CASE("feed: a blackholed first REST address falls through to the next one before the stall watchdog fires") {
+    MockExchangeServer server(dualHostServerOptions());
+    server.setHttpHandler([](const HttpRequestInfo&) {
+        return HttpReply{200, binanceDepth(105, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}})};
+    });
+    server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {})); });
+    BlackholeListener hole;
+    REQUIRE(hole.ok());
+    const DualHost dual(hole.port(), server.port());
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = "/ws/btcusdt@depth@100ms";
+    cfg.rest_host = "dual.test";
+    cfg.rest_port = "443";  // 替换后的解析忽略端口
+    cfg.snapshot_path = kBinanceSnapshotPath;
+    cfg.connect_timeout_ms = 2000;  // REST 连接总时限 min(2000, 10000 / 2) = 2000 ms → 每个地址 1000 ms
+    FeedRunner runner(cfg);
+    REQUIRE(waitFor(
+        [&] {
+            runner.feed.checkHealth(hft::nowNs());
+            return runner.feed.status() == FeedStatus::Live;
+        },
+        5000, 10));
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.rest_snapshots, 1u);
+    CHECK_EQ(s.stalls, 0u);
+    CHECK_EQ(s.reconnects, 0u);
+    CHECK_EQ(s.connect_failures, 0u);
+    const std::vector<HttpRequestInfo> reqs = server.httpRequests();
+    const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
+    REQUIRE_EQ(reqs.size(), std::size_t{1});
+    REQUIRE_EQ(sessions.size(), std::size_t{1});
+    CHECK_GE(ms(reqs[0].time_ns - sessions[0]), 990.0);  // 先在黑洞地址上用满 1000 ms
+    CHECK_LT(ms(reqs[0].time_ns - sessions[0]), 2000.0);
+    CHECK(server.errors().empty());
+}
+
+TEST_CASE("feed: after a connect timeout on a blackholed address the next session starts at the next address") {
+    MockExchangeServer server(dualHostServerOptions());
+    server.setWebSocketScripts({
+        [](WsSession& ws) {
+            ws.send(simpleBook(0));
+            ws.sleepMs(50);
+            ws.close(1001, "going away");
+        },
+        [](WsSession& ws) { ws.send(simpleBook(1)); },
+    });
+    BlackholeListener hole;
+    REQUIRE(hole.ok());
+    const DualHost dual(hole.port(), server.port());
+    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    cfg.host = "dual.test";
+    cfg.connect_timeout_ms = 400;  // 单个地址的下限 1000 ms 比总时限还长：第一个会话耗在黑洞地址上
+    EventLog events;
+    FeedRunner runner(cfg, events.callback());
+    REQUIRE(waitFor(
+        [&] {
+            runner.feed.checkHealth(hft::nowNs());
+            return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live;
+        },
+        5000, 10));
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.connect_failures, 1u);  // 只有第一个会话失败；服务器关闭之后的会话仍从连上过的地址开始
+    CHECK_EQ(s.reconnects, 2u);
+    CHECK_EQ(server.acceptCount(), std::size_t{2});
+    CHECK(events.inOrder({"[OKX] connect timeout: TCP connect did not complete within 400 ms", "[OKX] connected to",
+                          "[OKX] server closed the WebSocket", "[OKX] connected to"}));
+    CHECK(server.errors().empty());
 }
 
 TEST_CASE("feed: wrong CA / untrusted certificate -> connect_failures and a clear lastError, never LIVE") {
