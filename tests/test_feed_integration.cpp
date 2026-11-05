@@ -329,13 +329,16 @@ private:
 };
 
 // 在独立线程上运行 feed；析构时 stop + join（必须声明在 MockExchangeServer 之后）。
-// 日志回调在线程启动之前设置，不会漏掉最早的事件。
+// 日志回调与发布回调在线程启动之前设置，不会漏掉最早的事件。
 struct FeedRunner {
     MarketDataFeed feed;
     std::thread thread;
 
-    explicit FeedRunner(const FeedConfig& cfg, std::function<void(const std::string&)> log = {}) : feed(cfg) {
+    explicit FeedRunner(const FeedConfig& cfg, std::function<void(const std::string&)> log = {},
+                        std::function<void(MarketDataFeed&)> on_publish = {})
+        : feed(cfg) {
         if (log) feed.setLogCallback(std::move(log));
+        if (on_publish) feed.setPublishCallback([this, cb = std::move(on_publish)] { cb(feed); });
         thread = std::thread([this] { feed.run(); });
     }
     ~FeedRunner() { stop(); }
@@ -1947,6 +1950,65 @@ TEST_CASE("feed: the empty book of a disconnect is kept pending while the queue 
     CHECK_EQ(s.dropped_snapshots, 2u);  // 重试不重复计数
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
+}
+
+TEST_CASE("feed: the publish callback runs on the feed thread right after every successful push, empty books included") {
+    MockExchangeServer server;
+    server.setWebSocketScript([](WsSession& ws) {
+        for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
+        ws.sleepMs(50);
+        ws.close(1001, "going away");
+    });
+    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    cfg.queue_capacity = 2;  // 第 3 本簿与断线时的第一次空簿入队都会失败
+    cfg.reconnect_initial_ms = 3000;
+    cfg.reconnect_max_ms = 3000;
+    struct Calls {
+        std::mutex mutex;
+        std::vector<std::size_t> queue_sizes;    // 回调时队列里的快照数（消费者在断线之前不取）
+        std::vector<std::uint64_t> published;    // 回调时的 stats().published
+        std::vector<std::thread::id> threads;
+    };
+    auto calls = std::make_shared<Calls>();
+    FeedRunner runner(cfg, {}, [calls](MarketDataFeed& f) {
+        const std::size_t size = f.queue().size();
+        const std::uint64_t published = f.stats().published;
+        std::lock_guard<std::mutex> lock(calls->mutex);
+        calls->queue_sizes.push_back(size);
+        calls->published.push_back(published);
+        calls->threads.push_back(std::this_thread::get_id());
+    });
+    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Reconnecting; }, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+        std::lock_guard<std::mutex> lock(calls->mutex);
+        CHECK_EQ(calls->queue_sizes, (std::vector<std::size_t>{1, 2}));   // 每次都在入队之后
+        CHECK_EQ(calls->published, (std::vector<std::uint64_t>{1, 2}));    // 计数已包含这一次
+    }
+    CHECK_EQ(runner.feed.stats().dropped_snapshots, 2u);  // 丢弃的快照没有回调
+    SnapshotLog log;
+    log.pump(runner.feed);
+    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));  // 待发布的空簿
+    CHECK_EQ(log.all[2].bid_count + log.all[2].ask_count, 0u);
+    std::lock_guard<std::mutex> lock(calls->mutex);
+    CHECK_EQ(calls->queue_sizes.size(), std::size_t{3});
+    CHECK_EQ(calls->published.back(), 3u);
+    for (const std::thread::id& id : calls->threads) CHECK(id == runner.thread.get_id());
+}
+
+TEST_CASE("feed: an exception thrown by the publish callback is swallowed and the feed keeps publishing") {
+    MockExchangeServer server;
+    server.setWebSocketScript([](WsSession& ws) {
+        for (int i = 0; i < 5; ++i) ws.send(simpleBook(i));
+    });
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    FeedRunner runner(baseConfig(Exchange::OKX, server), {}, [calls](MarketDataFeed&) {
+        if (calls->fetch_add(1) == 0) throw std::runtime_error("callback failure");
+    });
+    SnapshotLog log;
+    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 5; }, 5000));
+    CHECK_EQ(calls->load(), 5);
+    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
 }
 
 TEST_CASE("feed: a pending disconnect book is superseded by the next session's book, never delivered stale after it") {

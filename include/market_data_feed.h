@@ -281,7 +281,8 @@ private:
 // = wallClockMs() - exchange_ts_ms（纳秒存储，时钟偏差导致的负值记为 0），每条带时间戳的消息记录一次。
 //
 // 线程模型：run() 在专用线程上调用一次；stop()、status()、stats()、lastError()、延迟统计可在任意线程调用；
-// checkHealth() 与 queue() 的消费端只在主线程调用。销毁前必须 stop() 并 join 运行 run() 的线程。
+// checkHealth() 与 queue() 的消费端只在主线程调用；setPublishCallback() 只能在 run() 之前调用。
+// 销毁前必须 stop() 并 join 运行 run() 的线程。
 class MarketDataFeed {
 public:
     // 连续立即重连的上限（之后改用退避，直到出现健康会话）
@@ -404,6 +405,11 @@ public:
         std::lock_guard<std::mutex> lock(error_mutex_);
         log_cb_ = std::move(cb);
     }
+
+    // 发布通知：每个快照（含空簿与待发布快照的重试）真正进入队列之后，立即在 feed 线程上调用 cb，
+    // 例如唤醒等待新数据的主循环；被丢弃（队列满）的快照不通知。必须在 run() 之前设置（之后不能再改，
+    // 不加锁）。cb 在行情热路径上执行：必须很快返回、不能阻塞；抛出的异常被吞掉。
+    void setPublishCallback(std::function<void()> cb) { publish_cb_ = std::move(cb); }
 
     // 退避时长：min(max, initial * 2^attempt) * (1 + 0.2 * jitter)，jitter ∈ [-1, 1]，结果钳制到 [1, max]
     static int backoffDelayMs(int attempt, int initial_ms, int max_ms, double jitter) noexcept {
@@ -1125,12 +1131,18 @@ private:
         return true;
     }
 
-    // 快照已经入队：记账只跟踪真正送到消费者手里的快照
+    // 快照已经入队：记账只跟踪真正送到消费者手里的快照，然后通知（发布回调）
     void delivered() noexcept {
         constexpr auto r = std::memory_order_relaxed;
         published_.store(published_.load(r) + 1, r);
         delivered_nonempty_ = snapshot_.bid_count + snapshot_.ask_count > 0;
         publish_pending_ = false;
+        if (publish_cb_) {
+            try {
+                publish_cb_();
+            } catch (...) {
+            }
+        }
     }
 
     // 重试没能入队的会话边界快照。snapshot_ 总是最新的状态：断线后是空簿；新会话组装过（但同样没能入队）的簿
@@ -1214,6 +1226,7 @@ private:
     mutable std::mutex error_mutex_;             // 保护 last_error_ / log_cb_
     std::string last_error_;
     std::function<void(const std::string&)> log_cb_;
+    std::function<void()> publish_cb_;           // run() 之前设置；之后只由 feed 线程读取
 
     std::atomic<std::uint64_t> messages_{0}, bytes_{0}, book_updates_{0}, published_{0}, dropped_{0},
         reconnects_{0}, connect_failures_{0}, stalls_{0}, gaps_{0}, checksum_failures_{0}, resyncs_{0},
