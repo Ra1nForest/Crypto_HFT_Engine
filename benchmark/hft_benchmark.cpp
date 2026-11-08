@@ -2,7 +2,7 @@
 // hft_benchmark.cpp
 // HFT 基础库基准测试。注意：本程序直接包含并测试 include/hft/ 下的真实头文件（不是另写的副本），
 // 对比 SPSC 无锁队列 vs std::mutex + std::deque、ObjectPool vs new/delete、
-// FlatHashMap vs std::unordered_map，以及 LatencyHistogram vs 旧版"复制 + 排序采样"的分位数统计。
+// FlatHashMap vs std::unordered_map（另测单次探测的组合操作），以及 LatencyHistogram vs 旧版"复制 + 排序采样"的分位数统计。
 // 用法：./build/hft_benchmark [--quick] [--pin]
 //   --quick  规模缩小 10 倍（冒烟运行）
 //   --pin    把两个基准线程分别绑定到 CPU 0 / 1
@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -294,13 +295,22 @@ struct MapOps<std::unordered_map<std::uint64_t, V>> {
 };
 
 struct MapResult {
-    double mixed, find_hit, find_miss, insert, erase;
+    double mixed = 1e30, find_hit = 1e30, find_miss = 1e30, insert = 1e30, erase = 1e30;
+
+    // 逐项保留更快的一次
+    void keepBest(const MapResult& r) {
+        mixed = std::min(mixed, r.mixed);
+        find_hit = std::min(find_hit, r.find_hit);
+        find_miss = std::min(find_miss, r.find_miss);
+        insert = std::min(insert, r.insert);
+        erase = std::min(erase, r.erase);
+    }
 };
 
 template <class Map>
 MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random_keys) {
     using Ops = MapOps<Map>;
-    MapResult r{};
+    MapResult r;
     const std::uint64_t window = 100'000;  // 存活订单数
     const std::uint64_t iters = 4'000'000 / scale;
     std::mt19937_64 rng(7);
@@ -358,22 +368,91 @@ MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random
     return r;
 }
 
+// 单次探测的组合操作（撮合引擎订单索引 id -> 订单指针的挂单 / 撤单用法）：n 个随机键，表预留到 n，
+// 先建表（不计时）再计时。挂单：contains 查重 + insert（两次探测） vs 插入占位值查重并预留、再经指针填写（一次）；
+// 撤单：find 取值 + erase（两次探测） vs extract（一次） vs find + eraseAt（一次）。删除顺序与插入顺序无关。
+// 值类型是指针（与订单索引相同），也让这一节的实例化与第 3 节的 <uint64, uint64> 互不影响内联决策
+using ProbeMap = hft::FlatHashMap<std::uint64_t, const std::uint64_t*>;
+
+template <class Add>
+double timeAdds(const std::vector<std::uint64_t>& keys, std::size_t n, Add add) {
+    ProbeMap m(n);
+    const std::int64_t t0 = hft::nowNs();
+    for (std::size_t i = 0; i < n; ++i) add(m, keys[i], &keys[i]);
+    const double ns = nsSince(t0) / static_cast<double>(n);
+    doNotOptimize(m.size());
+    return ns;
+}
+
+template <class Remove>
+double timeRemoves(const std::vector<std::uint64_t>& keys, const std::vector<std::uint64_t>& order, Remove remove) {
+    ProbeMap m(order.size());
+    for (std::size_t i = 0; i < order.size(); ++i) m.insert(keys[i], &keys[i]);
+    std::uint64_t sink = 0;
+    const std::int64_t t0 = hft::nowNs();
+    for (std::uint64_t k : order) sink += remove(m, k) != nullptr ? 1 : 0;
+    const double ns = nsSince(t0) / static_cast<double>(order.size());
+    doNotOptimize(sink);
+    return ns;
+}
+
+void benchSingleProbe(std::uint64_t scale, const std::vector<std::uint64_t>& keys) {
+    using Ptr = const std::uint64_t*;
+    const std::size_t n = static_cast<std::size_t>(1'000'000 / scale);
+    std::vector<std::uint64_t> order(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(n));
+    std::shuffle(order.begin(), order.end(), std::mt19937_64(3));
+    const auto contains_insert = [](ProbeMap& m, std::uint64_t k, Ptr v) {
+        if (!m.contains(k)) m.insert(k, v);
+    };
+    const auto reserve_fill = [](ProbeMap& m, std::uint64_t k, Ptr v) {
+        const auto [slot, fresh] = m.insert(k, nullptr);
+        if (fresh) *slot = v;
+    };
+    const auto find_erase = [](ProbeMap& m, std::uint64_t k) {
+        const Ptr* p = m.find(k);
+        const Ptr v = p != nullptr ? *p : nullptr;
+        m.erase(k);
+        return v;
+    };
+    const auto extract = [](ProbeMap& m, std::uint64_t k) { return m.extract(k).value_or(nullptr); };
+    const auto find_erase_at = [](ProbeMap& m, std::uint64_t k) {
+        const Ptr* p = m.find(k);
+        if (p == nullptr) return Ptr{nullptr};
+        const Ptr v = *p;
+        m.eraseAt(p);
+        return v;
+    };
+    double best[5] = {1e30, 1e30, 1e30, 1e30, 1e30};
+    for (int run = 0; run < 2; ++run) {
+        best[0] = std::min(best[0], timeAdds(keys, n, contains_insert));
+        best[1] = std::min(best[1], timeAdds(keys, n, reserve_fill));
+        best[2] = std::min(best[2], timeRemoves(keys, order, find_erase));
+        best[3] = std::min(best[3], timeRemoves(keys, order, extract));
+        best[4] = std::min(best[4], timeRemoves(keys, order, find_erase_at));
+    }
+    std::printf("  %-38s %14s %14s\n", "single-probe primitives (best of 2)", "ns/op", "vs 2 probes");
+    const struct {
+        const char* name;
+        double ns, two_probe_ns;
+    } rows[] = {
+        {"add: contains + insert (2 probes)", best[0], best[0]},
+        {"add: insert placeholder + fill", best[1], best[0]},
+        {"cancel: find + erase (2 probes)", best[2], best[2]},
+        {"cancel: extract", best[3], best[2]},
+        {"cancel: find + eraseAt", best[4], best[2]},
+    };
+    for (const auto& row : rows) std::printf("  %-38s %14.2f %13.2fx\n", row.name, row.ns, row.two_probe_ns / row.ns);
+}
+
 void benchMaps(std::uint64_t scale) {
     printHeader("[3] hft::FlatHashMap vs std::unordered_map (uint64 keys)");
     std::mt19937_64 rng(99);
     std::vector<std::uint64_t> keys(1u << 21);  // 前一半插入，后一半用作未命中查找
     for (auto& k : keys) k = rng();
-    using Flat = hft::FlatHashMap<std::uint64_t, std::uint64_t>;
-    using Std = std::unordered_map<std::uint64_t, std::uint64_t>;
-    MapResult flat{1e30, 1e30, 1e30, 1e30, 1e30}, std_map{1e30, 1e30, 1e30, 1e30, 1e30};
+    MapResult flat, std_map;
     for (int run = 0; run < 2; ++run) {
-        const MapResult a = benchMap<Flat>(scale, keys);
-        const MapResult b = benchMap<Std>(scale, keys);
-        flat = {std::min(flat.mixed, a.mixed), std::min(flat.find_hit, a.find_hit), std::min(flat.find_miss, a.find_miss),
-                std::min(flat.insert, a.insert), std::min(flat.erase, a.erase)};
-        std_map = {std::min(std_map.mixed, b.mixed), std::min(std_map.find_hit, b.find_hit),
-                   std::min(std_map.find_miss, b.find_miss), std::min(std_map.insert, b.insert),
-                   std::min(std_map.erase, b.erase)};
+        flat.keepBest(benchMap<hft::FlatHashMap<std::uint64_t, std::uint64_t>>(scale, keys));
+        std_map.keepBest(benchMap<std::unordered_map<std::uint64_t, std::uint64_t>>(scale, keys));
     }
     std::printf("  %-38s %14s %14s %9s\n", "operation (ns/op, best of 2)", "FlatHashMap", "unordered_map", "speedup");
     const struct {
@@ -389,6 +468,7 @@ void benchMaps(std::uint64_t scale) {
     for (const auto& row : rows) {
         std::printf("  %-38s %14.2f %14.2f %8.1fx\n", row.name, row.flat, row.std_map, row.std_map / row.flat);
     }
+    benchSingleProbe(scale, keys);
 }
 
 // ---------------------------------------------------------------------------

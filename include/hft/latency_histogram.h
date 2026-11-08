@@ -30,9 +30,10 @@ namespace hft {
 // - countBelow(v)：完全位于 v 所在桶之下的样本数，即值 < bucketLow(bucketIndex(v)) 的样本数。
 //   v 为桶下界时（v < 128 时总是如此）结果精确，否则少算 v 所在桶内小于 v 的那部分样本。
 // 并发：
-// - 只允许一个写者线程调用 record/reset/merge（作为目标）/拷贝赋值；读者可在任意线程并发调用 const 接口。
+// - 只允许一个写者线程调用 record/merge（作为目标）；读者可在任意线程并发调用 const 接口。不可拷贝。
 // - 所有计数都是 std::atomic<std::uint64_t>，写者用 relaxed 读 + 写更新（单写者，无需 RMW 指令）；
-//   count_ 最后用 release 写入，读者先 acquire 读 count_，因此读到 count == n 时至少能看到前 n 次记录。
+//   count_ 最后用 release 写入，读者先 acquire 读 count_，因此读到 count == n 时至少能看到前 n 次记录：
+//   此时 min <= max，[min, max] 覆盖的桶里至少有 n 个样本。
 //   写者并发更新期间读者得到的是近似一致的快照（某些字段可能比 count 更新），但不会出现数据竞争或越界。
 class LatencyHistogram {
 public:
@@ -40,16 +41,6 @@ public:
     static constexpr std::size_t kSubBucketCount = std::size_t{1} << kSubBucketBits;  // 每个倍程 64 个子桶
     static constexpr std::uint64_t kExactLimit = std::uint64_t{2} << kSubBucketBits;  // [0, 128) 精确
     static constexpr std::size_t kBucketCount = (64 - kSubBucketBits + 1) * kSubBucketCount;  // 3776
-
-    LatencyHistogram() noexcept = default;
-
-    // 拷贝：对源直方图做一次（近似一致的）快照，源可以正被其写者并发更新
-    LatencyHistogram(const LatencyHistogram& other) noexcept { copyFrom(other); }
-
-    LatencyHistogram& operator=(const LatencyHistogram& other) noexcept {
-        if (this != &other) copyFrom(other);
-        return *this;
-    }
 
     // ---------------- 桶映射（公开以便测试与外部聚合） ----------------
 
@@ -95,22 +86,12 @@ public:
         count_.store(count_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     }
 
-    // 清空（只能由写者调用；并发读者可能短暂看到部分清空的状态）
-    void reset() noexcept {
-        count_.store(0, std::memory_order_release);
-        sum_.store(0, std::memory_order_relaxed);
-        min_.store(kMaxValue, std::memory_order_relaxed);
-        max_.store(0, std::memory_order_relaxed);
-        for (auto& b : buckets_) b.store(0, std::memory_order_relaxed);
-    }
-
     // 把 other 的全部样本合并进来（本对象的写者调用；other 可以正被其写者并发更新，也可以是自身）
     void merge(const LatencyHistogram& other) noexcept {
         const std::uint64_t n = other.count_.load(std::memory_order_acquire);
         if (n == 0) return;
         const std::uint64_t lo = other.min_.load(std::memory_order_relaxed);
         const std::uint64_t hi = other.max_.load(std::memory_order_relaxed);
-        if (lo > hi) return;  // 防御：源正被 reset
         const std::uint64_t other_sum = other.sum_.load(std::memory_order_relaxed);
         // 用实际合并的桶计数更新 count，保证本对象 count == 各桶之和
         std::uint64_t merged = 0;
@@ -121,7 +102,6 @@ public:
             buckets_[i].store(buckets_[i].load(std::memory_order_relaxed) + c, std::memory_order_relaxed);
             merged += c;
         }
-        if (merged == 0) return;
         std::uint64_t s = sum_.load(std::memory_order_relaxed);
         if (__builtin_add_overflow(s, other_sum, &s)) s = kMaxValue;
         sum_.store(s, std::memory_order_relaxed);
@@ -164,13 +144,11 @@ public:
         if (count() == 0) return 0;
         const std::uint64_t lo = min_.load(std::memory_order_relaxed);
         const std::uint64_t hi = max_.load(std::memory_order_relaxed);
-        if (lo > hi) return 0;  // 防御：并发 reset
         // 只扫描 [min, max] 覆盖的桶；先求总数再定位秩，两遍之间桶计数只增不减，第二遍必能找到
         const std::size_t first = bucketIndex(lo);
         const std::size_t last = bucketIndex(hi);
         std::uint64_t total = 0;
         for (std::size_t i = first; i <= last; ++i) total += buckets_[i].load(std::memory_order_relaxed);
-        if (total == 0) return lo;
         if (!(q > 0.0)) q = 0.0;
         if (q > 1.0) q = 1.0;
         const double r = std::ceil(q * static_cast<double>(total));
@@ -192,15 +170,13 @@ public:
     // 值 < v 的样本数（桶分辨率，见类注释）
     std::uint64_t countBelow(std::uint64_t v) const noexcept {
         if (count() == 0) return 0;
-        const std::uint64_t lo = min_.load(std::memory_order_relaxed);
-        const std::uint64_t hi = max_.load(std::memory_order_relaxed);
-        if (lo > hi) return 0;
-        const std::size_t first = bucketIndex(lo);
-        const std::size_t end_bucket = bucketIndex(v);         // 不含 v 所在的桶
-        const std::size_t last_plus_one = bucketIndex(hi) + 1;  // 只扫描有数据的范围
-        const std::size_t end = end_bucket < last_plus_one ? end_bucket : last_plus_one;
+        const std::size_t end_bucket = bucketIndex(v);                                      // 不含 v 所在的桶
+        const std::size_t data_end = bucketIndex(max_.load(std::memory_order_relaxed)) + 1;  // 只扫描有数据的范围
+        const std::size_t end = end_bucket < data_end ? end_bucket : data_end;
         std::uint64_t below = 0;
-        for (std::size_t i = first; i < end; ++i) below += buckets_[i].load(std::memory_order_relaxed);
+        for (std::size_t i = bucketIndex(min_.load(std::memory_order_relaxed)); i < end; ++i) {
+            below += buckets_[i].load(std::memory_order_relaxed);
+        }
         return below;
     }
 
@@ -211,27 +187,6 @@ public:
 
 private:
     static constexpr std::uint64_t kMaxValue = std::numeric_limits<std::uint64_t>::max();
-
-    void copyFrom(const LatencyHistogram& other) noexcept {
-        const std::uint64_t n = other.count_.load(std::memory_order_acquire);
-        std::uint64_t total = 0;
-        for (std::size_t i = 0; i < kBucketCount; ++i) {
-            const std::uint64_t c = other.buckets_[i].load(std::memory_order_relaxed);
-            buckets_[i].store(c, std::memory_order_relaxed);
-            total += c;
-        }
-        if (n == 0 || total == 0) {
-            sum_.store(0, std::memory_order_relaxed);
-            min_.store(kMaxValue, std::memory_order_relaxed);
-            max_.store(0, std::memory_order_relaxed);
-        } else {
-            sum_.store(other.sum_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            min_.store(other.min_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            max_.store(other.max_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        }
-        // count 取实际复制的桶计数之和，保证快照自身 count == 各桶之和
-        count_.store(n == 0 ? 0 : total, std::memory_order_release);
-    }
 
     // 写者频繁更新的汇总字段放在同一缓存行
     alignas(kCacheLineSize) std::atomic<std::uint64_t> count_{0};

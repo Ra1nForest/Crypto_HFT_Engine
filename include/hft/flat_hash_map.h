@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -49,11 +50,15 @@ constexpr std::uint64_t splitmix64(std::uint64_t x) noexcept {
 // - 负载因子上限 0.5：插入使 size 超过 bucketCount()/2 时桶数翻倍并重新插入。
 // - 删除采用反向移位（backward-shift）：删除后把后续探测链上可以前移的元素依次前移填补空位，
 //   不留墓碑，查找性能不会随删除退化。
+// - 单次探测的组合操作：extract 删除并取出值；eraseAt 删除 find/insert 返回的指针所指的元素；
+//   insert 返回值指针，可以先插入占位值完成"查重 + 预留槽位"，之后经指针写入真正的值或用 eraseAt 撤销。
+// - 各查找类操作各自展开"命中 / 遇到空桶"双出口的探测循环，不共用一个返回桶下标的 probe() 辅助函数：
+//   实测共用版本在 hft_benchmark 的哈希表各行慢 10% 以上。
 // - 指针失效：find/insert/operator[] 返回的指针（引用）在任何触发扩容的插入之后失效；
-//   erase 会移动同一探测链上的其他元素，因此 erase 之后指向其他元素的指针同样失效。
+//   删除会移动同一探测链上的其他元素，因此任何删除之后指向其他元素的指针同样失效。
 // - 值类型 V 只需可移动（要求 noexcept 移动构造与析构，扩容与反向移位因此不会中途失败）；
 //   V 只在被占用的桶中构造，不要求默认构造（operator[] 除外）。
-// - 非线程安全。
+// - 只能移动构造（不可拷贝、不可赋值）；非线程安全。
 template <class K, class V>
 class FlatHashMap {
     using Underlying = typename detail::KeyUnderlying<K>::type;
@@ -70,9 +75,6 @@ class FlatHashMap {
     };
 
 public:
-    using key_type = K;
-    using mapped_type = V;
-
     // 表示空桶的哨兵键（底层类型最大值）；作为普通键使用时存放在表外专用槽位
     static constexpr K kEmptyKey = static_cast<K>(std::numeric_limits<Underlying>::max());
     // 分配桶数组时的最小桶数
@@ -84,51 +86,22 @@ public:
         if (initial_capacity > 0) reserve(initial_capacity);
     }
 
-    ~FlatHashMap() { releaseTable(); destroySpecial(); }
-
-    FlatHashMap(const FlatHashMap& other) : FlatHashMap(0) { copyFrom(other); }
-
-    FlatHashMap& operator=(const FlatHashMap& other) {
-        if (this != &other) {
-            FlatHashMap tmp(other);
-            swap(tmp);
-        }
-        return *this;
-    }
-
-    // 移动：转移桶数组，源对象变为空表（不持有内存）
-    FlatHashMap(FlatHashMap&& other) noexcept : FlatHashMap(0) { swap(other); }
-
-    FlatHashMap& operator=(FlatHashMap&& other) noexcept {
-        if (this != &other) {
-            releaseTable();
-            destroySpecial();
-            swap(other);
-        }
-        return *this;
-    }
-
-    void swap(FlatHashMap& other) noexcept {
-        std::swap(slots_, other.slots_);
-        std::swap(mask_, other.mask_);
-        std::swap(table_size_, other.table_size_);
-        std::swap(max_load_, other.max_load_);
-        // 表外专用槽位按值交换：只用移动构造 + 析构（不要求 V 可移动赋值）
-        if (has_special_ && other.has_special_) {
-            V tmp(std::move(*specialPtr()));
-            specialPtr()->~V();
+    // 移动构造：转移桶数组与表外槽位，源对象变为空表（不持有内存）
+    FlatHashMap(FlatHashMap&& other) noexcept
+        : slots_(std::exchange(other.slots_, sentinel())),
+          mask_(std::exchange(other.mask_, 0)),
+          table_size_(std::exchange(other.table_size_, 0)),
+          max_load_(std::exchange(other.max_load_, 0)) {
+        if (other.has_special_) {
             ::new (static_cast<void*>(special_value_)) V(std::move(*other.specialPtr()));
-            other.specialPtr()->~V();
-            ::new (static_cast<void*>(other.special_value_)) V(std::move(tmp));
-        } else if (has_special_) {
-            ::new (static_cast<void*>(other.special_value_)) V(std::move(*specialPtr()));
-            destroySpecial();
-            other.has_special_ = true;
-        } else if (other.has_special_) {
-            ::new (static_cast<void*>(special_value_)) V(std::move(*other.specialPtr()));
-            other.destroySpecial();
             has_special_ = true;
+            other.destroySpecial();
         }
+    }
+
+    ~FlatHashMap() {
+        if constexpr (!std::is_trivially_destructible_v<V>) clear();
+        if (slots_ != sentinel()) delete[] slots_;
     }
 
     // 查找：返回值指针，不存在返回 nullptr
@@ -164,40 +137,52 @@ public:
             if (k == key) break;
             if (k == kEmptyKey) return false;
         }
-        valuePtr(slots_[i])->~V();
-        // 反向移位：从被删位置向后扫描到第一个空桶。元素 j 的探测路径为 [home, j]，
-        // 若空位 hole 落在循环区间 [home, j) 内（等价于 dist(home, j) >= dist(hole, j)），
-        // 就把它前移到 hole，j 成为新的空位；否则它必须留在原地（前移会越过自己的 home）。
-        std::size_t hole = i;
-        for (std::size_t j = (i + 1) & mask_;; j = (j + 1) & mask_) {
-            Slot& sj = slots_[j];
-            if (sj.key == kEmptyKey) break;
-            const std::size_t home = homeOf(sj.key);
-            if (((j - home) & mask_) >= ((j - hole) & mask_)) {
-                Slot& sh = slots_[hole];
-                V* src = valuePtr(sj);
-                ::new (static_cast<void*>(sh.value)) V(std::move(*src));
-                src->~V();
-                sh.key = sj.key;
-                hole = j;
-            }
-        }
-        slots_[hole].key = kEmptyKey;
-        --table_size_;
+        eraseSlot(i);
         return true;
+    }
+
+    // 删除并取出值（一次探测）；键不存在时返回 nullopt
+    std::optional<V> extract(K key) noexcept {
+        if (HFT_UNLIKELY(key == kEmptyKey)) {
+            if (!has_special_) return std::nullopt;
+            std::optional<V> out(std::move(*specialPtr()));
+            destroySpecial();
+            return out;
+        }
+        std::size_t i = homeOf(key);
+        for (;; i = (i + 1) & mask_) {
+            const K k = slots_[i].key;
+            if (k == key) break;
+            if (k == kEmptyKey) return std::nullopt;
+        }
+        std::optional<V> out(std::move(*valuePtr(slots_[i])));
+        eraseSlot(i);
+        return out;
+    }
+
+    // 删除 p 所指的元素，不再探测。p 必须是 find/insert/operator[] 返回的指针，
+    // 且取得之后没有发生过扩容插入或任何删除（见指针失效规则）
+    void eraseAt(const V* p) noexcept {
+        if (HFT_UNLIKELY(has_special_ && p == specialPtr())) {
+            destroySpecial();
+            return;
+        }
+        // 值存储位于所在 Slot 内部：字节偏移整除 sizeof(Slot) 即桶下标
+        const std::size_t i =
+            (reinterpret_cast<std::uintptr_t>(p) - reinterpret_cast<std::uintptr_t>(slots_)) / sizeof(Slot);
+        HFT_ASSERT(i <= mask_ && slots_[i].key != kEmptyKey && valuePtr(slots_[i]) == p);
+        eraseSlot(i);
     }
 
     // 保证插入 n 个元素之前不会扩容（size() 超过 n 时才可能扩容）
     void reserve(std::size_t n) {
-        if (n <= max_load_) return;
-        rehash(bucketsFor(n));
+        if (n > max_load_) rehash(bucketsFor(n));
     }
 
     // 清空全部元素，保留已分配的桶数组
     void clear() noexcept {
         if (table_size_ != 0) {
-            const std::size_t buckets = mask_ + 1;
-            for (std::size_t i = 0; i < buckets; ++i) {
+            for (std::size_t i = 0; i <= mask_; ++i) {
                 Slot& s = slots_[i];
                 if (s.key != kEmptyKey) {
                     valuePtr(s)->~V();
@@ -219,8 +204,7 @@ public:
     // 遍历全部元素：f(K, const V&)。顺序未指定；遍历期间不得修改本表。
     template <class F>
     void forEach(F&& f) const {
-        const std::size_t buckets = mask_ + 1;
-        for (std::size_t i = 0; i < buckets; ++i) {
+        for (std::size_t i = 0; i <= mask_; ++i) {
             const Slot& s = slots_[i];
             if (s.key != kEmptyKey) f(s.key, *valuePtr(s));
         }
@@ -282,10 +266,13 @@ private:
 
     std::size_t homeOf(K key) const noexcept { return static_cast<std::size_t>(hash(key)) & mask_; }
 
-    static V* valuePtr(Slot& s) noexcept { return std::launder(reinterpret_cast<V*>(s.value)); }
-    static const V* valuePtr(const Slot& s) noexcept {
-        return std::launder(reinterpret_cast<const V*>(s.value));
+    // 已知 key 不在表中：返回其探测路径上的第一个空桶
+    std::size_t findEmptyFor(K key) const noexcept {
+        std::size_t i = homeOf(key);
+        while (slots_[i].key != kEmptyKey) i = (i + 1) & mask_;
+        return i;
     }
+
     V* specialPtr() noexcept { return std::launder(reinterpret_cast<V*>(special_value_)); }
     const V* specialPtr() const noexcept { return std::launder(reinterpret_cast<const V*>(special_value_)); }
 
@@ -294,6 +281,19 @@ private:
             specialPtr()->~V();
             has_special_ = false;
         }
+    }
+
+    static V* valuePtr(Slot& s) noexcept { return std::launder(reinterpret_cast<V*>(s.value)); }
+    static const V* valuePtr(const Slot& s) noexcept {
+        return std::launder(reinterpret_cast<const V*>(s.value));
+    }
+
+    // 把 from 中的元素移动到空桶 to 并析构原值（from 的键由调用方处理）
+    static void moveSlot(Slot& from, Slot& to) noexcept {
+        V* src = valuePtr(from);
+        ::new (static_cast<void*>(to.value)) V(std::move(*src));
+        src->~V();
+        to.key = from.key;
     }
 
     // 键不存在时用 args 构造值；返回 (值指针, 是否新插入)
@@ -313,7 +313,7 @@ private:
         }
         if (HFT_UNLIKELY(table_size_ >= max_load_)) {
             const std::size_t buckets = mask_ + 1;
-            rehash(buckets < kMinBuckets ? kMinBuckets : buckets * 2);
+            rehash(buckets < kMinBuckets ? kMinBuckets : buckets * 2);  // 桶数翻倍（未分配时为 kMinBuckets）
             i = findEmptyFor(key);
         }
         Slot& s = slots_[i];
@@ -323,93 +323,48 @@ private:
         return {valuePtr(s), true};
     }
 
-    // 已知 key 不在表中：返回其探测路径上的第一个空桶
-    std::size_t findEmptyFor(K key) const noexcept {
-        std::size_t i = homeOf(key);
-        while (slots_[i].key != kEmptyKey) i = (i + 1) & mask_;
-        return i;
-    }
-
-    static Slot* allocateTable(std::size_t buckets) {
-        Slot* t = new Slot[buckets];
-        for (std::size_t i = 0; i < buckets; ++i) t[i].key = kEmptyKey;
-        return t;
+    // 析构桶 i 中的元素，再反向移位：从 i 向后扫描到第一个空桶。元素 j 的探测路径为 [home, j]，
+    // 若空位 hole 落在循环区间 [home, j) 内（等价于 dist(home, j) >= dist(hole, j)），
+    // 就把它前移到 hole，j 成为新的空位；否则它必须留在原地（前移会越过自己的 home）。
+    void eraseSlot(std::size_t i) noexcept {
+        valuePtr(slots_[i])->~V();
+        std::size_t hole = i;
+        for (std::size_t j = (i + 1) & mask_;; j = (j + 1) & mask_) {
+            Slot& sj = slots_[j];
+            if (sj.key == kEmptyKey) break;
+            const std::size_t home = homeOf(sj.key);
+            if (((j - home) & mask_) >= ((j - hole) & mask_)) {
+                moveSlot(sj, slots_[hole]);
+                hole = j;
+            }
+        }
+        slots_[hole].key = kEmptyKey;
+        --table_size_;
     }
 
     // 重建为 new_buckets 个桶（2 的幂，且能容纳当前元素）；分配失败时原表不变
     void rehash(std::size_t new_buckets) {
-        Slot* fresh = allocateTable(new_buckets);
-        Slot* old = slots_;
+        Slot* const fresh = new Slot[new_buckets];
+        for (std::size_t i = 0; i < new_buckets; ++i) fresh[i].key = kEmptyKey;
+        Slot* const old = slots_;
         const std::size_t old_buckets = mask_ + 1;
         slots_ = fresh;
         mask_ = new_buckets - 1;
         max_load_ = new_buckets / 2;
-        if (old != sentinel()) {
-            for (std::size_t i = 0; i < old_buckets; ++i) {
-                Slot& s = old[i];
-                if (s.key == kEmptyKey) continue;
-                Slot& d = slots_[findEmptyFor(s.key)];
-                V* src = valuePtr(s);
-                ::new (static_cast<void*>(d.value)) V(std::move(*src));
-                src->~V();
-                d.key = s.key;
-            }
-            delete[] old;
+        if (old == sentinel()) return;
+        for (std::size_t i = 0; i < old_buckets; ++i) {
+            if (old[i].key != kEmptyKey) moveSlot(old[i], slots_[findEmptyFor(old[i].key)]);
         }
-    }
-
-    // 析构表内全部元素并释放桶数组，恢复为未分配状态
-    void releaseTable() noexcept {
-        if (slots_ == sentinel()) return;
-        if constexpr (!std::is_trivially_destructible_v<V>) {
-            const std::size_t buckets = mask_ + 1;
-            for (std::size_t i = 0; i < buckets; ++i) {
-                if (slots_[i].key != kEmptyKey) valuePtr(slots_[i])->~V();
-            }
-        }
-        delete[] slots_;
-        slots_ = sentinel();
-        mask_ = 0;
-        table_size_ = 0;
-        max_load_ = 0;
-    }
-
-    // 拷贝构造辅助：桶布局与源表完全相同（同样的桶数、同样的位置），无需重新探测
-    void copyFrom(const FlatHashMap& other) {
-        if (other.slots_ != sentinel()) {
-            const std::size_t buckets = other.mask_ + 1;
-            Slot* t = allocateTable(buckets);
-            std::size_t i = 0;
-            try {
-                for (; i < buckets; ++i) {
-                    const Slot& s = other.slots_[i];
-                    if (s.key == kEmptyKey) continue;
-                    ::new (static_cast<void*>(t[i].value)) V(*valuePtr(s));
-                    t[i].key = s.key;
-                }
-            } catch (...) {
-                for (std::size_t j = 0; j < i; ++j) {
-                    if (t[j].key != kEmptyKey) valuePtr(t[j])->~V();
-                }
-                delete[] t;
-                throw;
-            }
-            slots_ = t;
-            mask_ = other.mask_;
-            table_size_ = other.table_size_;
-            max_load_ = other.max_load_;
-        }
-        if (other.has_special_) {
-            ::new (static_cast<void*>(special_value_)) V(*other.specialPtr());  // 抛异常时由析构函数回收表
-            has_special_ = true;
-        }
+        delete[] old;
     }
 
     Slot* slots_ = sentinel();
     std::size_t mask_ = 0;        // 桶数 - 1
     std::size_t table_size_ = 0;  // 表内元素数（不含表外专用槽位）
     std::size_t max_load_ = 0;    // 扩容阈值 = 桶数 / 2（未分配时为 0）
-    bool has_special_ = false;    // kEmptyKey 是否作为普通键存在
+    // kEmptyKey 作为普通键时的值。用标志 + 原始存储，而不用 std::optional<V> 或 union：
+    // 实测后两者使 exchange_sim 吞吐下降 7-14%（引擎热路径的代码生成变差）
+    bool has_special_ = false;
     alignas(V) unsigned char special_value_[sizeof(V)];
 };
 

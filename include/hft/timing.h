@@ -7,10 +7,10 @@
 
 #include "common.h"
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <thread>
 
@@ -60,13 +60,13 @@ inline std::uint64_t rdtscp() noexcept {
 }
 
 // TSC 时钟：把 rdtsc() 的计数换算为纳秒。
-// - 首次调用 instance() 时以 steady_clock 为基准自动校准（默认 20 ms 窗口，此后可再次 calibrate()）。
+// - 首次调用 instance() 时以 steady_clock 为基准校准一次（阻塞约 20 ms），之后系数只读。
 // - 假设 TSC 恒定频率（Linux /proc/cpuinfo 中的 constant_tsc / nonstop_tsc）；否则换算只是近似值。
-// - 线程安全：系数存放在原子变量中，calibrate() 可与 toNs() 并发调用。
+// - 线程安全：函数内静态变量的初始化是线程安全的，校准完成之后各线程只读系数。
 class TscClock {
 public:
     static TscClock& instance() {
-        static TscClock clock;  // C++11 起函数内静态变量的初始化是线程安全的
+        static TscClock clock;
         return clock;
     }
 
@@ -74,35 +74,30 @@ public:
     TscClock& operator=(const TscClock&) = delete;
 
     // 每个 tick 的纳秒数（非 x86 平台约为 1.0）
-    double nsPerTick() const noexcept { return ns_per_tick_.load(std::memory_order_relaxed); }
+    double nsPerTick() const noexcept { return ns_per_tick_; }
 
     // tick 数换算为纳秒。ticks 按二进制补码解释为有符号数：end - start 因跨核 TSC 偏差
     // 出现小幅"负值"（无符号回绕）时得到小的负纳秒数，而不是一个巨大的正数。
     std::int64_t toNs(std::uint64_t ticks) const noexcept {
-        const double ns = static_cast<double>(static_cast<std::int64_t>(ticks)) * nsPerTick();
+        const double ns = static_cast<double>(static_cast<std::int64_t>(ticks)) * ns_per_tick_;
         constexpr double kLimit = 9.2e18;  // 略小于 INT64_MAX，避免 double -> int64 越界
         if (ns >= kLimit) return std::numeric_limits<std::int64_t>::max();
         if (ns <= -kLimit) return std::numeric_limits<std::int64_t>::min();
         return static_cast<std::int64_t>(ns);
     }
 
-    // 以 steady_clock 为基准在 window 时间窗内重新校准（阻塞约 window 时长）
-    void calibrate(std::chrono::milliseconds window = std::chrono::milliseconds(20)) {
-        if (window < std::chrono::milliseconds(1)) window = std::chrono::milliseconds(1);
+private:
+    // 以 steady_clock 为基准在 20 ms 时间窗内校准；TSC 不单调或时钟未前进时保留系数 1.0
+    TscClock() {
         std::uint64_t tsc0 = 0, tsc1 = 0;
         std::int64_t ns0 = 0, ns1 = 0;
         samplePair(tsc0, ns0);
-        std::this_thread::sleep_for(window);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         samplePair(tsc1, ns1);
         if (tsc1 > tsc0 && ns1 > ns0) {
-            ns_per_tick_.store(static_cast<double>(ns1 - ns0) / static_cast<double>(tsc1 - tsc0),
-                               std::memory_order_relaxed);
+            ns_per_tick_ = static_cast<double>(ns1 - ns0) / static_cast<double>(tsc1 - tsc0);
         }
-        // 否则（TSC 不单调或时钟未前进）保留原系数
     }
-
-private:
-    TscClock() { calibrate(); }
 
     // 同时读取一对 (tsc, steady ns)：取 5 次中两次 rdtsc 间隔最小的一次，
     // 用其 TSC 中点与 steady 读数配对，降低被中断/抢占造成的误差
@@ -124,7 +119,7 @@ private:
         }
     }
 
-    std::atomic<double> ns_per_tick_{1.0};
+    double ns_per_tick_ = 1.0;
 };
 
 // 把当前线程绑定到指定 CPU（Linux pthread_setaffinity_np）；失败或非 Linux 平台返回 false
@@ -145,12 +140,9 @@ inline bool pinThreadToCpu(int cpu) noexcept {
 inline void setThreadName(const char* name) noexcept {
 #if defined(__linux__)
     if (name == nullptr) return;
-    char buf[16];
-    std::size_t n = 0;
-    while (n < sizeof(buf) - 1 && name[n] != '\0') {
-        buf[n] = name[n];
-        ++n;
-    }
+    char buf[16];  // 15 个字符 + 结尾的 '\0'
+    const std::size_t n = ::strnlen(name, sizeof(buf) - 1);
+    std::memcpy(buf, name, n);
     buf[n] = '\0';
     pthread_setname_np(pthread_self(), buf);
 #else

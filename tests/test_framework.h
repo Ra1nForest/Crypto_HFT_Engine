@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -105,21 +106,19 @@ inline int runAll(int argc, char** argv) {
         filters.emplace_back(argv[i]);
     }
 
+    auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
     int run = 0, failed = 0;
-    auto total_start = std::chrono::steady_clock::now();
+    const auto total_start = std::chrono::steady_clock::now();
     // 按下标遍历并拷贝用例：允许用例在运行期间动态注册新用例而不使迭代器失效
     for (std::size_t idx = 0; idx < registry().size(); ++idx) {
         const TestCase tc = registry()[idx];
-        if (!filters.empty()) {
-            bool match = false;
-            for (auto& f : filters) {
-                if (tc.name.find(f) != std::string::npos) { match = true; break; }
-            }
-            if (!match) continue;
-        }
+        const auto matches = [&tc](const std::string& f) { return tc.name.find(f) != std::string::npos; };
+        if (!filters.empty() && std::none_of(filters.begin(), filters.end(), matches)) continue;
         ++run;
         currentFailures() = 0;
-        auto start = std::chrono::steady_clock::now();
+        const auto start = std::chrono::steady_clock::now();
         try {
             tc.fn();
         } catch (const RequireFailure&) {
@@ -129,19 +128,15 @@ inline int runAll(int argc, char** argv) {
         } catch (...) {
             reportFailure(tc.file, tc.line, "unexpected non-std exception");
         }
-        auto ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - start).count();
         if (currentFailures() > 0) {
             ++failed;
             std::cout << "[FAIL] " << tc.name << " (" << currentFailures() << " failure(s))" << std::endl;
         } else {
-            std::printf("[ OK ] %s (%.1f ms)\n", tc.name.c_str(), ms);
+            std::printf("[ OK ] %s (%.1f ms)\n", tc.name.c_str(), ms_since(start));
             std::fflush(stdout);
         }
     }
-    auto total_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - total_start).count();
-    std::printf("\n%d test(s) run, %d failed, %.1f ms\n", run, failed, total_ms);
+    std::printf("\n%d test(s) run, %d failed, %.1f ms\n", run, failed, ms_since(total_start));
     if (run == 0) {
         std::printf("No tests matched.\n");
         return 1;
@@ -197,6 +192,8 @@ inline int runAll(int argc, char** argv) {
 #define CHECK_GE(a, b) HFT_TEST_CMP_IMPL(a, b, >=, false)
 #define REQUIRE_EQ(a, b) HFT_TEST_CMP_IMPL(a, b, ==, true)
 #define REQUIRE_NE(a, b) HFT_TEST_CMP_IMPL(a, b, !=, true)
+#define REQUIRE_LE(a, b) HFT_TEST_CMP_IMPL(a, b, <=, true)
+#define REQUIRE_GE(a, b) HFT_TEST_CMP_IMPL(a, b, >=, true)
 
 // 浮点近似比较
 #define CHECK_NEAR(a, b, eps)                                                        \

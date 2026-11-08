@@ -1,6 +1,6 @@
 //
 // test_hft.cpp
-// HFT 基础库测试：SPSC 队列、对象池、开放寻址哈希表、HDR 直方图、计时工具与 LatencyTracker 兼容接口。
+// HFT 基础库测试：SPSC 队列、对象池、开放寻址哈希表、HDR 直方图、计时工具与 LatencyTracker。
 // 多线程用例（SPSC 压力测试、直方图读写并发）需要在 TSan 构建下也能通过。
 //
 
@@ -26,6 +26,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -34,19 +35,12 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
-#endif
-
-// test_framework.h 只提供 REQUIRE_EQ/REQUIRE_NE，这里补充有序比较的致命断言
-#ifndef REQUIRE_LE
-#define REQUIRE_LE(a, b) HFT_TEST_CMP_IMPL(a, b, <=, true)
-#endif
-#ifndef REQUIRE_GE
-#define REQUIRE_GE(a, b) HFT_TEST_CMP_IMPL(a, b, >=, true)
 #endif
 
 namespace {
@@ -120,22 +114,18 @@ std::uint64_t absDiff(std::uint64_t a, std::uint64_t b) { return a > b ? a - b :
 // common.h
 // ============================================================================
 
-TEST_CASE("common: nextPow2 and isPow2") {
+TEST_CASE("common: nextPow2, isPow2, branch hints and cpuRelax") {
     static_assert(hft::kCacheLineSize == 64);
     static_assert(hft::nextPow2(0) == 1);
     static_assert(hft::nextPow2(1) == 1);
     static_assert(hft::nextPow2(2) == 2);
     static_assert(hft::nextPow2(3) == 4);
     static_assert(hft::nextPow2(1000) == 1024);
-    CHECK_EQ(hft::nextPow2(5), std::size_t{8});
-    CHECK_EQ(hft::nextPow2(1023), std::size_t{1024});
-    CHECK_EQ(hft::nextPow2(1024), std::size_t{1024});
-    CHECK_EQ(hft::nextPow2(1025), std::size_t{2048});
     const std::size_t top = std::size_t{1} << (std::numeric_limits<std::size_t>::digits - 1);
-    CHECK_EQ(hft::nextPow2(top - 1), top);
-    CHECK_EQ(hft::nextPow2(top), top);
-    CHECK_EQ(hft::nextPow2(top + 1), top);  // 不可表示：饱和
-    CHECK_EQ(hft::nextPow2(std::numeric_limits<std::size_t>::max()), top);
+    const std::pair<std::size_t, std::size_t> cases[] = {
+        {5, 8}, {1023, 1024}, {1024, 1024}, {1025, 2048}, {top - 1, top}, {top, top},
+        {top + 1, top}, {std::numeric_limits<std::size_t>::max(), top}};  // 超过 top 的值不可表示：饱和为 top
+    for (const auto& [n, want] : cases) CHECK_EQ(hft::nextPow2(n), want);
     for (std::size_t n = 1; n < 5000; ++n) {
         const std::size_t p = hft::nextPow2(n);
         REQUIRE(hft::isPow2(p));
@@ -146,9 +136,7 @@ TEST_CASE("common: nextPow2 and isPow2") {
     CHECK(hft::isPow2(1));
     CHECK(!hft::isPow2(6));
     CHECK(hft::isPow2(top));
-}
 
-TEST_CASE("common: branch hints and cpuRelax") {
     int taken = 0;
     for (int i = 0; i < 10; ++i) {
         if (HFT_LIKELY(i < 9)) ++taken;
@@ -163,13 +151,9 @@ TEST_CASE("common: branch hints and cpuRelax") {
 // ============================================================================
 
 TEST_CASE("spsc: capacity rounds up to a power of two with a minimum of 2") {
-    CHECK_EQ(hft::SpscQueue<int>(0).capacity(), std::size_t{2});
-    CHECK_EQ(hft::SpscQueue<int>(1).capacity(), std::size_t{2});
-    CHECK_EQ(hft::SpscQueue<int>(2).capacity(), std::size_t{2});
-    CHECK_EQ(hft::SpscQueue<int>(3).capacity(), std::size_t{4});
-    CHECK_EQ(hft::SpscQueue<int>(1000).capacity(), std::size_t{1024});
-    CHECK_EQ(hft::SpscQueue<int>(1024).capacity(), std::size_t{1024});
-    CHECK_EQ(hft::SpscQueue<int>(1025).capacity(), std::size_t{2048});
+    const std::pair<std::size_t, std::size_t> cases[] = {{0, 2},    {1, 2},       {2, 2},       {3, 4},
+                                                         {1000, 1024}, {1024, 1024}, {1025, 2048}};
+    for (const auto& [requested, actual] : cases) CHECK_EQ(hft::SpscQueue<int>(requested).capacity(), actual);
     CHECK_THROWS(hft::SpscQueue<int>(std::numeric_limits<std::size_t>::max()));
     // 只读字段 + 两个下标 + 两个缓存副本，各占一个缓存行
     static_assert(alignof(hft::SpscQueue<int>) == hft::kCacheLineSize);
@@ -188,7 +172,7 @@ TEST_CASE("spsc: full and empty boundaries keep FIFO order") {
 
     for (int i = 0; i < 4; ++i) CHECK(q.tryPush(i));
     CHECK_EQ(q.size(), std::size_t{4});
-    CHECK(!q.tryPush(99));     // 满：不浪费槽位，容量 4 恰好放 4 个
+    CHECK(!q.tryPush(99));  // 满：不浪费槽位，容量 4 恰好放 4 个
     CHECK(!q.tryEmplace(98));
     CHECK_EQ(q.size(), std::size_t{4});
 
@@ -217,9 +201,8 @@ TEST_CASE("spsc: full and empty boundaries keep FIFO order") {
     CHECK(!q.tryPop(out));
 }
 
-TEST_CASE("spsc: randomized single-thread ops match std::deque across many wraparounds") {
-    const std::size_t capacities[] = {2, 4, 8, 64};
-    for (std::size_t cap : capacities) {
+TEST_CASE("spsc: randomized single-thread push, reserving push, tryPop and front/pop match std::deque") {
+    for (std::size_t cap : {std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}, std::size_t{64}}) {
         hft::SpscQueue<std::uint64_t> q(cap);
         REQUIRE_EQ(q.capacity(), cap);
         std::deque<std::uint64_t> model;
@@ -228,8 +211,10 @@ TEST_CASE("spsc: randomized single-thread ops match std::deque across many wrapa
         for (int iter = 0; iter < 300000; ++iter) {
             const unsigned op = static_cast<unsigned>(rng() % 4);
             if (op < 2) {
-                const bool ok = q.tryPush(next);
-                REQUIRE_EQ(ok, model.size() < cap);
+                // op 0：普通推入；op 1：带预留的推入（reserve 含 >= 容量的情况）
+                const std::size_t reserve = op == 0 ? 0 : static_cast<std::size_t>(rng() % (cap + 2));
+                const bool ok = op == 0 ? q.tryPush(next) : q.tryPushReserving(next, reserve);
+                REQUIRE_EQ(ok, reserve < cap && model.size() < cap - reserve);
                 if (ok) {
                     model.push_back(next);
                     ++pushed;
@@ -255,8 +240,7 @@ TEST_CASE("spsc: randomized single-thread ops match std::deque across many wrapa
             REQUIRE_EQ(q.size(), model.size());
             REQUIRE_EQ(q.empty(), model.empty());
         }
-        // 下标绕环形数组至少上千圈
-        CHECK_GT(pushed / cap, std::uint64_t{1000});
+        CHECK_GT(pushed / cap, std::uint64_t{1000});  // 下标绕环形数组至少上千圈
     }
 }
 
@@ -366,25 +350,16 @@ std::uint64_t runSpscStress(std::size_t capacity, std::uint64_t items, Make make
     unsigned spins = 0;
     T out = make(0);
     while (expected < items) {
-        if ((expected & 1) == 0) {
-            if (q.tryPop(out)) {
-                mismatches += verify(out, expected) ? 0 : 1;
-                ++expected;
-                spins = 0;
-            } else {
-                backoff(spins);
-            }
-        } else {
-            T* f = q.front();
-            if (f != nullptr) {
-                mismatches += verify(*f, expected) ? 0 : 1;
-                q.pop();
-                ++expected;
-                spins = 0;
-            } else {
-                backoff(spins);
-            }
+        T* f = nullptr;
+        const bool got = (expected & 1) == 0 ? q.tryPop(out) : (f = q.front()) != nullptr;
+        if (!got) {
+            backoff(spins);
+            continue;
         }
+        mismatches += verify(f != nullptr ? *f : out, expected) ? 0 : 1;
+        if (f != nullptr) q.pop();
+        ++expected;
+        spins = 0;
     }
     producer.join();
     if (!q.empty()) ++mismatches;
@@ -398,40 +373,30 @@ struct Payload {
     std::vector<std::uint64_t> data;
 };
 
+std::string payloadText(std::uint64_t i) { return "payload-" + std::to_string(i) + "-with-enough-text-to-heap-allocate"; }
+
 }  // namespace
 
-TEST_CASE("spsc: two-thread stress keeps sequence integrity (10M items)") {
-    const std::uint64_t mismatches = runSpscStress<std::uint64_t>(
-        1024, 10'000'000, [](std::uint64_t i) { return i; },
-        [](std::uint64_t v, std::uint64_t i) { return v == i; });
-    CHECK_EQ(mismatches, std::uint64_t{0});
-}
-
-TEST_CASE("spsc: two-thread stress at minimum capacity (1M items)") {
-    const std::uint64_t mismatches = runSpscStress<std::uint64_t>(
-        2, 1'000'000, [](std::uint64_t i) { return i * 2654435761u; },
-        [](std::uint64_t v, std::uint64_t i) { return v == i * 2654435761u; });
-    CHECK_EQ(mismatches, std::uint64_t{0});
+TEST_CASE("spsc: two-thread stress keeps sequence integrity (10M items at capacity 1024, 1M at capacity 2)") {
+    const struct {
+        std::size_t capacity;
+        std::uint64_t items, mult;
+    } runs[] = {{1024, 10'000'000, 1}, {2, 1'000'000, 2654435761u}};
+    for (const auto& run : runs) {
+        const std::uint64_t mult = run.mult;
+        const std::uint64_t mismatches = runSpscStress<std::uint64_t>(
+            run.capacity, run.items, [mult](std::uint64_t i) { return i * mult; },
+            [mult](std::uint64_t v, std::uint64_t i) { return v == i * mult; });
+        CHECK_EQ(mismatches, std::uint64_t{0});
+    }
 }
 
 TEST_CASE("spsc: two-thread stress with heap-owning payloads (300k items)") {
     const std::uint64_t mismatches = runSpscStress<Payload>(
         16, 300'000,
-        [](std::uint64_t i) {
-            Payload p;
-            p.seq = i;
-            p.text = "payload-" + std::to_string(i) + "-with-enough-text-to-heap-allocate";
-            p.data.assign(static_cast<std::size_t>(i % 7), i);
-            return p;
-        },
+        [](std::uint64_t i) { return Payload{i, payloadText(i), std::vector<std::uint64_t>(i % 7, i)}; },
         [](const Payload& p, std::uint64_t i) {
-            if (p.seq != i) return false;
-            if (p.text != "payload-" + std::to_string(i) + "-with-enough-text-to-heap-allocate") return false;
-            if (p.data.size() != static_cast<std::size_t>(i % 7)) return false;
-            for (std::uint64_t x : p.data) {
-                if (x != i) return false;
-            }
-            return true;
+            return p.seq == i && p.text == payloadText(i) && p.data == std::vector<std::uint64_t>(i % 7, i);
         });
     CHECK_EQ(mismatches, std::uint64_t{0});
 }
@@ -464,12 +429,12 @@ TEST_CASE("spsc: tryPushReserving keeps reserve slots free; reserve 0 is tryPush
     hft::SpscQueue<int> q(4);
     CHECK(!q.tryPushReserving(1, 4));  // 预留不少于容量：空队列也推不进
     CHECK(!q.tryPushReserving(1, 5));
-    CHECK(!q.tryEmplaceReserving(std::numeric_limits<std::size_t>::max(), 1));
+    CHECK(!q.tryPushReserving(1, std::numeric_limits<std::size_t>::max()));
     CHECK(q.empty());
     CHECK(q.tryPushReserving(10, 3));  // reserve = capacity - 1：只有空队列能推入
     CHECK(!q.tryPushReserving(11, 3));
     CHECK(q.tryPushReserving(11, 1));
-    CHECK(q.tryEmplaceReserving(1, 12));
+    CHECK(q.tryPushReserving(12, 1));
     CHECK(!q.tryPushReserving(13, 1));  // 再推就只剩 0 个空位
     CHECK_EQ(q.size(), std::size_t{3});
     CHECK(q.tryPushReserving(13, 0));  // 预留的最后一个槽位
@@ -485,45 +450,6 @@ TEST_CASE("spsc: tryPushReserving keeps reserve slots free; reserve 0 is tryPush
         CHECK_EQ(out, want);  // FIFO 不受预留影响
     }
     CHECK(q.empty());
-
-    // 只可移动类型：推入失败不消费参数
-    hft::SpscQueue<std::unique_ptr<int>> m(2);
-    CHECK(m.tryPushReserving(std::make_unique<int>(1), 1));
-    auto extra = std::make_unique<int>(2);
-    CHECK(!m.tryPushReserving(std::move(extra), 1));
-    CHECK(extra != nullptr);
-    CHECK(m.tryPushReserving(std::move(extra), 0));
-    CHECK(extra == nullptr);
-    CHECK_EQ(m.size(), std::size_t{2});
-}
-
-TEST_CASE("spsc: randomized single-thread ops with random reserves match std::deque") {
-    const std::size_t capacities[] = {2, 4, 16};
-    for (std::size_t cap : capacities) {
-        hft::SpscQueue<std::uint64_t> q(cap);
-        std::deque<std::uint64_t> model;
-        std::mt19937_64 rng(cap * 7 + 1);
-        std::uint64_t next = 0;
-        for (int iter = 0; iter < 200000; ++iter) {
-            const unsigned op = static_cast<unsigned>(rng() % 3);
-            if (op < 2) {
-                const std::size_t reserve = static_cast<std::size_t>(rng() % (cap + 2));  // 含 >= 容量的情况
-                const bool ok = q.tryPushReserving(next, reserve);
-                REQUIRE_EQ(ok, reserve < cap && model.size() < cap - reserve);
-                if (ok) model.push_back(next);
-                ++next;
-            } else {
-                std::uint64_t v = 0;
-                const bool ok = q.tryPop(v);
-                REQUIRE_EQ(ok, !model.empty());
-                if (ok) {
-                    REQUIRE_EQ(v, model.front());
-                    model.pop_front();
-                }
-            }
-            REQUIRE_EQ(q.size(), model.size());
-        }
-    }
 }
 
 TEST_CASE("spsc: with a consumer running, a reserve-0 push right after a successful reserve-1 push never fails") {
@@ -622,9 +548,8 @@ TEST_CASE("pool: growth keeps existing objects at stable addresses") {
     CHECK_EQ(pool.size(), std::size_t{0});
 }
 
-TEST_CASE("pool: a non-growable pool returns nullptr when exhausted") {
+TEST_CASE("pool: a non-growable pool returns nullptr when exhausted; zero initial capacity") {
     hft::ObjectPool<int> pool(3, false);
-    CHECK(!pool.growable());
     int* a = pool.create(1);
     int* b = pool.create(2);
     int* c = pool.create(3);
@@ -646,9 +571,7 @@ TEST_CASE("pool: a non-growable pool returns nullptr when exhausted") {
     CHECK(pool.create(8) != nullptr);
     CHECK(pool.create(9) == nullptr);
     CHECK_EQ(pool.size(), std::size_t{5});
-}
 
-TEST_CASE("pool: zero initial capacity") {
     hft::ObjectPool<int> fixed(0, false);
     CHECK_EQ(fixed.capacity(), std::size_t{0});
     CHECK(fixed.create(1) == nullptr);
@@ -702,6 +625,7 @@ TEST_CASE("pool: the destructor destroys objects that are still live") {
         hft::ObjectPool<Tracked> pool(4, true);
         std::vector<Tracked*> objs;
         for (int i = 0; i < 100; ++i) objs.push_back(pool.create(i));  // 多次扩容，多个块
+        pool.reserve(300);                                             // 再加一个只有空闲槽位的块
         for (std::size_t i = 0; i < objs.size(); i += 3) pool.destroy(objs[i]);
         CHECK_EQ(Tracked::live, 66);
         CHECK_EQ(pool.size(), std::size_t{66});
@@ -773,27 +697,6 @@ TEST_CASE("pool: randomized create/destroy keeps live objects intact and unique"
     CHECK_EQ(pool.size(), std::size_t{0});
 }
 
-TEST_CASE("pool: move construction and assignment transfer ownership without moving objects") {
-    hft::ObjectPool<int> a(8);
-    int* p = a.create(5);
-    REQUIRE(p != nullptr);
-    hft::ObjectPool<int> b(std::move(a));
-    CHECK_EQ(a.capacity(), std::size_t{0});
-    CHECK_EQ(a.size(), std::size_t{0});
-    CHECK(b.owns(p));
-    CHECK_EQ(*p, 5);
-    CHECK_EQ(b.size(), std::size_t{1});
-    hft::ObjectPool<int> c(4);
-    c = std::move(b);
-    CHECK_EQ(c.capacity(), std::size_t{8});
-    CHECK(c.owns(p));
-    c.destroy(p);
-    CHECK_EQ(c.size(), std::size_t{0});
-    int* q = a.create(1);  // 被移走的池仍可使用（可扩容）
-    REQUIRE(q != nullptr);
-    a.destroy(q);
-}
-
 // ============================================================================
 // FlatHashMap
 // ============================================================================
@@ -801,6 +704,30 @@ TEST_CASE("pool: move construction and assignment transfer ownership without mov
 namespace {
 
 enum class Side : std::uint8_t { Buy = 0, Sell = 1, Other = 255 };
+
+// 值类型是外围类里带默认成员初始化器的嵌套类型（OkxAdapter::LevelText 的用法）：表在外围类完整之前
+// 就作为成员被实例化，operator[] 仍须能值初始化新元素，哨兵键也一样（clang 曾因此编译失败）
+struct NestedValueOwner {
+    struct Text {
+        int len = 7;
+    };
+    hft::FlatHashMap<std::uint64_t, Text> map{4};
+};
+
+// 用三种方式之一删除 key（how % 3：erase、extract、find + eraseAt）；返回被删除的值，键不存在时为 nullopt
+template <class K, class V>
+std::optional<V> eraseVia(hft::FlatHashMap<K, V>& m, K key, std::uint64_t how) {
+    if (how % 3 == 1) return m.extract(key);
+    const V* p = m.find(key);
+    std::optional<V> value;
+    if (p != nullptr) value.emplace(*p);
+    if (how % 3 == 0) {
+        REQUIRE_EQ(m.erase(key), value.has_value());
+    } else if (p != nullptr) {
+        m.eraseAt(p);
+    }
+    return value;
+}
 
 // 逐项比较 FlatHashMap 与 std::unordered_map，并校验内部不变量
 template <class Map, class Ref>
@@ -824,34 +751,60 @@ void requireSameContents(const Map& m, const Ref& ref) {
     if (!m.checkInvariants(&why)) FAIL(why);
 }
 
-// 差分测试：同一随机操作序列同时作用于 FlatHashMap 与 std::unordered_map，每一步比较结果
-template <class K, class KeyFn>
-void runDifferential(std::uint64_t seed, std::size_t ops, int insert_pct, int erase_pct,
-                     std::size_t initial_capacity, KeyFn next_key) {
+// 一步操作中插入与删除所占的百分比（其余：5% operator[]、5% 先预留再填写或撤销、剩下的是查找）
+struct OpMix {
+    int insert_pct, erase_pct;
+};
+
+auto constantMix(int insert_pct, int erase_pct) {
+    return [=](std::size_t) { return OpMix{insert_pct, erase_pct}; };
+}
+
+// 差分测试：同一随机操作序列同时作用于 FlatHashMap 与 std::unordered_map，每一步比较结果。
+// mix(i) 给出第 i 步的操作比例；删除轮流使用 erase / extract / find + eraseAt。
+template <class K, class KeyFn, class MixFn>
+void runDifferential(std::uint64_t seed, std::size_t ops, std::size_t initial_capacity, KeyFn next_key, MixFn mix) {
     hft::FlatHashMap<K, std::uint64_t> m(initial_capacity);
     std::unordered_map<K, std::uint64_t> ref;
     std::mt19937_64 rng(seed);
     for (std::size_t i = 0; i < ops; ++i) {
         const K key = next_key(rng);
+        const OpMix p = mix(i);
         const int r = static_cast<int>(rng() % 100);
-        if (r < insert_pct) {
+        if (r < p.insert_pct) {
             const std::uint64_t val = rng();
             const auto res = m.insert(key, val);
             const auto ref_res = ref.emplace(key, val);
             REQUIRE_EQ(res.second, ref_res.second);
             REQUIRE(res.first != nullptr);
             REQUIRE_EQ(*res.first, ref_res.first->second);
-        } else if (r < insert_pct + erase_pct) {
-            REQUIRE_EQ(m.erase(key), ref.erase(key) == 1);
-        } else if (r < insert_pct + erase_pct + 5) {
+        } else if (r < p.insert_pct + p.erase_pct) {
+            const std::optional<std::uint64_t> got = eraseVia(m, key, rng());
+            const auto it = ref.find(key);
+            REQUIRE_EQ(got.has_value(), it != ref.end());
+            if (got.has_value()) {
+                REQUIRE_EQ(*got, it->second);
+                ref.erase(it);
+            }
+        } else if (r < p.insert_pct + p.erase_pct + 5) {
             m[key] += 1;  // operator[]：不存在时值初始化为 0
             ref[key] += 1;
             REQUIRE_EQ(*m.find(key), ref[key]);
+        } else if (r < p.insert_pct + p.erase_pct + 10) {
+            // 一次探测完成"查重 + 预留"：插入占位值，之后经指针写入真正的值，或用 eraseAt 撤销预留
+            const auto [slot, fresh] = m.insert(key, 0);
+            REQUIRE_EQ(fresh, ref.count(key) == 0);
+            if (fresh && rng() % 2 == 0) {
+                *slot = rng();
+                ref.emplace(key, *slot);
+            } else if (fresh) {
+                m.eraseAt(slot);
+            }
         } else {
-            const std::uint64_t* p = m.find(key);
+            const std::uint64_t* found = m.find(key);
             const auto it = ref.find(key);
-            REQUIRE_EQ(p != nullptr, it != ref.end());
-            if (p != nullptr) REQUIRE_EQ(*p, it->second);
+            REQUIRE_EQ(found != nullptr, it != ref.end());
+            if (found != nullptr) REQUIRE_EQ(*found, it->second);
             REQUIRE_EQ(m.contains(key), it != ref.end());
         }
         REQUIRE_EQ(m.size(), ref.size());
@@ -862,9 +815,9 @@ void runDifferential(std::uint64_t seed, std::size_t ops, int insert_pct, int er
     std::vector<K> keys;
     m.forEach([&keys](K k, const std::uint64_t&) { keys.push_back(k); });
     REQUIRE_EQ(keys.size(), ref.size());
-    for (K k : keys) {
-        REQUIRE(m.erase(k));
-        ref.erase(k);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        REQUIRE(eraseVia(m, keys[i], i).has_value());
+        ref.erase(keys[i]);
     }
     REQUIRE(m.empty());
     requireSameContents(m, ref);
@@ -925,6 +878,32 @@ TEST_CASE("flat_map: basic insert/find/erase/operator[]") {
     CHECK(m.checkInvariants(&why));
 }
 
+TEST_CASE("flat_map: extract, eraseAt and reserve-then-fill on ordinary and sentinel keys") {
+    using Map = hft::FlatHashMap<std::uint64_t, std::string>;
+    Map m(0);
+    for (const std::uint64_t k : {std::uint64_t{1}, kU64Max}) {  // 普通键与哨兵键（表外专用槽位）
+        const std::string text = "value-" + std::to_string(k);
+        CHECK(!m.extract(k).has_value());
+        const auto [slot, fresh] = m.insert(k, std::string());  // 先插入占位值预留槽位
+        REQUIRE(fresh);
+        *slot = text;  // 之后经指针写入真正的值
+        REQUIRE(m.find(k) != nullptr);
+        CHECK_EQ(*m.find(k), text);
+        const std::optional<std::string> got = m.extract(k);
+        REQUIRE(got.has_value());
+        CHECK_EQ(*got, text);
+        CHECK(!m.contains(k));
+        const auto [again, inserted] = m.insert(k, "placeholder");
+        REQUIRE(inserted);
+        m.eraseAt(again);  // 撤销预留
+        CHECK(!m.contains(k));
+        m.insert(k, text);
+        m.eraseAt(m.find(k));
+        CHECK(m.empty());
+    }
+    CHECK(m.checkInvariants());
+}
+
 TEST_CASE("flat_map: zero initial capacity allocates on first insert") {
     using Map = hft::FlatHashMap<std::uint32_t, int>;
     Map m(0);
@@ -932,6 +911,7 @@ TEST_CASE("flat_map: zero initial capacity allocates on first insert") {
     CHECK_EQ(m.bucketCount(), std::size_t{1});
     CHECK(m.find(3) == nullptr);
     CHECK(!m.erase(3));
+    CHECK(!m.extract(3).has_value());
     m.clear();
     CHECK(m.checkInvariants());
     CHECK(m.insert(3, 9).second);
@@ -961,27 +941,6 @@ TEST_CASE("flat_map: the sentinel key value works as an ordinary key") {
     CHECK_EQ(visits, 2);
     CHECK(saw_max);
 
-    Map copy(m);
-    REQUIRE(copy.find(kU64Max) != nullptr);
-    CHECK_EQ(*copy.find(kU64Max), std::string("max"));
-    Map moved(std::move(copy));
-    REQUIRE(moved.find(kU64Max) != nullptr);
-    CHECK_EQ(*moved.find(kU64Max), std::string("max"));
-    CHECK(copy.empty());
-    CHECK(!copy.contains(kU64Max));
-
-    // 交换：只有一侧 / 两侧都有专用槽位
-    Map other(4);
-    other.insert(2, "two");
-    other.swap(moved);
-    CHECK(other.contains(kU64Max));
-    CHECK(!moved.contains(kU64Max));
-    CHECK(moved.contains(2));
-    moved.insert(kU64Max, "moved-max");
-    other.swap(moved);
-    CHECK_EQ(*other.find(kU64Max), std::string("moved-max"));
-    CHECK_EQ(*moved.find(kU64Max), std::string("max"));
-
     CHECK(m.erase(kU64Max));
     CHECK(!m.contains(kU64Max));
     CHECK_EQ(m.size(), std::size_t{1});
@@ -990,6 +949,11 @@ TEST_CASE("flat_map: the sentinel key value works as an ordinary key") {
     m.clear();
     CHECK(m.empty());
     CHECK(!m.contains(kU64Max));
+
+    NestedValueOwner owner;
+    CHECK_EQ(owner.map[1].len, 7);
+    CHECK_EQ(owner.map[kU64Max].len, 7);
+    CHECK_EQ(owner.map.size(), std::size_t{2});
 }
 
 TEST_CASE("flat_map: signed, narrow and enum keys") {
@@ -1048,11 +1012,14 @@ TEST_CASE("flat_map: exhaustive 16-bit key space with growth and complete erase"
 
 TEST_CASE("flat_map: differential vs std::unordered_map, sequential order ids (1M ops)") {
     std::uint64_t next_id = 1'000'000;
-    runDifferential<std::uint64_t>(11, 1'000'000, 45, 35, 16, [&next_id](std::mt19937_64& rng) {
-        // 一半是新 id，一半是最近的 id（查找/撤单命中率高）
-        if (rng() % 2 == 0) return next_id++;
-        return next_id - 1 - rng() % 5000;
-    });
+    runDifferential<std::uint64_t>(
+        11, 1'000'000, 16,
+        [&next_id](std::mt19937_64& rng) {
+            // 一半是新 id，一半是最近的 id（查找/撤单命中率高）
+            if (rng() % 2 == 0) return next_id++;
+            return next_id - 1 - rng() % 5000;
+        },
+        constantMix(45, 35));
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, random 64-bit keys (1M ops)") {
@@ -1060,62 +1027,47 @@ TEST_CASE("flat_map: differential vs std::unordered_map, random 64-bit keys (1M 
     std::vector<std::uint64_t> universe(100'000);
     for (auto& k : universe) k = gen();
     universe[0] = kU64Max;  // 混入哨兵值
-    runDifferential<std::uint64_t>(13, 1'000'000, 40, 30, 0, [&universe](std::mt19937_64& rng) {
-        return universe[static_cast<std::size_t>(rng() % universe.size())];
-    });
+    runDifferential<std::uint64_t>(
+        13, 1'000'000, 0,
+        [&universe](std::mt19937_64& rng) { return universe[static_cast<std::size_t>(rng() % universe.size())]; },
+        constantMix(40, 30));
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, clustered drifting keys (1M ops)") {
     std::uint64_t base = 1'000'000'000'000ULL;
     std::uint64_t step = 0;
-    runDifferential<std::uint64_t>(14, 1'000'000, 40, 40, 16, [&](std::mt19937_64& rng) {
-        if (++step % 1000 == 0) base += 64;  // 窗口缓慢漂移
-        return base + rng() % 512;
-    });
+    runDifferential<std::uint64_t>(
+        14, 1'000'000, 16,
+        [&](std::mt19937_64& rng) {
+            if (++step % 1000 == 0) base += 64;  // 窗口缓慢漂移
+            return base + rng() % 512;
+        },
+        constantMix(40, 40));
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, high-bit-only keys (1M ops)") {
     // 只有高位不同的键：检验哈希把高位混入低位
-    runDifferential<std::uint64_t>(15, 1'000'000, 45, 30, 16, [](std::mt19937_64& rng) {
-        return (rng() % 40'000) << 40;
-    });
+    runDifferential<std::uint64_t>(
+        15, 1'000'000, 16, [](std::mt19937_64& rng) { return (rng() % 40'000) << 40; }, constantMix(45, 30));
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, erase-heavy churn with growth phases (1M ops)") {
     // 交替的增长期与删除期：表反复增长到约 2 万个元素再被删到接近空（删除发生在已扩容的大表中）
-    hft::FlatHashMap<std::uint32_t, std::uint64_t> m(0);
-    std::unordered_map<std::uint32_t, std::uint64_t> ref;
-    std::mt19937_64 rng(17);
-    for (std::uint64_t op = 0; op < 1'000'000; ++op) {
-        const bool growth_phase = (op / 100'000) % 2 == 0;
-        const std::uint32_t key = static_cast<std::uint32_t>(rng() % 40'000);
-        const int r = static_cast<int>(rng() % 100);
-        const int insert_pct = growth_phase ? 70 : 15;
-        const int erase_pct = growth_phase ? 20 : 75;
-        if (r < insert_pct) {
-            const std::uint64_t val = rng();
-            REQUIRE_EQ(m.insert(key, val).second, ref.emplace(key, val).second);
-        } else if (r < insert_pct + erase_pct) {
-            REQUIRE_EQ(m.erase(key), ref.erase(key) == 1);
-        } else {
-            const std::uint64_t* p = m.find(key);
-            const auto it = ref.find(key);
-            REQUIRE_EQ(p != nullptr, it != ref.end());
-            if (p != nullptr) REQUIRE_EQ(*p, it->second);
-        }
-        REQUIRE_EQ(m.size(), ref.size());
-        if (op % 50'000 == 0) requireSameContents(m, ref);
-    }
-    requireSameContents(m, ref);
+    runDifferential<std::uint32_t>(
+        17, 1'000'000, 0, [](std::mt19937_64& rng) { return static_cast<std::uint32_t>(rng() % 40'000); },
+        [](std::size_t op) { return (op / 100'000) % 2 == 0 ? OpMix{65, 20} : OpMix{10, 75}; });
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, signed keys around zero incl. sentinel (1M ops)") {
-    runDifferential<std::int32_t>(18, 1'000'000, 40, 40, 8, [](std::mt19937_64& rng) {
-        const unsigned r = static_cast<unsigned>(rng() % 1000);
-        if (r == 0) return std::numeric_limits<std::int32_t>::max();  // 哨兵值
-        if (r == 1) return std::numeric_limits<std::int32_t>::min();
-        return static_cast<std::int32_t>(static_cast<std::int64_t>(rng() % 6001) - 3000);
-    });
+    runDifferential<std::int32_t>(
+        18, 1'000'000, 8,
+        [](std::mt19937_64& rng) {
+            const unsigned r = static_cast<unsigned>(rng() % 1000);
+            if (r == 0) return std::numeric_limits<std::int32_t>::max();  // 哨兵值
+            if (r == 1) return std::numeric_limits<std::int32_t>::min();
+            return static_cast<std::int32_t>(static_cast<std::int64_t>(rng() % 6001) - 3000);
+        },
+        constantMix(40, 40));
 }
 
 TEST_CASE("flat_map: colliding keys in probe runs that wrap around the table end") {
@@ -1138,7 +1090,7 @@ TEST_CASE("flat_map: colliding keys in probe runs that wrap around the table end
                 const std::uint64_t v = rng();
                 REQUIRE_EQ(m.insert(k, v).second, ref.emplace(k, v).second);
             } else if (r < 90) {
-                REQUIRE_EQ(m.erase(k), ref.erase(k) == 1);
+                REQUIRE_EQ(eraseVia(m, k, rng()).has_value(), ref.erase(k) == 1);
             } else {
                 const std::uint64_t* p = m.find(k);
                 const auto it = ref.find(k);
@@ -1172,7 +1124,7 @@ TEST_CASE("flat_map: keys sharing one home bucket at the table end, erased in ra
         REQUIRE_EQ(m.bucketCount(), kBuckets);
         std::shuffle(order.begin(), order.end(), rng);
         for (std::size_t i = 0; i < order.size(); ++i) {
-            REQUIRE(m.erase(order[i]));
+            REQUIRE(eraseVia(m, order[i], round + i) == std::optional<std::uint64_t>(order[i] * 3));
             std::string why;
             if (!m.checkInvariants(&why)) FAIL(why);
             for (std::size_t j = 0; j < order.size(); ++j) {
@@ -1237,7 +1189,13 @@ TEST_CASE("flat_map: non-trivial values survive growth and backward shifts") {
             std::string v = "value-" + std::to_string(rng()) + "-long-enough-for-heap-allocation";
             REQUIRE_EQ(m.insert(k, v).second, ref.emplace(k, v).second);
         } else if (r < 85) {
-            REQUIRE_EQ(m.erase(k), ref.erase(k) == 1);
+            const std::optional<std::string> got = eraseVia(m, k, r);  // extract 把字符串移出表外
+            const auto it = ref.find(k);
+            REQUIRE_EQ(got.has_value(), it != ref.end());
+            if (got.has_value()) {
+                REQUIRE(*got == it->second);
+                ref.erase(it);
+            }
         } else {
             m[k] += "+";
             ref[k] += "+";
@@ -1254,24 +1212,22 @@ TEST_CASE("flat_map: value constructions and destructions balance") {
         std::mt19937_64 rng(31);
         for (int op = 0; op < 200000; ++op) {
             const std::uint64_t k = rng() % 3000;
+            const std::uint64_t key = k == 0 ? kU64Max : k;  // 混入哨兵值（表外专用槽位）
             const unsigned r = static_cast<unsigned>(rng() % 1000);
             if (r < 500) {
-                m.insert(k, Tracked(static_cast<int>(k)));
+                m.insert(key, Tracked(static_cast<int>(k)));
             } else if (r < 995) {
-                m.erase(k);
+                const std::optional<Tracked> got = eraseVia(m, key, r);
+                REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), m.size() + (got.has_value() ? 1 : 0));
             } else {
                 m.clear();
             }
             REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), m.size());
         }
-        hft::FlatHashMap<std::uint64_t, Tracked> copy(m);
-        REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), 2 * m.size());
-        hft::FlatHashMap<std::uint64_t, Tracked> moved(std::move(copy));
-        REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), 2 * m.size());
-        copy = moved;  // 拷贝赋值给被移走的对象
-        REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), 3 * m.size());
-        copy = std::move(moved);
-        REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), 2 * m.size());
+        m.insert(kU64Max, Tracked(-1));
+        hft::FlatHashMap<std::uint64_t, Tracked> moved(std::move(m));
+        REQUIRE_EQ(static_cast<std::size_t>(Tracked::live), moved.size());
+        CHECK(m.empty());
     }
     CHECK_EQ(Tracked::live, 0);
 }
@@ -1305,38 +1261,29 @@ TEST_CASE("flat_map: reserve prevents rehash until size exceeds n") {
     }
 }
 
-TEST_CASE("flat_map: copy, move and swap") {
+TEST_CASE("flat_map: move construction transfers the table and leaves the source empty") {
     using Map = hft::FlatHashMap<std::uint64_t, std::string>;
     Map a;
     for (std::uint64_t i = 0; i < 1000; ++i) a.insert(i * 31, std::to_string(i));
-    Map b(a);
-    CHECK_EQ(b.size(), a.size());
-    a.forEach([&b](std::uint64_t k, const std::string& v) {
-        const std::string* p = b.find(k);
-        CHECK(p != nullptr && *p == v);
-    });
-    b.erase(0);
-    CHECK(a.contains(0));  // 深拷贝
-    Map c;
-    c = b;
-    CHECK_EQ(c.size(), b.size());
-    Map& alias = c;
-    c = alias;  // 自赋值
-    CHECK_EQ(c.size(), b.size());
-    Map d(std::move(c));
-    CHECK_EQ(d.size(), b.size());
-    CHECK(c.empty());
-    CHECK_EQ(c.bucketCount(), std::size_t{1});
-    c.insert(5, "five");  // 被移走的对象可继续使用
-    CHECK_EQ(*c.find(5), std::string("five"));
-    d = std::move(c);
-    CHECK_EQ(d.size(), std::size_t{1});
-    CHECK(c.empty());
-    d.swap(a);
-    CHECK_EQ(d.size(), std::size_t{1000});
-    CHECK_EQ(a.size(), std::size_t{1});
-    CHECK(d.checkInvariants());
+    a.insert(kU64Max, "max");
+    const std::size_t buckets = a.bucketCount();
+    Map b(std::move(a));
+    CHECK_EQ(b.size(), std::size_t{1001});
+    CHECK_EQ(b.bucketCount(), buckets);
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        const std::string* p = b.find(i * 31);
+        REQUIRE(p != nullptr);
+        REQUIRE_EQ(*p, std::to_string(i));
+    }
+    REQUIRE(b.find(kU64Max) != nullptr);
+    CHECK_EQ(*b.find(kU64Max), std::string("max"));
+    CHECK(b.checkInvariants());
+    CHECK(a.empty());
+    CHECK_EQ(a.bucketCount(), std::size_t{1});  // 不再持有内存
+    CHECK(!a.contains(kU64Max));
     CHECK(a.checkInvariants());
+    a.insert(5, "five");  // 被移走的对象可继续使用
+    CHECK_EQ(*a.find(5), std::string("five"));
 }
 
 // ============================================================================
@@ -1443,28 +1390,19 @@ TEST_CASE("histogram: bucket mapping covers the full uint64 range with width <= 
     }
 }
 
-TEST_CASE("histogram: empty state and reset") {
+TEST_CASE("histogram: empty state and the first sample") {
     hft::LatencyHistogram h;
-    auto check_empty = [&h] {
-        CHECK_EQ(h.count(), std::uint64_t{0});
-        CHECK(h.empty());
-        CHECK_EQ(h.min(), std::uint64_t{0});
-        CHECK_EQ(h.max(), std::uint64_t{0});
-        CHECK_EQ(h.mean(), 0.0);
-        CHECK_EQ(h.percentile(0.0), std::uint64_t{0});
-        CHECK_EQ(h.percentile(0.5), std::uint64_t{0});
-        CHECK_EQ(h.percentile(1.0), std::uint64_t{0});
-        CHECK_EQ(h.countBelow(0), std::uint64_t{0});
-        CHECK_EQ(h.countBelow(kU64Max), std::uint64_t{0});
-    };
-    check_empty();
-    h.record(5);
-    h.record(500000);
-    h.record(kU64Max);
-    h.reset();
-    check_empty();
+    CHECK_EQ(h.count(), std::uint64_t{0});
+    CHECK(h.empty());
+    CHECK_EQ(h.min(), std::uint64_t{0});
+    CHECK_EQ(h.max(), std::uint64_t{0});
+    CHECK_EQ(h.mean(), 0.0);
+    for (double q : {0.0, 0.5, 1.0}) CHECK_EQ(h.percentile(q), std::uint64_t{0});
+    CHECK_EQ(h.countBelow(0), std::uint64_t{0});
+    CHECK_EQ(h.countBelow(kU64Max), std::uint64_t{0});
     for (std::size_t i = 0; i < hft::LatencyHistogram::kBucketCount; ++i) REQUIRE_EQ(h.bucketCountAt(i), std::uint64_t{0});
     h.record(42);
+    CHECK(!h.empty());
     CHECK_EQ(h.count(), std::uint64_t{1});
     CHECK_EQ(h.min(), std::uint64_t{42});
     CHECK_EQ(h.max(), std::uint64_t{42});
@@ -1472,37 +1410,20 @@ TEST_CASE("histogram: empty state and reset") {
     CHECK_EQ(h.mean(), 42.0);
 }
 
-TEST_CASE("histogram: values below 128 are exact") {
-    std::vector<std::uint64_t> samples;
-    std::mt19937_64 rng(3);
-    for (int i = 0; i < 20000; ++i) samples.push_back(rng() % 128);
-    hft::LatencyHistogram h;
-    for (std::uint64_t v : samples) h.record(v);
-    std::vector<std::uint64_t> sorted = samples;
-    std::sort(sorted.begin(), sorted.end());
-    for (int k = 0; k <= 2000; ++k) {
-        const double q = k / 2000.0;
-        REQUIRE_EQ(h.percentile(q), exactPercentile(sorted, q));
-    }
-    for (std::uint64_t v = 0; v <= 130; ++v) {
-        const auto exact = static_cast<std::uint64_t>(
-            std::lower_bound(sorted.begin(), sorted.end(), v) - sorted.begin());
-        REQUIRE_EQ(h.countBelow(v), exact);
-    }
-    for (std::uint64_t v = 0; v < 128; ++v) {
-        hft::LatencyHistogram one;
-        one.record(v);
-        one.record(v);
-        one.record(v);
-        REQUIRE_EQ(one.percentile(0.5), v);
-        REQUIRE_EQ(one.bucketCountAt(static_cast<std::size_t>(v)), std::uint64_t{3});
-    }
-}
-
 TEST_CASE("histogram: percentiles and countBelow vs exact sorted data on random distributions") {
     std::mt19937_64 rng(5);
     constexpr std::size_t kN = 100'000;
     std::vector<std::uint64_t> s;
+
+    s.clear();  // [0, 128) 精确区：每个值一个桶，分位数与 countBelow 都没有误差
+    for (std::size_t i = 0; i < kN; ++i) s.push_back(rng() % 128);
+    checkHistogramAgainstExact(s, 0);
+    for (std::uint64_t v = 0; v < 128; ++v) {
+        hft::LatencyHistogram one;
+        for (int k = 0; k < 3; ++k) one.record(v);
+        REQUIRE_EQ(one.percentile(0.5), v);
+        REQUIRE_EQ(one.bucketCountAt(static_cast<std::size_t>(v)), std::uint64_t{3});
+    }
 
     s.clear();  // 均匀小值
     for (std::size_t i = 0; i < kN; ++i) s.push_back(rng() % 1000);
@@ -1638,7 +1559,8 @@ TEST_CASE("histogram: merge equals recording every sample into one histogram") {
         b.record(v);
         all.record(v);
     }
-    hft::LatencyHistogram merged = a;
+    hft::LatencyHistogram merged;
+    merged.merge(a);
     merged.merge(b);
     CHECK_EQ(merged.count(), all.count());
     CHECK_EQ(merged.min(), all.min());
@@ -1649,43 +1571,23 @@ TEST_CASE("histogram: merge equals recording every sample into one histogram") {
     }
     for (double q : {0.0, 0.1, 0.5, 0.9, 0.99, 0.999, 1.0}) CHECK_EQ(merged.percentile(q), all.percentile(q));
 
-    hft::LatencyHistogram empty;
-    hft::LatencyHistogram a2 = a;
-    a2.merge(empty);
-    CHECK_EQ(a2.count(), a.count());
-    CHECK_EQ(a2.min(), a.min());
-    CHECK_EQ(a2.max(), a.max());
-    empty.merge(a);
-    CHECK_EQ(empty.count(), a.count());
-    CHECK_EQ(empty.min(), a.min());
-    CHECK_EQ(empty.max(), a.max());
-    CHECK_EQ(empty.percentile(0.5), a.percentile(0.5));
+    hft::LatencyHistogram copy, empty;
+    copy.merge(a);      // 合并进空直方图：与 a 相同
+    copy.merge(empty);  // 合并空直方图：不变
+    CHECK_EQ(empty.count(), std::uint64_t{0});
+    CHECK_EQ(copy.count(), a.count());
+    CHECK_EQ(copy.min(), a.min());
+    CHECK_EQ(copy.max(), a.max());
+    CHECK_EQ(copy.percentile(0.5), a.percentile(0.5));
 
-    hft::LatencyHistogram self = a;  // 与自身合并：计数翻倍，分布不变
-    self.merge(self);
-    CHECK_EQ(self.count(), 2 * a.count());
-    CHECK_EQ(self.min(), a.min());
-    CHECK_EQ(self.max(), a.max());
-    CHECK_EQ(self.mean(), a.mean());
+    copy.merge(copy);  // 与自身合并：计数翻倍，分布不变
+    CHECK_EQ(copy.count(), 2 * a.count());
+    CHECK_EQ(copy.min(), a.min());
+    CHECK_EQ(copy.max(), a.max());
+    CHECK_EQ(copy.mean(), a.mean());
     for (std::size_t i = 0; i < hft::LatencyHistogram::kBucketCount; ++i) {
-        REQUIRE_EQ(self.bucketCountAt(i), 2 * a.bucketCountAt(i));
+        REQUIRE_EQ(copy.bucketCountAt(i), 2 * a.bucketCountAt(i));
     }
-}
-
-TEST_CASE("histogram: copy is an independent snapshot") {
-    hft::LatencyHistogram h;
-    for (std::uint64_t v = 1; v <= 1000; ++v) h.record(v * 1000);
-    hft::LatencyHistogram copy(h);
-    h.record(5);
-    CHECK_EQ(copy.count(), std::uint64_t{1000});
-    CHECK_EQ(copy.min(), std::uint64_t{1000});
-    CHECK_EQ(h.min(), std::uint64_t{5});
-    hft::LatencyHistogram assigned;
-    assigned.record(1);
-    assigned = copy;
-    CHECK_EQ(assigned.count(), copy.count());
-    CHECK_EQ(assigned.percentile(0.5), copy.percentile(0.5));
-    CHECK_EQ(assigned.min(), std::uint64_t{1000});
 }
 
 TEST_CASE("histogram: concurrent readers and one writer stay consistent (run under TSan)") {
@@ -1713,8 +1615,9 @@ TEST_CASE("histogram: concurrent readers and one writer stay consistent (run und
                 const std::uint64_t c1 = h.countBelow(10'000);
                 const std::uint64_t c2 = h.countBelow(1'000'000);
                 if (c1 > c2) ++local_violations;  // 阈值更大、读取更晚，不可能更少
-                hft::LatencyHistogram snapshot(h);  // 并发快照
-                if (snapshot.count() > 0 && snapshot.percentile(0.5) > kHi) ++local_violations;
+                hft::LatencyHistogram snapshot;   // 并发合并：源正被其写者更新
+                snapshot.merge(h);
+                if (snapshot.count() < n || snapshot.percentile(0.5) > kHi) ++local_violations;
             }
             ++iterations;
         } while (!done.load(std::memory_order_acquire));
@@ -1764,7 +1667,7 @@ TEST_CASE("timing: clocks are monotonic and plausible") {
 }
 
 TEST_CASE("timing: TscClock agrees with steady_clock") {
-    hft::TscClock& clock = hft::TscClock::instance();
+    const hft::TscClock& clock = hft::TscClock::instance();
     CHECK(&clock == &hft::TscClock::instance());
     CHECK_GT(clock.nsPerTick(), 0.0);
     CHECK_EQ(clock.toNs(0), std::int64_t{0});
@@ -1781,9 +1684,6 @@ TEST_CASE("timing: TscClock agrees with steady_clock") {
         best_ratio_error = std::min(best_ratio_error, std::fabs(ratio - 1.0));
     }
     CHECK_LT(best_ratio_error, 0.02);
-    const double before = clock.nsPerTick();
-    clock.calibrate(std::chrono::milliseconds(5));
-    CHECK_NEAR(clock.nsPerTick(), before, before * 0.05);
 }
 
 TEST_CASE("timing: thread pinning and naming") {
@@ -1822,95 +1722,33 @@ TEST_CASE("timing: thread pinning and naming") {
 }
 
 // ============================================================================
-// LatencyTracker 兼容接口
+// LatencyTracker
 // ============================================================================
 
-TEST_CASE("latency_tracker: empty tracker") {
-    LatencyTracker t("Binance", 123);
-    CHECK_EQ(t.getName(), std::string("Binance"));
-    CHECK_EQ(t.getCount(), 0);
-    CHECK_EQ(t.count(), std::uint64_t{0});
-    CHECK_EQ(t.getP50(), 0L);
-    CHECK_EQ(t.getP99(), 0L);
-    CHECK_EQ(t.getMin(), 0L);
-    CHECK_EQ(t.getMax(), 0L);
-    CHECK_EQ(t.getAvg(), 0L);
-    CHECK_EQ(t.getAvgUs(), 0.0);
-    CHECK_EQ(t.fractionBelowNs(1000), 0.0);
-    CHECK_EQ(t.getCompactStats(), std::string("     0 msgs  Avg:   0μs  P50:   0μs  P99:   0μs  Max:   0μs"));
-}
-
-TEST_CASE("latency_tracker: microsecond compat API keeps its meaning") {
+TEST_CASE("latency_tracker: empty state, nanosecond statistics and microsecond percentiles") {
     LatencyTracker t("OKX");
-    for (long us = 1; us <= 100; ++us) t.record(us);
-    t.record(-5L);  // 负值忽略
-    CHECK_EQ(t.getCount(), 100);
-    CHECK_EQ(t.getMin(), 1L);
-    CHECK_EQ(t.getMax(), 100L);
-    CHECK_EQ(t.getAvg(), 51L);  // 50.5 µs 四舍五入
-    CHECK_EQ(t.getP50(), 50L);
-    CHECK_EQ(t.getP95(), 95L);
-    CHECK_EQ(t.getP99(), 99L);
-    CHECK_EQ(t.getPercentile(0.0), 1L);
-    CHECK_EQ(t.getPercentile(1.0), 100L);
-    CHECK_NEAR(t.getAvgUs(), 50.5, 1e-9);
-    CHECK_NEAR(t.getP50Us(), 50.0, 50.0 / 64);
-    CHECK_NEAR(t.getP99Us(), 99.0, 99.0 / 64);
+    CHECK_EQ(t.getName(), std::string("OKX"));
+    CHECK_EQ(t.count(), std::uint64_t{0});  // 空：所有统计量为 0
+    CHECK_EQ(t.percentileNs(0.5), std::uint64_t{0});
+    CHECK_EQ(t.minNs(), std::uint64_t{0});
+    CHECK_EQ(t.maxNs(), std::uint64_t{0});
+    CHECK_EQ(t.meanNs(), 0.0);
+    CHECK_EQ(t.getP50Us(), 0.0);
+    CHECK_EQ(t.getP99Us(), 0.0);
+    CHECK_EQ(t.fractionBelowNs(1000), 0.0);
+    for (std::uint64_t us = 1; us <= 100; ++us) t.recordNs(us * 1000);
     CHECK_EQ(t.count(), std::uint64_t{100});
     CHECK_EQ(t.minNs(), std::uint64_t{1000});
     CHECK_EQ(t.maxNs(), std::uint64_t{100000});
     CHECK_NEAR(t.meanNs(), 50500.0, 1e-6);
-    CHECK_EQ(t.getCompactStats(), std::string("   100 msgs  Avg:  51μs  P50:  50μs  P99:  99μs  Max: 100μs"));
-
-    LatencyTracker single("x");
-    single.record(7L);
-    CHECK_EQ(single.getCompactStats(), std::string("     1 msgs  Avg:   7μs  P50:   7μs  P99:   7μs  Max:   7μs"));
-
-    // 整数微秒样本：64 µs 以内精确还原，更大时误差不超过约 1/128 + 1 µs
-    for (long us = 1; us <= 3000; ++us) {
-        LatencyTracker u("u");
-        u.record(1L);
-        u.record(us);
-        u.record(1'000'000L);
-        const long tol = us < 64 ? 0 : us / 128 + 1;
-        const long got = u.getP50();
-        if (std::labs(got - us) > tol) FAIL("P50 of {1, " + std::to_string(us) + ", 1e6} us = " + std::to_string(got));
-    }
-}
-
-TEST_CASE("latency_tracker: time point and nanosecond recording") {
-    LatencyTracker t("t");
-    const auto start = std::chrono::high_resolution_clock::now();
-    t.record(start, start + std::chrono::microseconds(42));
-    CHECK_EQ(t.getCount(), 1);
-    CHECK_EQ(t.minNs(), std::uint64_t{42000});
-    CHECK_EQ(t.getP50(), 42L);
-    t.record(start + std::chrono::microseconds(42), start);  // 负区间忽略
-    CHECK_EQ(t.getCount(), 1);
-    const auto s = std::chrono::steady_clock::now();
-    t.record(s, s + std::chrono::nanoseconds(1500));
-    CHECK_EQ(t.minNs(), std::uint64_t{1500});
-    CHECK_EQ(t.getMin(), 2L);  // 1.5 µs 四舍五入
-    t.recordNs(10);
+    CHECK_EQ(t.percentileNs(0.0), std::uint64_t{1000});
+    CHECK_EQ(t.percentileNs(1.0), std::uint64_t{100000});
+    CHECK_NEAR(t.getP50Us(), 50.0, 50.0 / 64);
+    CHECK_NEAR(t.getP99Us(), 99.0, 99.0 / 64);
+    t.recordNs(10);  // < 128 ns 的样本精确记录
+    CHECK_EQ(t.count(), std::uint64_t{101});
     CHECK_EQ(t.minNs(), std::uint64_t{10});
-    CHECK_EQ(t.getMin(), 0L);
-    CHECK_EQ(t.count(), std::uint64_t{3});
     CHECK_EQ(t.percentileNs(0.0), std::uint64_t{10});
-    CHECK_EQ(t.percentileNs(1.0), std::uint64_t{42000});
-    CHECK_EQ(t.maxNs(), std::uint64_t{42000});
-    CHECK_NEAR(t.meanNs(), (42000.0 + 1500.0 + 10.0) / 3.0, 1e-6);
-    t.reset();
-    CHECK_EQ(t.getCount(), 0);
-    CHECK_EQ(t.getCompactStats(), std::string("     0 msgs  Avg:   0μs  P50:   0μs  P99:   0μs  Max:   0μs"));
-    t.record(1L);
-    CHECK_EQ(t.getCount(), 1);
-    // 两端精度不同的时间点（旧的非模板接口经隐式转换支持这种调用）
-    const auto fine = std::chrono::steady_clock::now();
-    const auto coarse = std::chrono::time_point_cast<std::chrono::milliseconds>(fine) + std::chrono::milliseconds(2);
-    t.record(fine, coarse);
-    CHECK_EQ(t.getCount(), 2);
-    CHECK_GT(t.maxNs(), std::uint64_t{1'000'000});
-    CHECK_LE(t.maxNs(), std::uint64_t{2'000'000});
 }
 
 TEST_CASE("latency_tracker: fractionBelowNs at the display bucket edges") {
@@ -1924,40 +1762,29 @@ TEST_CASE("latency_tracker: fractionBelowNs at the display bucket edges") {
     CHECK_NEAR(t.fractionBelowNs(20000), 0.8, 1e-12);
     CHECK_NEAR(t.fractionBelowNs(100000), 0.8, 1e-12);
     CHECK_NEAR(t.fractionBelowNs(kU64Max), 1.0, 1e-12);
-    const LatencyTracker copy = t;  // 可拷贝（快照）
-    CHECK_EQ(copy.count(), t.count());
-    CHECK_EQ(copy.getName(), std::string("f"));
-    CHECK_NEAR(copy.fractionBelowNs(5000), 0.5, 1e-12);
 }
 
 TEST_CASE("latency_tracker: concurrent writer and dashboard reader (run under TSan)") {
     LatencyTracker t("feed");
     std::atomic<bool> done{false};
     std::thread writer([&t, &done] {
-        for (long i = 0; i < 300'000; ++i) {
-            if (i % 2 == 0) {
-                t.record(i % 150);
-            } else {
-                t.recordNs(static_cast<std::uint64_t>(i % 150'000));
-            }
-        }
+        for (std::uint64_t i = 0; i < 300'000; ++i) t.recordNs(i % 150'000);
         done.store(true, std::memory_order_release);
     });
     std::uint64_t bad = 0, iterations = 0;
     do {
-        const std::string stats = t.getCompactStats();
-        if (stats.find("msgs") == std::string::npos) ++bad;
-        const long p99 = t.getP99();
-        if (p99 < 0 || p99 > 150) ++bad;
+        if (t.percentileNs(0.99) > 150'000 || t.getP50Us() > 150.0) ++bad;
         const double f = t.fractionBelowNs(50'000);
         if (f < 0.0 || f > 1.0) ++bad;
-        if (t.getAvgUs() < 0.0 || t.getAvgUs() > 150.0) ++bad;
+        if (t.meanNs() < 0.0 || t.meanNs() > 150'000.0) ++bad;
+        const std::uint64_t lo = t.minNs();  // 先读 min 再读 max：min 只减不增、max 只增不减
+        if (lo > t.maxNs()) ++bad;
         ++iterations;
     } while (!done.load(std::memory_order_acquire));
     writer.join();
     CHECK_EQ(bad, std::uint64_t{0});
     CHECK_GT(iterations, std::uint64_t{0});
-    CHECK_EQ(t.getCount(), 300'000);
+    CHECK_EQ(t.count(), std::uint64_t{300'000});
 }
 
 int main(int argc, char** argv) { return hft_test::runAll(argc, argv); }

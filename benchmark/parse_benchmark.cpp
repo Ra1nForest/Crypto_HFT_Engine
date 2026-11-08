@@ -3,24 +3,62 @@
 // 对比 std::stod 与 std::from_chars 的字符串转浮点性能。
 //
 
-#include <iostream>
-#include <iomanip>
-#include <chrono>
-#include <string>
-#include <string_view>
 #include <charconv>
-#include <vector>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
 #include <random>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+constexpr int kIterations = 1000000;
+constexpr int kWarmup = 100000;
+
+// 一轮：把 40 对价格/数量字符串解析成 double 并累加乘积。强制内联：预热与计时两个循环都调用它，
+// 不内联时每轮多一次函数调用，测到的就不再是旧版逐行展开的循环
+template <class Parse>
+__attribute__((always_inline)) inline void parseSnapshot(const std::vector<std::string>& prices,
+                                                         const std::vector<std::string>& qtys, Parse& parse,
+                                                         volatile double& sink) {
+    double sum = 0.0;
+    for (int j = 0; j < 40; ++j) {
+        const double p = parse(std::string_view(prices[j]));
+        const double q = parse(std::string_view(qtys[j]));
+        sum += p * q;
+    }
+    sink = sum;
+}
+
+// 预热（避免首次调用带来的噪声）后正式计时
+template <class Parse>
+void runBenchmark(const char* title, const std::vector<std::string>& prices, const std::vector<std::string>& qtys,
+                  Parse parse) {
+    volatile double sink = 0.0;  // 防止编译器优化掉计算
+    for (int i = 0; i < kWarmup; ++i) parseSnapshot(prices, qtys, parse, sink);
+    const auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kIterations; ++i) parseSnapshot(prices, qtys, parse, sink);
+    const auto end = std::chrono::high_resolution_clock::now();
+
+    const auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    const double avg_ns = static_cast<double>(total_ns) / kIterations;
+    std::cout << title << ":" << std::endl;
+    std::cout << "  Total time:       " << std::setw(8) << total_ns / 1000000 << " ms" << std::endl;
+    std::cout << "  Avg per snapshot: " << std::setw(8) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
+    std::cout << "  Avg per snapshot: " << std::setw(8) << std::setprecision(2) << avg_ns / 1000.0 << " us" << std::endl;
+    std::cout << std::endl;
+}
+
+}  // namespace
 
 int main() {
-    const int ITERATIONS = 1000000;
-    const int WARMUP = 100000;
-
     std::cout << "╔═══════════════════════════════════════════════════╗" << std::endl;
     std::cout << "║    Parse Benchmark: std::stod vs from_chars       ║" << std::endl;
     std::cout << "╠═══════════════════════════════════════════════════╣" << std::endl;
-    std::cout << "║  Iterations: " << std::setw(8) << ITERATIONS << "                             ║" << std::endl;
+    std::cout << "║  Iterations: " << std::setw(8) << kIterations << "                             ║" << std::endl;
     std::cout << "║  Each iteration: parse 40 price strings           ║" << std::endl;
     std::cout << "║  (simulating 20 bids + 20 asks depth snapshot)    ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
@@ -30,7 +68,6 @@ int main() {
     std::mt19937 gen(42);
     std::uniform_real_distribution<> price_dist(68000.0, 72000.0);
     std::uniform_real_distribution<> qty_dist(0.0001, 5.0);
-
     std::vector<std::string> price_strings(40);
     std::vector<std::string> qty_strings(40);
     for (int i = 0; i < 40; ++i) {
@@ -41,98 +78,18 @@ int main() {
         qty_strings[i] = qs.str();
     }
 
-    // ===== Benchmark: std::stod（需要构造 std::string）=====
-    {
-        volatile double sink = 0.0;
-
-    // Warmup：避免首次调用带来的噪声
-        for (int i = 0; i < WARMUP; ++i) {
-            double sum = 0.0;
-            for (int j = 0; j < 40; ++j) {
-                std::string_view psv(price_strings[j]);
-                std::string_view qsv(qty_strings[j]);
-                // 模拟实际代码：string_view → string → stod
-                double p = std::stod(std::string(psv));
-                double q = std::stod(std::string(qsv));
-                sum += p * q;
-            }
-            sink = sum;
-        }
-
-    // 正式计时
-    auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < ITERATIONS; ++i) {
-            double sum = 0.0;
-            for (int j = 0; j < 40; ++j) {
-                std::string_view psv(price_strings[j]);
-                std::string_view qsv(qty_strings[j]);
-                double p = std::stod(std::string(psv));
-                double q = std::stod(std::string(qsv));
-                sum += p * q;
-            }
-            sink = sum;
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-
-        auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-        double avg_ns = static_cast<double>(total_ns) / ITERATIONS;
-
-        std::cout << "std::stod (with std::string allocation):" << std::endl;
-        std::cout << "  Total time:       " << std::setw(8) << total_ns / 1000000 << " ms" << std::endl;
-        std::cout << "  Avg per snapshot: " << std::setw(8) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
-        std::cout << "  Avg per snapshot: " << std::setw(8) << std::setprecision(2) << avg_ns / 1000.0 << " us" << std::endl;
-        std::cout << std::endl;
-        (void)sink;
-    }
-
-    // ===== Benchmark: std::from_chars（零分配）=====
-    {
-        volatile double sink = 0.0;
-
-    // Warmup
-        for (int i = 0; i < WARMUP; ++i) {
-            double sum = 0.0;
-            for (int j = 0; j < 40; ++j) {
-                std::string_view psv(price_strings[j]);
-                std::string_view qsv(qty_strings[j]);
-                double p = 0.0, q = 0.0;
-                std::from_chars(psv.data(), psv.data() + psv.size(), p);
-                std::from_chars(qsv.data(), qsv.data() + qsv.size(), q);
-                sum += p * q;
-            }
-            sink = sum;
-        }
-
-    // 正式计时
-    auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < ITERATIONS; ++i) {
-            double sum = 0.0;
-            for (int j = 0; j < 40; ++j) {
-                std::string_view psv(price_strings[j]);
-                std::string_view qsv(qty_strings[j]);
-                double p = 0.0, q = 0.0;
-                std::from_chars(psv.data(), psv.data() + psv.size(), p);
-                std::from_chars(qsv.data(), qsv.data() + qsv.size(), q);
-                sum += p * q;
-            }
-            sink = sum;
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-
-        auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-        double avg_ns = static_cast<double>(total_ns) / ITERATIONS;
-
-        std::cout << "std::from_chars (zero allocation):" << std::endl;
-        std::cout << "  Total time:       " << std::setw(8) << total_ns / 1000000 << " ms" << std::endl;
-        std::cout << "  Avg per snapshot: " << std::setw(8) << std::fixed << std::setprecision(0) << avg_ns << " ns" << std::endl;
-        std::cout << "  Avg per snapshot: " << std::setw(8) << std::setprecision(2) << avg_ns / 1000.0 << " us" << std::endl;
-        std::cout << std::endl;
-        (void)sink;
-    }
+    // 模拟实际代码：string_view → string → stod（每次转换都要构造一个 std::string）
+    runBenchmark("std::stod (with std::string allocation)", price_strings, qty_strings,
+                 [](std::string_view sv) { return std::stod(std::string(sv)); });
+    // 直接在原缓冲区上解析，零分配
+    runBenchmark("std::from_chars (zero allocation)", price_strings, qty_strings, [](std::string_view sv) {
+        double v = 0.0;
+        std::from_chars(sv.data(), sv.data() + sv.size(), v);
+        return v;
+    });
 
     std::cout << "═══ Conclusion ═══" << std::endl;
     std::cout << "  std::from_chars avoids heap allocation for each string conversion," << std::endl;
     std::cout << "  eliminating 80 malloc/free calls per depth-20 snapshot." << std::endl;
-
     return 0;
 }

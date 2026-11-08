@@ -70,13 +70,10 @@ inline std::uint32_t crc32(std::string_view s, std::uint32_t seed = 0) noexcept 
 }
 
 // 32 位无符号 CRC 按二进制补码解释为有符号数（OKX 订单簿 checksum 的表示方式）。
-// 用 64 位算术换算，避免 C++20 之前"超范围无符号转有符号"的实现定义行为。
-constexpr std::int32_t toSignedCrc(std::uint32_t v) noexcept {
-    return static_cast<std::int32_t>(static_cast<std::int64_t>(v) -
-                                     (v > 0x7FFFFFFFu ? (std::int64_t{1} << 32) : std::int64_t{0}));
-}
+// 超出 int32 范围的值按模 2^32 回绕：GCC/Clang 的实现定义行为，C++20 起写入标准。
+constexpr std::int32_t toSignedCrc(std::uint32_t v) noexcept { return static_cast<std::int32_t>(v); }
 
 // 有符号 CRC-32：crc32Signed("3366.1:7:3366.8:9:3366:6:3368:8") == -1881014294（即 2413953002u）
-inline std::int32_t crc32Signed(std::string_view s) noexcept { return toSignedCrc(crc32(s.data(), s.size())); }
+inline std::int32_t crc32Signed(std::string_view s) noexcept { return toSignedCrc(crc32(s)); }
 
 }  // namespace hft

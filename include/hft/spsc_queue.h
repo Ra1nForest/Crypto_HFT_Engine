@@ -31,9 +31,8 @@ namespace hft {
 //   消费者析构元素后 release 存 read_idx_，生产者 acquire 读到后才复用该槽位。
 //   各端读取自己的下标用 relaxed（只有自己会写它）。
 // - 原始对齐内存 + placement new：T 无需默认构造，支持只可移动类型；析构时销毁剩余元素。
-// - 线程约束：tryEmplace/tryPush（及其 Reserving 版本）只能由一个生产者线程调用，front/pop/tryPop 只能由一个
-//   消费者线程调用；
-//   size/empty/capacity 任意线程可调用（对方并发操作时结果是近似值）。
+// - 线程约束：tryEmplace/tryPush/tryPushReserving 只能由一个生产者线程调用，front/pop/tryPop 只能由一个
+//   消费者线程调用；size/empty/capacity 任意线程可调用（对方并发操作时结果是近似值）。
 template <class T>
 class SpscQueue {
     static_assert(std::is_nothrow_destructible_v<T>, "hft::SpscQueue<T>: T must be nothrow destructible");
@@ -41,8 +40,6 @@ class SpscQueue {
                   "hft::SpscQueue requires lock-free 64-bit atomics");
 
 public:
-    using value_type = T;
-
     // capacity：期望容量；实际容量向上取整到 2 的幂，最小为 2
     explicit SpscQueue(std::size_t capacity)
         : capacity_(roundCapacity(capacity))
@@ -69,49 +66,18 @@ public:
     // T 的构造函数抛异常时队列保持不变，异常继续向外传播。
     template <class... Args>
     bool tryEmplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
-        const std::uint64_t w = write_idx_.load(std::memory_order_relaxed);
-        if (HFT_UNLIKELY(w - cached_read_idx_ >= capacity_)) {
-            // 缓存显示已满：读取消费者的最新下标（acquire：保证其析构已完成，槽位可复用）
-            cached_read_idx_ = read_idx_.load(std::memory_order_acquire);
-            if (w - cached_read_idx_ >= capacity_) return false;
-        }
-        ::new (slotAddress(w)) T(std::forward<Args>(args)...);
-        write_idx_.store(w + 1, std::memory_order_release);  // 发布元素
-        return true;
+        return emplaceBelow(capacity_, std::forward<Args>(args)...);
     }
 
-    bool tryPush(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
-        return tryEmplace(v);
-    }
+    bool tryPush(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) { return tryEmplace(v); }
 
-    bool tryPush(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
-        return tryEmplace(std::move(v));
-    }
+    bool tryPush(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) { return tryEmplace(std::move(v)); }
 
-    // 带预留的推入：只有推入之后仍至少空着 reserve 个槽位才构造并返回 true（reserve >= capacity() 时总是失败；
-    // reserve = 0 与 tryEmplace 相同）。用途：生产者给必须送达的元素留位置——普通元素用 reserve = 1，
+    // 带预留的推入：只有推入之后仍至少空着 reserve 个槽位才拷贝并返回 true（reserve >= capacity() 时总是失败；
+    // reserve = 0 与 tryPush 相同）。用途：生产者给必须送达的元素留位置——普通元素用 reserve = 1，
     // 关键元素用 0，那么只要最近一次成功推入的是普通元素，下一个关键元素一定能推入（消费者只会腾出更多槽位）。
-    template <class... Args>
-    bool tryEmplaceReserving(std::size_t reserve,
-                             Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
-        if (HFT_UNLIKELY(reserve >= capacity_)) return false;
-        const std::uint64_t limit = static_cast<std::uint64_t>(capacity_ - reserve);
-        const std::uint64_t w = write_idx_.load(std::memory_order_relaxed);
-        if (HFT_UNLIKELY(w - cached_read_idx_ >= limit)) {
-            cached_read_idx_ = read_idx_.load(std::memory_order_acquire);  // 同 tryEmplace
-            if (w - cached_read_idx_ >= limit) return false;
-        }
-        ::new (slotAddress(w)) T(std::forward<Args>(args)...);
-        write_idx_.store(w + 1, std::memory_order_release);
-        return true;
-    }
-
     bool tryPushReserving(const T& v, std::size_t reserve) noexcept(std::is_nothrow_copy_constructible_v<T>) {
-        return tryEmplaceReserving(reserve, v);
-    }
-
-    bool tryPushReserving(T&& v, std::size_t reserve) noexcept(std::is_nothrow_move_constructible_v<T>) {
-        return tryEmplaceReserving(reserve, std::move(v));
+        return reserve < capacity_ && emplaceBelow(capacity_ - reserve, v);
     }
 
     // ---------------- 消费者端 ----------------
@@ -119,23 +85,16 @@ public:
     // 队首元素指针；队列空时返回 nullptr。指针在 pop() 之前一直有效。
     T* front() noexcept {
         const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
-        if (r == cached_write_idx_) {
-            // 缓存显示为空：读取生产者的最新下标（acquire：保证看到元素的完整构造）
-            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
-            if (r == cached_write_idx_) return nullptr;
-        }
-        return slot(r);
+        return readable(r) ? slot(r) : nullptr;
     }
 
     // 弹出（析构）队首元素。前置条件：队列非空（例如 front() != nullptr）。
     // 防御：队列为空时为空操作（启用 HFT_ASSERT 时直接报错）。
     void pop() noexcept {
         const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
-        if (HFT_UNLIKELY(r == cached_write_idx_)) {
-            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
-            HFT_ASSERT(r != cached_write_idx_ && "SpscQueue::pop() on an empty queue");
-            if (r == cached_write_idx_) return;
-        }
+        const bool ok = readable(r);
+        HFT_ASSERT(ok && "SpscQueue::pop() on an empty queue");
+        if (HFT_UNLIKELY(!ok)) return;
         slot(r)->~T();
         read_idx_.store(r + 1, std::memory_order_release);  // 归还槽位
     }
@@ -144,11 +103,8 @@ public:
     // 移动赋值抛异常时元素仍留在队列中。
     bool tryPop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
         const std::uint64_t r = read_idx_.load(std::memory_order_relaxed);
-        if (r == cached_write_idx_) {
-            cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
-            if (r == cached_write_idx_) return false;
-        }
-        T* p = slot(r);
+        if (!readable(r)) return false;
+        T* const p = slot(r);
         out = std::move(*p);
         p->~T();
         read_idx_.store(r + 1, std::memory_order_release);
@@ -185,6 +141,28 @@ private:
         if (requested > kMaxCapacity) throw std::length_error("hft::SpscQueue: capacity too large");
         const std::size_t c = nextPow2(requested);
         return c < 2 ? 2 : c;
+    }
+
+    // 队列中的元素少于 limit（<= capacity_）个时在队尾构造一个元素并发布；否则返回 false
+    template <class... Args>
+    bool emplaceBelow(std::size_t limit, Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+        const std::uint64_t w = write_idx_.load(std::memory_order_relaxed);
+        if (HFT_UNLIKELY(w - cached_read_idx_ >= limit)) {
+            // 缓存显示已满：读取消费者的最新下标（acquire：保证其析构已完成，槽位可复用）
+            cached_read_idx_ = read_idx_.load(std::memory_order_acquire);
+            if (w - cached_read_idx_ >= limit) return false;
+        }
+        ::new (slotAddress(w)) T(std::forward<Args>(args)...);
+        write_idx_.store(w + 1, std::memory_order_release);  // 发布元素
+        return true;
+    }
+
+    // 消费者端：下标 r 处是否已有元素。缓存显示为空时才读取生产者的最新下标
+    // （acquire：保证看到元素的完整构造）
+    bool readable(std::uint64_t r) noexcept {
+        if (r != cached_write_idx_) return true;
+        cached_write_idx_ = write_idx_.load(std::memory_order_acquire);
+        return r != cached_write_idx_;
     }
 
     static unsigned char* allocateStorage(std::size_t capacity) {

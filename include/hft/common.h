@@ -77,15 +77,10 @@ constexpr bool isPow2(std::size_t n) noexcept {
 // n 超过 size_t 能表示的最大 2 的幂（64 位下为 2^63）时无法表示，饱和返回该最大值；
 // 本库的容器在调用前都会先检查容量上限，不会走到饱和分支。
 constexpr std::size_t nextPow2(std::size_t n) noexcept {
-    constexpr std::size_t kMaxPow2 = (std::numeric_limits<std::size_t>::max() >> 1) + 1;
+    constexpr int kBits = std::numeric_limits<std::size_t>::digits;
     if (n <= 1) return 1;
-    if (n > kMaxPow2) return kMaxPow2;
-    --n;
-    for (unsigned shift = 1; shift < static_cast<unsigned>(std::numeric_limits<std::size_t>::digits);
-         shift <<= 1) {
-        n |= n >> shift;
-    }
-    return n + 1;
+    const int width = std::numeric_limits<unsigned long long>::digits - __builtin_clzll(n - 1);  // n - 1 的有效位数
+    return std::size_t{1} << (width < kBits ? width : kBits - 1);
 }
 
 namespace detail {

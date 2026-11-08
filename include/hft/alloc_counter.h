@@ -43,8 +43,6 @@ inline std::uint64_t stopWindow() noexcept {
     return g_window_count.load(std::memory_order_relaxed);
 }
 
-inline std::uint64_t windowCount() noexcept { return g_window_count.load(std::memory_order_relaxed); }
-
 namespace detail {
 
 inline void note() noexcept {
@@ -55,25 +53,16 @@ inline void note() noexcept {
     }
 }
 
-inline void* allocNothrow(std::size_t n) noexcept {
+// 计数并分配 n 字节，失败返回 nullptr。align 为 0 时用 malloc（默认对齐），
+// 否则用 aligned_alloc（它要求大小是对齐的整数倍，因此向上取整）
+inline void* allocate(std::size_t n, std::size_t align) noexcept {
     note();
-    return std::malloc(n == 0 ? 1 : n);
+    if (align == 0) return std::malloc(n == 0 ? 1 : n);
+    return std::aligned_alloc(align, n == 0 ? align : (n + align - 1) / align * align);
 }
 
-inline void* allocAlignedNothrow(std::size_t n, std::align_val_t align) noexcept {
-    note();
-    const std::size_t a = static_cast<std::size_t>(align);
-    const std::size_t rounded = n == 0 ? a : (n + a - 1) / a * a;  // aligned_alloc 要求大小是对齐的整数倍
-    return std::aligned_alloc(a, rounded);
-}
-
-inline void* alloc(std::size_t n) {
-    if (void* p = allocNothrow(n)) return p;
-    throw std::bad_alloc();
-}
-
-inline void* allocAligned(std::size_t n, std::align_val_t align) {
-    if (void* p = allocAlignedNothrow(n, align)) return p;
+inline void* allocateOrThrow(std::size_t n, std::size_t align) {
+    if (void* p = allocate(n, align)) return p;
     throw std::bad_alloc();
 }
 
@@ -85,25 +74,29 @@ inline void* allocAligned(std::size_t n, std::align_val_t align) {
 // noinline：-O1（sanitizer 构建）下 GCC 若把它们内联进调用点，会对"operator new 的结果被 free"误报
 // -Wmismatched-new-delete；底层本来就是 malloc/aligned_alloc 与 free 配对。
 // 注意：标准规定替换的分配函数不得声明为 inline，所以它们是普通的非内联定义。
-__attribute__((noinline)) void* operator new(std::size_t n) { return hft::alloc_counter::detail::alloc(n); }
-__attribute__((noinline)) void* operator new[](std::size_t n) { return hft::alloc_counter::detail::alloc(n); }
+__attribute__((noinline)) void* operator new(std::size_t n) {
+    return hft::alloc_counter::detail::allocateOrThrow(n, 0);
+}
+__attribute__((noinline)) void* operator new[](std::size_t n) {
+    return hft::alloc_counter::detail::allocateOrThrow(n, 0);
+}
 __attribute__((noinline)) void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    return hft::alloc_counter::detail::allocNothrow(n);
+    return hft::alloc_counter::detail::allocate(n, 0);
 }
 __attribute__((noinline)) void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
-    return hft::alloc_counter::detail::allocNothrow(n);
+    return hft::alloc_counter::detail::allocate(n, 0);
 }
 __attribute__((noinline)) void* operator new(std::size_t n, std::align_val_t a) {
-    return hft::alloc_counter::detail::allocAligned(n, a);
+    return hft::alloc_counter::detail::allocateOrThrow(n, static_cast<std::size_t>(a));
 }
 __attribute__((noinline)) void* operator new[](std::size_t n, std::align_val_t a) {
-    return hft::alloc_counter::detail::allocAligned(n, a);
+    return hft::alloc_counter::detail::allocateOrThrow(n, static_cast<std::size_t>(a));
 }
 __attribute__((noinline)) void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
-    return hft::alloc_counter::detail::allocAlignedNothrow(n, a);
+    return hft::alloc_counter::detail::allocate(n, static_cast<std::size_t>(a));
 }
 __attribute__((noinline)) void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
-    return hft::alloc_counter::detail::allocAlignedNothrow(n, a);
+    return hft::alloc_counter::detail::allocate(n, static_cast<std::size_t>(a));
 }
 __attribute__((noinline)) void operator delete(void* p) noexcept { std::free(p); }
 __attribute__((noinline)) void operator delete[](void* p) noexcept { std::free(p); }
