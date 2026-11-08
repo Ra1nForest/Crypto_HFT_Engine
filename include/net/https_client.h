@@ -28,7 +28,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -54,21 +53,17 @@ enum class KickReason : int { None = 0, Stop = 1, Stall = 2, ConnectTimeout = 3 
 // ---------------------------------------------------------------------------
 // SocketRegistry：活动套接字登记表（"踢断"机制）
 // ---------------------------------------------------------------------------
-// 同步 Boost.Beast 的阻塞调用（TLS 握手 / read / write）没有超时也无法取消。其他线程调用 kick() 时，对登记的
-// 每个套接字执行 ::shutdown(SHUT_RDWR)：阻塞在已连接（或正在连接、SYN_SENT）的套接字上的系统调用立即返回
-// （recv 返回 EOF，进行中的连接以 ECONNRESET 失败），挂起的异步读写同样以错误完成，会话随之结束。
-// 注意：Linux 上对还没有发起连接（TCP_CLOSE）的套接字 shutdown 只返回 ENOTCONN，并不阻止之后的 connect()。
-// 所以 connectSocket 从不调用阻塞的 connect()：它用非阻塞 connect + 分片 poll，每片之间检查 interrupted()，
-// 踢断落在任何时刻都会在一个轮询片之内生效。
-// fd 复用竞争：登记时保存的是 fd 的副本（fcntl(F_DUPFD_CLOEXEC)）。shutdown 作用于套接字本身，
-// 对副本调用与对原 fd 调用效果完全相同；副本在注销前一直打开，它的编号不可能被别的套接字复用，
-// 因此即使原 fd 已被关闭（Beast 在收到 close 帧或协议错误时会在 teardown 里自行关闭套接字），踢断也
-// 不会误伤别的连接。使用方仍然遵守"先注销、再关闭"（SocketRegistration 声明在流对象之后）。
-// 副本让底层套接字在注销前保持存活：注销（关闭副本）后才真正释放连接。
-// epoll：副本也会让原 fd 在 epoll 中的登记残留到副本关闭为止。只做同步操作、从不 run() 的 io_context 不受影响。
-// feed 的 WebSocket 会话用一个只属于该会话、由 feed 线程 run_one() 的 io_context：残留只出现在 Beast 自行关闭
-// 套接字之后、会话结束注销之前；asio 的描述符状态对象由 io_context 的对象池持有、不会被释放，残留的事件只落在
-// 没有挂起操作的状态上（什么也不做），这段时间该 io_context 也不再打开新的套接字，会话结束时它随之销毁。
+// 阻塞的 TLS 握手 / read / write 没有超时也无法取消。其他线程调用 kick() 时，对登记的每个套接字执行
+// ::shutdown(SHUT_RDWR)：阻塞在已连接（或正在连接、SYN_SENT）的套接字上的系统调用立即返回（recv 返回 EOF，
+// 进行中的连接以 ECONNRESET 失败），挂起的异步读写同样以错误完成，会话随之结束。
+// Linux 上对还没有发起连接（TCP_CLOSE）的套接字 shutdown 只返回 ENOTCONN、并不阻止之后的 connect()，所以
+// connectSocket 不调用阻塞的 connect()：非阻塞 connect + 分片 poll，每片之间检查 interrupted()。
+// fd 复用竞争：登记的是 fd 的副本（fcntl(F_DUPFD_CLOEXEC)）。shutdown 作用于套接字本身，对副本调用与对原 fd
+// 调用效果相同；副本在注销前一直打开，它的编号不会被别的套接字复用，所以即使原 fd 已被关闭（Beast 收到 close
+// 帧或协议错误时会在 teardown 里自行关闭套接字），踢断也不会误伤别的连接。副本让底层套接字（以及原 fd 在 epoll
+// 中的登记）存活到注销为止：只做同步操作、从不 run() 的 io_context 不受影响；feed 的 WebSocket 会话用只属于
+// 该会话的 io_context，残留的 epoll 事件只落在没有挂起操作的描述符状态上（什么也不做），会话结束时随之销毁。
+// 使用方仍然遵守"先注销、再关闭"（SocketRegistration 声明在流对象之后）。
 // 线程安全：全部方法可在任意线程调用（内部互斥锁）；reason()/interrupted() 无锁。
 class SocketRegistry {
 public:
@@ -90,7 +85,7 @@ public:
         const int kick_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
         if (kick_fd < 0) return 0;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (reason_.load(std::memory_order_relaxed) != KickReason::None || count_ == kMaxSockets) {
+        if (interrupted() || count_ == kMaxSockets) {
             ::shutdown(kick_fd, SHUT_RDWR);
             ::close(kick_fd);
             return 0;
@@ -102,7 +97,6 @@ public:
 
     // 注销（关闭 fd 副本）。必须在关闭/销毁原套接字之前调用。
     void remove(Token token) noexcept {
-        if (token == 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t i = 0; i < count_; ++i) {
             if (entries_[i].token == token) {
@@ -116,9 +110,8 @@ public:
     // 踢断当前会话：记录原因并 shutdown 全部已登记套接字；之后的 add() 一律失败，直到 rearm()。
     // 已处于踢断状态时什么也不做并返回 false（同一会话不会被重复计数）。
     bool kick(KickReason why) noexcept {
-        if (why == KickReason::None) return false;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (reason_.load(std::memory_order_relaxed) != KickReason::None) return false;
+        if (interrupted()) return false;
         reason_.store(why, std::memory_order_release);
         shutdownAllLocked();
         return true;
@@ -176,19 +169,15 @@ public:
     // 登记 fd；失败（已踢断等）时返回 false
     bool attach(SocketRegistry& registry, int fd) noexcept {
         release();
-        const SocketRegistry::Token token = registry.add(fd);
-        if (token == 0) return false;
-        registry_ = &registry;
-        token_ = token;
-        return true;
+        token_ = registry.add(fd);
+        if (token_ != 0) registry_ = &registry;
+        return token_ != 0;
     }
 
     void release() noexcept {
-        if (registry_ != nullptr) {
-            registry_->remove(token_);
-            registry_ = nullptr;
-            token_ = 0;
-        }
+        if (registry_ != nullptr) registry_->remove(token_);
+        registry_ = nullptr;
+        token_ = 0;
     }
 
     bool attached() const noexcept { return registry_ != nullptr; }
@@ -201,8 +190,6 @@ private:
 // ---------------------------------------------------------------------------
 // 小工具
 // ---------------------------------------------------------------------------
-
-inline std::string errorText(const boost::system::error_code& ec) { return ec.message(); }
 
 // 主机名是否为 IP 字面量（IP 字面量不发送 SNI，按 IP SAN 校验证书）
 inline bool isIpLiteral(const std::string& host) noexcept {
@@ -248,10 +235,10 @@ inline std::unique_ptr<ssl::context> makeClientContext(const TlsOptions& opt) {
     }
     boost::system::error_code ec;
     ctx->set_default_verify_paths(ec);
-    if (ec) throw std::runtime_error("TLS setup: cannot load the system CA store: " + errorText(ec));
+    if (ec) throw std::runtime_error("TLS setup: cannot load the system CA store: " + ec.message());
     if (!opt.ca_file.empty()) {
         ctx->load_verify_file(opt.ca_file, ec);
-        if (ec) throw std::runtime_error("TLS setup: cannot load CA file '" + opt.ca_file + "': " + errorText(ec));
+        if (ec) throw std::runtime_error("TLS setup: cannot load CA file '" + opt.ca_file + "': " + ec.message());
     }
     ctx->set_verify_mode(ssl::verify_peer);
     return ctx;
@@ -298,21 +285,19 @@ void prepareTlsStream(SslStream& stream, const std::string& host, bool verify) {
 // "unable to get local issuer certificate"、"hostname mismatch"）
 inline std::string describeHandshakeError(SSL* ssl, const boost::system::error_code& ec, const std::string& host,
                                           bool verify) {
-    if (verify && ssl != nullptr) {
-        const long result = SSL_get_verify_result(ssl);
-        if (result != X509_V_OK) {
-            return "TLS certificate verification failed for " + host + ": " +
-                   X509_verify_cert_error_string(result) + " (" + errorText(ec) + ")";
-        }
+    const long result = verify ? SSL_get_verify_result(ssl) : X509_V_OK;
+    if (result != X509_V_OK) {
+        return "TLS certificate verification failed for " + host + ": " + X509_verify_cert_error_string(result) +
+               " (" + ec.message() + ")";
     }
-    return "TLS handshake with " + host + " failed: " + errorText(ec);
+    return "TLS handshake with " + host + " failed: " + ec.message();
 }
 
 // ---------------------------------------------------------------------------
 // Resolver：可中断的 DNS 解析
 // ---------------------------------------------------------------------------
 // getaddrinfo 无法取消（glibc 默认超时可达 timeout x attempts 秒），因此在分离的后台线程中执行，
-// 调用方每 poll_ms 检查一次 abort()；放弃的查询在后台自行结束，只访问自己的共享状态。
+// 调用方每 10 ms 检查一次 abort()；放弃的查询在后台自行结束，只访问自己的共享状态。
 // 对同一 host/port 的下一次 resolve() 会接着等待仍在进行中的查询，所以每个 Resolver 最多只有一个后台线程。
 // IP 字面量直接同步解析（AI_NUMERICHOST，不访问 DNS、不创建线程）。
 // 非线程安全：一个 Resolver 只由一个线程使用（feed 线程）。
@@ -322,7 +307,7 @@ public:
 
     template <class AbortFn>
     boost::system::error_code resolve(const std::string& host, const std::string& port, results_type& out,
-                                      AbortFn&& abort, int poll_ms = 10) {
+                                      AbortFn&& abort) {
         boost::system::error_code ec;
         if (isIpLiteral(host)) {
             asio::io_context ioc;
@@ -337,7 +322,7 @@ public:
         std::unique_lock<std::mutex> lock(st->mutex);
         while (!st->done) {
             if (abort()) return asio::error::operation_aborted;  // pending_ 保留，下次复用
-            st->cv.wait_for(lock, std::chrono::milliseconds(poll_ms > 0 ? poll_ms : 1));
+            st->cv.wait_for(lock, std::chrono::milliseconds(10));
         }
         out = st->results;
         ec = st->ec;
@@ -390,21 +375,20 @@ private:
 
 // connectSocket 的时限与端点轮转
 struct ConnectOptions {
-    int timeout_ms = 0;             // 全部端点的总时限（<= 0：不限，每个端点一直等到内核放弃）
-    int min_endpoint_ms = 1000;     // 单个端点的时限 = max(min_endpoint_ms, timeout_ms / 端点数)，且不超过剩余总时限
+    int timeout_ms = 0;             // 全部端点的总时限（<= 0：不限，每个端点一直等到内核放弃）；
+                                    // 单个端点的时限 = max(1000 ms, timeout_ms / 端点数)，且不超过剩余总时限
     std::size_t* cursor = nullptr;  // 可选的轮转游标：从第 *cursor % 端点数 个端点开始依次尝试；返回时成功 = 连上的
                                     // 端点，失败 = 最后尝试的端点的下一个（调用方据此让下一次从别的地址开始）
-    std::function<void()> on_wait;  // 可选：等待连接完成期间每个空闲的轮询片（<= 50 ms）之后调用一次
 };
 
 namespace detail {
 
 constexpr int kConnectPollSliceMs = 50;  // 等待连接时检查踢断状态与时限的粒度
+constexpr int kMinEndpointMs = 1000;     // 单个端点的最短时限
 
 // 等待非阻塞 connect 完成：每片最多 50 ms 的 poll(POLLOUT)，片与片之间检查踢断状态（踢断的 shutdown 也会
 // 立即唤醒 poll）。返回 0 = 已连接；ECANCELED = 已被踢断；ETIMEDOUT = 到达 deadline；其他 = 连接错误（errno）
-inline int waitForConnect(int fd, const SocketRegistry& registry, std::chrono::steady_clock::time_point deadline,
-                          const std::function<void()>& on_wait) {
+inline int waitForConnect(int fd, const SocketRegistry& registry, std::chrono::steady_clock::time_point deadline) {
     using Clock = std::chrono::steady_clock;
     for (;;) {
         if (registry.interrupted()) return ECANCELED;
@@ -418,14 +402,8 @@ inline int waitForConnect(int fd, const SocketRegistry& registry, std::chrono::s
         }
         pollfd p{fd, POLLOUT, 0};
         const int r = ::poll(&p, 1, slice_ms);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return errno;
-        }
-        if (r == 0) {
-            if (on_wait) on_wait();
-            continue;
-        }
+        if (r < 0 && errno != EINTR) return errno;
+        if (r <= 0) continue;
         int so_error = 0;
         socklen_t len = sizeof(so_error);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) return errno;
@@ -438,8 +416,7 @@ inline int waitForConnect(int fd, const SocketRegistry& registry, std::chrono::s
 // 下一次检查 interrupted() 时发现；落在 SYN_SENT 或已连接之后 → shutdown 直接让连接失败并唤醒 poll。
 template <class Socket>
 boost::system::error_code connectEndpoint(Socket& sock, const tcp::endpoint& ep, SocketRegistry& registry,
-                                          SocketRegistration& reg, std::chrono::steady_clock::time_point deadline,
-                                          const std::function<void()>& on_wait) {
+                                          SocketRegistration& reg, std::chrono::steady_clock::time_point deadline) {
     boost::system::error_code ec;
     sock.open(ep.protocol(), ec);
     if (ec) return ec;
@@ -451,12 +428,11 @@ boost::system::error_code connectEndpoint(Socket& sock, const tcp::endpoint& ep,
     if (ec) return ec;
     const int fd = sock.native_handle();
     int err = ::connect(fd, ep.data(), static_cast<socklen_t>(ep.size())) == 0 ? 0 : errno;
-    if (err == EINPROGRESS || err == EINTR) err = waitForConnect(fd, registry, deadline, on_wait);
+    if (err == EINPROGRESS || err == EINTR) err = waitForConnect(fd, registry, deadline);
     if (err != 0) return boost::system::error_code(err, asio::error::get_system_category());
     sock.native_non_blocking(false, ec);  // 之后的同步 TLS / WebSocket 调用保持阻塞语义
     if (ec) return ec;
-    if (registry.interrupted()) return asio::error::operation_aborted;
-    return ec;
+    return registry.interrupted() ? asio::error::operation_aborted : ec;
 }
 
 }  // namespace detail
@@ -469,49 +445,31 @@ boost::system::error_code connectEndpoint(Socket& sock, const tcp::endpoint& ep,
 template <class Socket>
 boost::system::error_code connectSocket(Socket& sock, const tcp::resolver::results_type& endpoints,
                                         SocketRegistry& registry, SocketRegistration& reg,
-                                        tcp::endpoint* connected = nullptr,
                                         const ConnectOptions& opt = ConnectOptions()) {
     using Clock = std::chrono::steady_clock;
     const std::size_t n = endpoints.size();
-    boost::system::error_code last = asio::error::host_not_found;
-    if (n == 0) return last;
-    Clock::time_point overall = Clock::time_point::max();
-    Clock::duration per_endpoint = Clock::duration::max();
-    if (opt.timeout_ms > 0) {
-        overall = Clock::now() + std::chrono::milliseconds(opt.timeout_ms);
-        const long long share = static_cast<long long>(opt.timeout_ms) / static_cast<long long>(n);
-        per_endpoint = std::chrono::milliseconds(std::max<long long>(opt.min_endpoint_ms, share));
-    }
-    std::size_t index = opt.cursor != nullptr ? *opt.cursor % n : 0;
-    auto it = endpoints.begin();
-    std::advance(it, static_cast<std::ptrdiff_t>(index));
+    if (n == 0) return asio::error::host_not_found;
+    const bool timed = opt.timeout_ms > 0;
+    const Clock::time_point overall = Clock::now() + std::chrono::milliseconds(std::max(0, opt.timeout_ms));
+    const std::chrono::milliseconds per_endpoint(
+        std::max<long long>(detail::kMinEndpointMs, opt.timeout_ms / static_cast<long long>(n)));
+    const std::size_t first = opt.cursor != nullptr ? *opt.cursor % n : 0;
+    boost::system::error_code last;
     for (std::size_t k = 0; k < n; ++k) {
-        if (k > 0) {
-            ++it;
-            ++index;
-            if (it == endpoints.end()) {
-                it = endpoints.begin();
-                index = 0;
-            }
-        }
+        const std::size_t index = (first + k) % n;
         Clock::time_point deadline = Clock::time_point::max();
-        if (opt.timeout_ms > 0) {
+        if (timed) {
             const Clock::time_point now = Clock::now();
-            if (now >= overall) {
-                last = asio::error::timed_out;  // 游标保持在这个还没尝试的端点上
-                break;
-            }
-            deadline = overall - now > per_endpoint ? now + per_endpoint : overall;
+            if (now >= overall) return asio::error::timed_out;  // 游标保持在这个还没尝试的端点上
+            deadline = std::min(overall, now + per_endpoint);
         }
-        const tcp::endpoint ep = it->endpoint();
         closeSocket(sock, reg);
-        const boost::system::error_code ec = detail::connectEndpoint(sock, ep, registry, reg, deadline, opt.on_wait);
-        if (!ec) {
-            if (connected != nullptr) *connected = ep;
+        const tcp::endpoint ep = std::next(endpoints.begin(), static_cast<std::ptrdiff_t>(index))->endpoint();
+        last = detail::connectEndpoint(sock, ep, registry, reg, deadline);
+        if (!last) {
             if (opt.cursor != nullptr) *opt.cursor = index;
-            return ec;
+            return last;
         }
-        last = ec;
         closeSocket(sock, reg);
         if (opt.cursor != nullptr) *opt.cursor = (index + 1) % n;
         if (registry.interrupted()) return asio::error::operation_aborted;
@@ -541,66 +499,59 @@ struct HttpResult {
     std::string error;   // ok == false 时的可读原因
 };
 
+namespace detail {
+inline HttpResult httpError(std::string error) {
+    HttpResult r;
+    r.error = std::move(error);
+    return r;
+}
+}  // namespace detail
+
 // 阻塞式 HTTPS GET（每次请求一个连接，Connection: close）。套接字登记到 registry，可被踢断；
 // 解析可被 registry 的踢断状态中断。不抛异常（std::bad_alloc 除外）。
 // ioc 必须是只做同步操作、从不 run() 的 io_context（见 SocketRegistry 的说明）。
 inline HttpResult httpsGet(asio::io_context& ioc, ssl::context& ctx, Resolver& resolver, SocketRegistry& registry,
                            const HttpsGetRequest& rq) {
-    HttpResult r;
     const std::string where = rq.host + ":" + rq.port;
     tcp::resolver::results_type endpoints;
     boost::system::error_code ec =
         resolver.resolve(rq.host, rq.port, endpoints, [&registry] { return registry.interrupted(); });
-    if (ec) {
-        r.error = "resolve " + where + ": " + errorText(ec);
-        return r;
-    }
+    if (ec) return detail::httpError("resolve " + where + ": " + ec.message());
     beast::ssl_stream<tcp::socket> stream(ioc, ctx);
     SocketRegistration reg;  // 声明在 stream 之后：析构时先注销、再由 stream 关闭套接字
     tcp::socket& sock = beast::get_lowest_layer(stream);
     ConnectOptions copt;
     copt.timeout_ms = rq.connect_timeout_ms;
     copt.cursor = rq.endpoint_cursor;
-    ec = connectSocket(sock, endpoints, registry, reg, nullptr, copt);
-    if (ec) {
-        r.error = "connect " + where + ": " + errorText(ec);
-        return r;
-    }
+    ec = connectSocket(sock, endpoints, registry, reg, copt);
+    if (ec) return detail::httpError("connect " + where + ": " + ec.message());
     sock.set_option(tcp::no_delay(true), ec);
     try {
         prepareTlsStream(stream, rq.host, rq.verify);
     } catch (const std::exception& e) {
-        r.error = e.what();
-        return r;
+        return detail::httpError(e.what());
     }
     stream.handshake(ssl::stream_base::client, ec);
-    if (ec) {
-        r.error = describeHandshakeError(stream.native_handle(), ec, rq.host, rq.verify);
-        return r;
-    }
+    if (ec) return detail::httpError(describeHandshakeError(stream.native_handle(), ec, rq.host, rq.verify));
     http::request<http::empty_body> req{http::verb::get, rq.target, 11};
     req.set(http::field::host, hostHeader(rq.host, rq.port, "443"));
     req.set(http::field::user_agent, kUserAgent);
     req.set(http::field::accept, "application/json");
     req.set(http::field::connection, "close");
     http::write(stream, req, ec);
-    if (ec) {
-        r.error = "send request to " + where + ": " + errorText(ec);
-        return r;
-    }
+    if (ec) return detail::httpError("send request to " + where + ": " + ec.message());
     beast::flat_buffer buffer;
     http::response_parser<http::string_body> parser;
     parser.body_limit(static_cast<std::uint64_t>(rq.body_limit));
     http::read(stream, buffer, parser, ec);
     // 服务器在完整响应之后直接断开（没有 close_notify）不算错误；响应不完整时才是截断
     if (ec == ssl::error::stream_truncated && parser.is_done()) ec = {};
-    if (ec) {
-        r.error = ec == http::error::body_limit
-                      ? "response from " + where + " exceeds " + std::to_string(rq.body_limit) + " bytes"
-                      : "read response from " + where + ": " + errorText(ec);
-        return r;
+    if (ec == http::error::body_limit) {
+        return detail::httpError("response from " + where + " exceeds " + std::to_string(rq.body_limit) + " bytes");
     }
+    if (ec) return detail::httpError("read response from " + where + ": " + ec.message());
     auto& res = parser.get();
+    HttpResult r;
     r.ok = true;
     r.status = static_cast<int>(res.result_int());
     r.reason = std::string(res.reason());

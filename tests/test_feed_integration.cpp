@@ -7,7 +7,7 @@
 // 启用库内调试断言（必须在包含任何 hft 头文件之前定义）
 #define HFT_ENABLE_ASSERTS
 
-#include "hft/alloc_counter.h"
+#include "hft/alloc_counter.h"  // 计数版全局 operator new：验证 feed 线程稳态下每条消息零堆分配
 #include "test_framework.h"
 
 #include "hft/crc32.h"
@@ -42,12 +42,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-// ============================================================================
-// 全局 operator new 计数（只统计被跟踪的线程）：验证 feed 线程稳态下每条消息零堆分配
-// ============================================================================
-
-// 堆分配计数见 hft/alloc_counter.h（startWindow(线程) / stopWindow() 只统计被跟踪的线程）
 
 // ============================================================================
 // getaddrinfo 替换："dual.test" 解析为两个 127.0.0.1 端点（各带端口，忽略 service），模拟第一个地址不通的
@@ -135,7 +129,10 @@ constexpr const char* kOkxBooksSub = R"({"op":"subscribe","args":[{"channel":"bo
 constexpr const char* kOkxBooksUnsub = R"({"op":"unsubscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
 constexpr const char* kBybitSub = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
 constexpr const char* kBybitPing = R"({"op":"ping"})";
+constexpr const char* kBybitPong = R"({"op":"pong","args":["1700000000000"],"conn_id":"c1"})";
 constexpr const char* kBinanceSnapshotPath = "/api/v3/depth?symbol=BTCUSDT&limit=1000";
+constexpr const char* kBinanceDiffPath = "/ws/btcusdt@depth@100ms";
+constexpr const char* kBinanceDepth20Path = "/ws/btcusdt@depth20@100ms";
 
 double ms(std::int64_t ns) { return static_cast<double>(ns) / 1e6; }
 
@@ -172,6 +169,11 @@ std::string binanceDepth(std::uint64_t last_update_id, const Levels& bids, const
            R"(,"asks":)" + levelsJson(asks, false) + "}";
 }
 
+// 单档 depth20 推送（买一 65000.00，卖一 65000.01）
+std::string binanceTop(std::uint64_t last_update_id) {
+    return binanceDepth(last_update_id, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}});
+}
+
 std::string okxBooks5(const Levels& bids, const Levels& asks, std::int64_t ts_ms) {
     return R"({"arg":{"channel":"books5","instId":"BTC-USDT"},"data":[{"asks":)" + levelsJson(asks, true) +
            R"(,"bids":)" + levelsJson(bids, true) + R"(,"instId":"BTC-USDT","ts":")" + std::to_string(ts_ms) +
@@ -197,20 +199,17 @@ struct OkxModel {
     std::map<double, std::pair<std::string, std::string>> asks;
 
     void apply(const Levels& b, const Levels& a) {
-        for (const auto& [px, sz] : b) {
-            if (std::stod(sz) == 0.0) {
-                bids.erase(std::stod(px));
-            } else {
-                bids[std::stod(px)] = {px, sz};
+        auto upsert = [](auto& side, const Levels& levels) {
+            for (const auto& [px, sz] : levels) {
+                if (std::stod(sz) == 0.0) {
+                    side.erase(std::stod(px));
+                } else {
+                    side[std::stod(px)] = {px, sz};
+                }
             }
-        }
-        for (const auto& [px, sz] : a) {
-            if (std::stod(sz) == 0.0) {
-                asks.erase(std::stod(px));
-            } else {
-                asks[std::stod(px)] = {px, sz};
-            }
-        }
+        };
+        upsert(bids, b);
+        upsert(asks, a);
     }
 
     std::int32_t checksum() const {
@@ -255,17 +254,13 @@ public:
         };
     }
 
-    std::vector<Event> events() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return events_;
-    }
-
-    bool any(const std::string& part) const {
+    // 第一个包含 part 的事件的时刻（没有时为 0）
+    std::int64_t firstTime(const std::string& part) const {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const Event& e : events_) {
-            if (e.line.find(part) != std::string::npos) return true;
+            if (e.line.find(part) != std::string::npos) return e.time_ns;
         }
-        return false;
+        return 0;
     }
 
     // 事件中是否按顺序（不必相邻）出现这些子串；失败时打印全部事件
@@ -357,6 +352,28 @@ FeedConfig baseConfig(Exchange exchange, MockExchangeServer& server) {
     return c;
 }
 
+// Binance 增量深度：REST 快照也从模拟服务器拉取
+FeedConfig binanceDiffConfig(MockExchangeServer& server) {
+    FeedConfig c = baseConfig(Exchange::BINANCE, server);
+    c.path = kBinanceDiffPath;
+    c.rest_host = "127.0.0.1";
+    c.rest_port = server.portString();
+    c.snapshot_path = kBinanceSnapshotPath;
+    return c;
+}
+
+// 指向一个连不上的本机端口的 OKX 配置（不校验证书，其余为默认值）
+FeedConfig unreachableConfig(unsigned short port) {
+    FeedConfig c;
+    c.exchange = Exchange::OKX;
+    c.name = "OKX";
+    c.host = "127.0.0.1";
+    c.port = std::to_string(port);
+    c.tls_verify = false;
+    c.log_to_stderr = false;
+    return c;
+}
+
 // 消费者：把队列中的快照全部取出并保存（只在测试线程调用）
 struct SnapshotLog {
     std::vector<BookSnapshot> all;
@@ -373,17 +390,31 @@ struct SnapshotLog {
         return n;
     }
 
-    std::vector<std::uint64_t> updateIds() const {
-        std::vector<std::uint64_t> ids;
-        for (const BookSnapshot& s : all) ids.push_back(s.update_id);
-        return ids;
+    std::string updateIds() const {
+        std::string s = "[";
+        for (std::size_t i = 0; i < all.size(); ++i) s += (i ? "," : "") + std::to_string(all[i].update_id);
+        return s + "]";
     }
 };
 
-std::string idsToString(const std::vector<std::uint64_t>& ids) {
-    std::string s = "[";
-    for (std::size_t i = 0; i < ids.size(); ++i) s += (i ? "," : "") + std::to_string(ids[i]);
-    return s + "]";
+// 等待 pred 成立，期间像主线程的刷新循环一样每 10 ms 调用一次 checkHealth（停顿 / 连接超时看门狗照常工作）
+template <class Pred>
+bool waitChecking(MarketDataFeed& feed, Pred&& pred, int timeout_ms) {
+    return waitFor(
+        [&] {
+            feed.checkHealth(hft::nowNs());
+            return pred();
+        },
+        timeout_ms, 10);
+}
+
+// duration_ms 内每 10 ms 调用一次 checkHealth
+void runHealthChecks(MarketDataFeed& feed, int duration_ms) {
+    const std::int64_t t0 = hft::nowNs();
+    while (ms(hft::nowNs() - t0) < duration_ms) {
+        feed.checkHealth(hft::nowNs());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 
 // 记录对象存活期间发往 server 端口的每次 connect()（客户端时刻，按发起顺序）。测试里只有 feed 一个客户端、
@@ -410,6 +441,13 @@ public:
         return ms(g_connect_trace_ns[reqs[k].connection] - g_connect_trace_ns[reqs[k - 1].connection]);
     }
 };
+
+// 让下一次 connect() 停在系统调用之前（套接字已登记、连接尚未发起），直到 g_connect_release
+void parkNextConnect() {
+    g_connect_parked.store(false);
+    g_connect_release.store(false);
+    g_connect_park.store(true);
+}
 
 // 状态观察者：后台线程每 100 µs 采样一次 status()，记录每次变化
 class StatusWatcher {
@@ -439,12 +477,6 @@ public:
         return it == expected.end();
     }
 
-    std::string describe() const {
-        std::string s;
-        for (FeedStatus st : transitions()) s += std::string(s.empty() ? "" : " -> ") + feedStatusName(st);
-        return s;
-    }
-
 private:
     void sample() {
         const FeedStatus s = feed_.status();
@@ -466,21 +498,22 @@ private:
     std::thread thread_;
 };
 
-// 在 127.0.0.1 上监听但从不 accept、且全连接队列已被占满的端口：新的 connect() 会停在 SYN_SENT
-class BlackholeListener {
+// 在 127.0.0.1 上监听、从不 accept 的端口。blackhole：backlog 0 且全连接队列已被占满，新的 connect() 停在
+// SYN_SENT；否则队列足够长，内核替它完成三次握手，connect() 立即成功。
+class Listener {
 public:
-    BlackholeListener() {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    explicit Listener(bool blackhole) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        ok_ = listen_fd_ >= 0 && ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-              ::listen(listen_fd_, 0) == 0;
         socklen_t len = sizeof(addr);
-        ok_ = ok_ && ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+        ok_ = fd_ >= 0 && ::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+              ::listen(fd_, blackhole ? 0 : 64) == 0 &&
+              ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
         port_ = ntohs(addr.sin_port);
-        for (int i = 0; ok_ && i < 4; ++i) {  // 占满队列（backlog 0 时内核允许 1 个已完成连接）
+        if (!blackhole || !ok_) return;
+        for (int i = 0; i < 4; ++i) {  // 占满队列（backlog 0 时内核允许 1 个已完成连接）
             const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             if (fd < 0) break;
             ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
@@ -488,39 +521,12 @@ public:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    ~BlackholeListener() {
+    ~Listener() {
         for (int fd : fillers_) ::close(fd);
-        if (listen_fd_ >= 0) ::close(listen_fd_);
-    }
-    bool ok() const { return ok_; }
-    unsigned short port() const { return port_; }
-    std::string portString() const { return std::to_string(port_); }
-
-private:
-    int listen_fd_ = -1;
-    unsigned short port_ = 0;
-    bool ok_ = false;
-    std::vector<int> fillers_;
-};
-
-// 在 127.0.0.1 上监听、从不 accept 的端口（队列足够长）：内核替它完成三次握手，connect() 立即成功
-class OpenListener {
-public:
-    OpenListener() {
-        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        socklen_t len = sizeof(addr);
-        ok_ = fd_ >= 0 && ::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-              ::listen(fd_, 64) == 0 && ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
-        port_ = ntohs(addr.sin_port);
-    }
-    ~OpenListener() {
         if (fd_ >= 0) ::close(fd_);
     }
-    OpenListener(const OpenListener&) = delete;
-    OpenListener& operator=(const OpenListener&) = delete;
+    Listener(const Listener&) = delete;
+    Listener& operator=(const Listener&) = delete;
     bool ok() const { return ok_; }
     unsigned short port() const { return port_; }
 
@@ -528,6 +534,7 @@ private:
     int fd_ = -1;
     unsigned short port_ = 0;
     bool ok_ = false;
+    std::vector<int> fillers_;
 };
 
 // 作用域内 "dual.test" 解析为 [127.0.0.1:first, 127.0.0.1:second]（见文件开头的 getaddrinfo 替换）
@@ -544,12 +551,31 @@ struct DualHost {
     DualHost& operator=(const DualHost&) = delete;
 };
 
-// 证书 SAN 同时包含 "dual.test" 的模拟服务器选项（tls_verify 照常开启）
-mock_exchange::ServerOptions dualHostServerOptions() {
-    mock_exchange::ServerOptions opt;
-    opt.certificate.dns_names = {"localhost", "dual.test"};
-    return opt;
-}
+// "dual.test" = [黑洞地址, 模拟服务器]；服务器证书的 SAN 同时包含 "dual.test"（tls_verify 照常开启）
+struct BlackholeThenServer {
+    static mock_exchange::ServerOptions options() {
+        mock_exchange::ServerOptions opt;
+        opt.certificate.dns_names = {"localhost", "dual.test"};
+        return opt;
+    }
+
+    MockExchangeServer server{options()};
+    Listener hole{true};
+    DualHost dual{hole.port(), server.port()};
+};
+
+// AF_UNIX 套接字对，析构时关闭（已手动关闭的一端置为 -1）
+struct SocketPair {
+    int fd[2] = {-1, -1};
+    SocketPair() { REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0); }
+    ~SocketPair() {
+        for (int f : fd) {
+            if (f >= 0) ::close(f);
+        }
+    }
+    SocketPair(const SocketPair&) = delete;
+    SocketPair& operator=(const SocketPair&) = delete;
+};
 
 // 脚本：之后只应答心跳——每收到一个 ping 文本帧回一个 pong（pong 为空时不回应），直到客户端断开
 void answerPings(WsSession& ws, const std::string& ping, const std::string& pong) {
@@ -563,6 +589,13 @@ void answerPings(WsSession& ws, const std::string& ping, const std::string& pong
     }
 }
 
+// 第一个会话：三本簿，然后服务器关闭
+void threeBooksThenClose(WsSession& ws) {
+    for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
+    ws.sleepMs(50);
+    ws.close(1001, "going away");
+}
+
 // frames 中等于 text 的帧的到达时刻
 std::vector<std::int64_t> timesOf(const std::vector<std::string>& frames, const std::vector<std::int64_t>& times,
                                   const std::string& text) {
@@ -571,15 +604,6 @@ std::vector<std::int64_t> timesOf(const std::vector<std::string>& frames, const 
         if (frames[i] == text) out.push_back(times[i]);
     }
     return out;
-}
-
-// 主线程的刷新循环：duration_ms 内每 10 ms 调用一次 checkHealth（停顿看门狗照常工作）
-void runHealthChecks(MarketDataFeed& feed, int duration_ms) {
-    const std::int64_t t0 = hft::nowNs();
-    while (ms(hft::nowNs() - t0) < duration_ms) {
-        feed.checkHealth(hft::nowNs());
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
 }
 
 // 检查 feed 宣布的重连等待序列：第 i 次等待 ∈ [0.8, 1.2] x expected[i]（钳制到 max_ms；0 = 立即重连），
@@ -625,19 +649,16 @@ TEST_CASE("feed: backoff delay is min(max, initial * 2^attempt) with +-20% jitte
 }
 
 TEST_CASE("feed: feedStatusName covers every status") {
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Idle)), std::string("IDLE"));
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Connecting)), std::string("CONNECTING"));
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Syncing)), std::string("SYNCING"));
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Live)), std::string("LIVE"));
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Reconnecting)), std::string("RECONNECTING"));
-    CHECK_EQ(std::string(feedStatusName(FeedStatus::Stopped)), std::string("STOPPED"));
+    const std::pair<FeedStatus, const char*> names[] = {
+        {FeedStatus::Idle, "IDLE"}, {FeedStatus::Connecting, "CONNECTING"},     {FeedStatus::Syncing, "SYNCING"},
+        {FeedStatus::Live, "LIVE"}, {FeedStatus::Reconnecting, "RECONNECTING"}, {FeedStatus::Stopped, "STOPPED"}};
+    for (const auto& [status, name] : names) CHECK_EQ(std::string(feedStatusName(status)), std::string(name));
 }
 
 TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, rearm and close semantics") {
     hft::net::SocketRegistry reg;
-    int sv[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    const hft::net::SocketRegistry::Token t = reg.add(sv[0]);
+    SocketPair sv;
+    const hft::net::SocketRegistry::Token t = reg.add(sv.fd[0]);
     REQUIRE(t != 0);
     CHECK_EQ(reg.size(), std::size_t{1});
 
@@ -645,7 +666,7 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
     std::atomic<long> got{-2};
     std::thread reader([&] {
         char c;
-        got.store(::recv(sv[0], &c, 1, 0));
+        got.store(::recv(sv.fd[0], &c, 1, 0));
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const std::int64_t t0 = hft::nowNs();
@@ -658,98 +679,61 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
     CHECK(!reg.kick(hft::net::KickReason::Stall));  // 同一会话不重复踢
 
     // 踢断状态下新登记失败，且该套接字被立即 shutdown
-    int sv2[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
-    CHECK_EQ(reg.add(sv2[0]), hft::net::SocketRegistry::Token{0});
+    SocketPair sv2;
+    CHECK_EQ(reg.add(sv2.fd[0]), hft::net::SocketRegistry::Token{0});
     char c = 0;
-    CHECK_EQ(::recv(sv2[0], &c, 1, 0), static_cast<ssize_t>(0));
+    CHECK_EQ(::recv(sv2.fd[0], &c, 1, 0), static_cast<ssize_t>(0));
 
     // rearm 之后恢复正常
     reg.remove(t);
     CHECK_EQ(reg.size(), std::size_t{0});
     reg.rearm();
     CHECK(!reg.interrupted());
-    int sv3[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv3) == 0);
-    const hft::net::SocketRegistry::Token t3 = reg.add(sv3[0]);
+    SocketPair sv3;
+    const hft::net::SocketRegistry::Token t3 = reg.add(sv3.fd[0]);
     CHECK(t3 != 0);
 
     // close：永久停止，原因为 Stop，rearm 无效
     reg.close();
     CHECK_EQ(static_cast<int>(reg.reason()), static_cast<int>(hft::net::KickReason::Stop));
-    CHECK_EQ(::recv(sv3[0], &c, 1, 0), static_cast<ssize_t>(0));
+    CHECK_EQ(::recv(sv3.fd[0], &c, 1, 0), static_cast<ssize_t>(0));
     reg.rearm();
     CHECK(reg.interrupted());
-    int sv4[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv4) == 0);
-    CHECK_EQ(reg.add(sv4[0]), hft::net::SocketRegistry::Token{0});
+    SocketPair sv4;
+    CHECK_EQ(reg.add(sv4.fd[0]), hft::net::SocketRegistry::Token{0});
     reg.remove(t3);
-    for (int fd : {sv[0], sv[1], sv2[0], sv2[1], sv3[0], sv3[1], sv4[0], sv4[1]}) ::close(fd);
 }
 
 TEST_CASE("registry: kicking after the original fd was closed and its number reused never touches the new socket") {
     // Beast 在收到 close 帧时会在 teardown 中自行关闭套接字；登记表持有 fd 副本，fd 号被复用也不会误踢
     hft::net::SocketRegistry reg;
-    int a[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0);
-    const int old_fd = a[0];
+    SocketPair a;
+    const int old_fd = a.fd[0];
     const hft::net::SocketRegistry::Token t = reg.add(old_fd);
     REQUIRE(t != 0);
     ::close(old_fd);  // 原 fd 被"别人"关闭
-    int b[2];
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, b) == 0);
-    const int reused = b[0] == old_fd ? b[0] : (b[1] == old_fd ? b[1] : -1);
-    CHECK(reused >= 0);  // 内核总是分配最小的空闲 fd 号
+    a.fd[0] = -1;
+    SocketPair b;
+    CHECK(b.fd[0] == old_fd || b.fd[1] == old_fd);  // 内核总是分配最小的空闲 fd 号
     CHECK(reg.kick(hft::net::KickReason::Stall));
     // 新套接字不受影响：仍可双向收发
-    CHECK_EQ(::send(b[0], "x", 1, MSG_NOSIGNAL), static_cast<ssize_t>(1));
+    CHECK_EQ(::send(b.fd[0], "x", 1, MSG_NOSIGNAL), static_cast<ssize_t>(1));
     char c = 0;
-    CHECK_EQ(::recv(b[1], &c, 1, 0), static_cast<ssize_t>(1));
+    CHECK_EQ(::recv(b.fd[1], &c, 1, 0), static_cast<ssize_t>(1));
     CHECK_EQ(c, 'x');
     // 被踢的是旧套接字：对端读到 EOF
-    CHECK_EQ(::recv(a[1], &c, 1, 0), static_cast<ssize_t>(0));
+    CHECK_EQ(::recv(a.fd[1], &c, 1, 0), static_cast<ssize_t>(0));
     reg.remove(t);
-    ::close(a[1]);
-    ::close(b[0]);
-    ::close(b[1]);
-}
-
-TEST_CASE("registry: a blocking TCP connect stuck in SYN_SENT is aborted by kick") {
-    BlackholeListener hole;
-    REQUIRE(hole.ok());
-    hft::net::SocketRegistry reg;
-    boost::asio::io_context ioc;
-    hft::net::tcp::socket sock(ioc);
-    hft::net::SocketRegistration registration;
-    hft::net::Resolver resolver;
-    hft::net::tcp::resolver::results_type endpoints;
-    REQUIRE(!resolver.resolve("127.0.0.1", hole.portString(), endpoints, [] { return false; }));
-    boost::system::error_code ec;
-    std::atomic<bool> done{false};
-    std::thread t([&] {
-        ec = hft::net::connectSocket(sock, endpoints, reg, registration);
-        done.store(true);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    CHECK(!done.load());  // 仍在等待连接完成（没有时限）
-    const std::int64_t t0 = hft::nowNs();
-    reg.kick(hft::net::KickReason::ConnectTimeout);
-    t.join();
-    CHECK_LT(ms(hft::nowNs() - t0), 500.0);
-    CHECK(ec == boost::asio::error::operation_aborted);
-    CHECK(!sock.is_open());
-    CHECK(!registration.attached());
-    CHECK_EQ(reg.size(), std::size_t{0});
 }
 
 TEST_CASE("net: a kick landing between socket registration and connect() still aborts the connect (200 trials)") {
     // Linux 上对尚未发起连接的套接字 shutdown 是空操作：踢断若只靠 shutdown，落在这个窗口里就会丢失，
     // connect 随后在 SYN_SENT 里一直等到内核放弃（约 2 分钟）。每次试验在登记出现的瞬间踢断（close / kick 交替）。
-    BlackholeListener hole;
+    Listener hole(true);
     REQUIRE(hole.ok());
     hft::net::Resolver resolver;
     hft::net::tcp::resolver::results_type endpoints;
-    REQUIRE(!resolver.resolve("127.0.0.1", hole.portString(), endpoints, [] { return false; }));
+    REQUIRE(!resolver.resolve("127.0.0.1", std::to_string(hole.port()), endpoints, [] { return false; }));
     int lost = 0;
     int aborted = 0;
     double worst_ms = 0.0;
@@ -786,9 +770,9 @@ TEST_CASE("net: a kick landing between socket registration and connect() still a
     std::printf("    200 kicks at registration time: %d lost, worst return %.1f ms\n", lost, worst_ms);
 }
 
-TEST_CASE("net: connectSocket gives every address its own deadline, falls through a blackhole and rotates its cursor") {
-    BlackholeListener hole;
-    OpenListener good;
+TEST_CASE("net: connectSocket gives every address its own deadline, falls through a blackhole, rotates its cursor and is aborted by a kick") {
+    Listener hole(true);
+    Listener good(false);
     REQUIRE(hole.ok());
     REQUIRE(good.ok());
     const DualHost dual(hole.port(), good.port());
@@ -798,58 +782,57 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
     REQUIRE_EQ(endpoints.size(), std::size_t{2});
     hft::net::SocketRegistry reg;
     boost::asio::io_context ioc;
-    auto attempt = [&](int timeout_ms, std::size_t& cursor, boost::asio::ip::tcp::endpoint& connected, int& waits,
-                       double& took_ms) {
+    boost::asio::ip::tcp::endpoint connected;
+    double took = 0.0;
+    auto attempt = [&](int timeout_ms, std::size_t& cursor) {
         hft::net::tcp::socket sock(ioc);
         hft::net::SocketRegistration registration;
         hft::net::ConnectOptions opt;
         opt.timeout_ms = timeout_ms;
         opt.cursor = &cursor;
-        waits = 0;
-        opt.on_wait = [&waits] { ++waits; };
         const std::int64_t t0 = hft::nowNs();
-        const boost::system::error_code ec = hft::net::connectSocket(sock, endpoints, reg, registration, &connected, opt);
-        took_ms = ms(hft::nowNs() - t0);
-        CHECK_EQ(registration.attached(), !ec);
+        const boost::system::error_code ec = hft::net::connectSocket(sock, endpoints, reg, registration, opt);
+        took = ms(hft::nowNs() - t0);
+        CHECK_EQ(registration.attached(), !ec);  // 失败时套接字已注销、已关闭
         CHECK_EQ(sock.is_open(), !ec);
+        boost::system::error_code ignored;
+        if (!ec) connected = sock.remote_endpoint(ignored);
         hft::net::closeSocket(sock, registration);
         return ec;
     };
-    boost::asio::ip::tcp::endpoint connected;
-    int waits = 0;
-    double took = 0.0;
     // [黑洞, 好]：第一个地址用满自己的时限 max(1000, 1500 / 2) = 1000 ms，然后连上第二个；游标指向连上的地址
     std::size_t cursor = 0;
-    boost::system::error_code ec = attempt(1500, cursor, connected, waits, took);
+    boost::system::error_code ec = attempt(1500, cursor);
     CHECK(!ec);
     CHECK_EQ(connected.port(), good.port());
     CHECK_EQ(cursor, std::size_t{1});
     CHECK_GE(took, 990.0);
     CHECK_LT(took, 1400.0);
-    CHECK_GE(waits, 10);  // 等待期间每个空闲的轮询片（<= 50 ms）回调一次
     // 游标 = 1：直接从好地址开始，立即连上，游标不变
-    ec = attempt(1500, cursor, connected, waits, took);
+    ec = attempt(1500, cursor);
     CHECK(!ec);
     CHECK_EQ(cursor, std::size_t{1});
     CHECK_LT(took, 200.0);
     // 总时限比单个地址的下限还短：第一个地址用完全部时限，返回 timed_out，游标指向下一个（没来得及试的）地址
     cursor = 0;
-    ec = attempt(300, cursor, connected, waits, took);
+    ec = attempt(300, cursor);
     CHECK(ec == boost::asio::error::timed_out);
     CHECK_EQ(cursor, std::size_t{1});
     CHECK_GE(took, 290.0);
     CHECK_LT(took, 700.0);
-    // 没有时限：游标从 2 % 2 = 0 开始也一样，被踢断时及时返回 operation_aborted，游标指向下一个地址
+    // 没有时限：从 2 % 2 = 0（黑洞）开始，一直停在 SYN_SENT 里，直到 200 ms 后被踢断：及时返回 operation_aborted，
+    // 游标指向下一个地址
     cursor = 2;
     std::thread kicker([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         reg.kick(hft::net::KickReason::ConnectTimeout);
     });
-    ec = attempt(0, cursor, connected, waits, took);
+    ec = attempt(0, cursor);
     kicker.join();
     CHECK(ec == boost::asio::error::operation_aborted);
     CHECK_EQ(cursor, std::size_t{1});
-    CHECK_LT(took, 400.0);
+    CHECK_GE(took, 190.0);  // 踢断之前一直在等
+    CHECK_LT(took, 700.0);  // 踢断之后 500 ms 之内返回
     CHECK_EQ(reg.size(), std::size_t{0});
 }
 
@@ -911,6 +894,44 @@ TEST_CASE("mock: generated certificate verifies for 127.0.0.1 and localhost; the
     CHECK(threw);
 }
 
+TEST_CASE("feed: handler memory recycles blocks per size class and only touches the heap when the class is empty") {
+    using feed_detail::HandlerMemory;
+    HandlerMemory mem;
+    void* a = mem.allocate(100);  // 128 字节级别：新块
+    void* b = mem.allocate(300);  // 512 字节级别：新块
+    CHECK_EQ(mem.heapAllocations(), 2u);
+    mem.deallocate(a, 100);
+    mem.deallocate(b, 300);
+    CHECK(mem.allocate(90) == a);   // 同一级别的空闲块
+    CHECK(mem.allocate(400) == b);
+    void* e = mem.allocate(50);     // 该级别已空：新块
+    CHECK_EQ(mem.heapAllocations(), 3u);
+    mem.deallocate(a, 90);
+    mem.deallocate(b, 400);
+    mem.deallocate(e, 50);
+    // 稳态：反复申请 / 释放同几种大小不再访问全局堆
+    for (int i = 0; i < 1000; ++i) {
+        void* x = mem.allocate(120);
+        void* y = mem.allocate(380);
+        void* z = mem.allocate(64);
+        mem.deallocate(y, 380);
+        mem.deallocate(x, 120);
+        mem.deallocate(z, 64);
+    }
+    CHECK_EQ(mem.heapAllocations(), 3u);
+    // 超过最大级别的请求直接走全局堆，释放时归还（不缓存）
+    constexpr std::size_t kHuge = (HandlerMemory::kMinBlock << (HandlerMemory::kClasses - 1)) + 1;
+    for (int i = 0; i < 2; ++i) mem.deallocate(mem.allocate(kHuge), kHuge);
+    CHECK_EQ(mem.heapAllocations(), 5u);
+    feed_detail::HandlerAllocator<int> alloc(mem);
+    int* p = alloc.allocate(4);
+    p[3] = 7;
+    CHECK_EQ(p[3], 7);
+    alloc.deallocate(p, 4);
+    CHECK_EQ(mem.heapAllocations(), 5u);  // 16 字节来自 128 字节级别的空闲块
+    CHECK(alloc == feed_detail::HandlerAllocator<double>(mem));
+}
+
 // ===========================================================================
 // 协议端到端
 // ===========================================================================
@@ -938,13 +959,8 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         ws.waitUntil([&ws] { return ws.server().httpRequestCount() >= 3; }, 5000);
         ws.send(binanceDiff(151, 160, {}, {{"65102.00", "5.0"}}));
     });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth@100ms";
-    cfg.rest_host = "127.0.0.1";
-    cfg.rest_port = server.portString();
-    cfg.snapshot_path = kBinanceSnapshotPath;
     const ConnectTrace trace(server);
-    FeedRunner runner(cfg);
+    FeedRunner runner(binanceDiffConfig(server));
     SnapshotLog log;
     const bool done = waitFor(
         [&] {
@@ -954,7 +970,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         8000);
     REQUIRE(done);
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
-    CHECK_EQ(idsToString(log.updateIds()), std::string("[110,120,130,0,150,160]"));
+    CHECK_EQ(log.updateIds(), std::string("[110,120,130,0,150,160]"));
     for (std::size_t i = 0; i < log.all.size(); ++i) {
         CHECK_EQ(log.all[i].seq, static_cast<std::uint64_t>(i + 1));
         CHECK_EQ(log.all[i].venue, 3u);
@@ -1000,7 +1016,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     CHECK_EQ(s.reconnects, 0u);
     CHECK_EQ(s.connect_failures, 0u);
     CHECK(contains(runner.feed.lastError(), "gap"));
-    CHECK_EQ(server.wsTargets(), std::vector<std::string>{"/ws/btcusdt@depth@100ms"});
+    CHECK_EQ(server.wsTargets(), std::vector<std::string>{kBinanceDiffPath});
     CHECK(server.errors().empty());
 }
 
@@ -1060,7 +1076,7 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
             return !log.all.empty() && log.all.back().update_id == 3001;
         },
         8000));
-    CHECK_EQ(idsToString(log.updateIds()), std::string("[1000,1001,1002,0,2000,0,3000,3001]"));
+    CHECK_EQ(log.updateIds(), std::string("[1000,1001,1002,0,2000,0,3000,3001]"));
     CHECK_EQ(server.framesReceived(0), (std::vector<std::string>{kOkxBooksSub, kOkxBooksUnsub, kOkxBooksSub,
                                                                   kOkxBooksUnsub, kOkxBooksSub}));
     const FeedStats s = runner.feed.stats();
@@ -1108,7 +1124,7 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
                               100 + static_cast<std::uint64_t>(i), base_ts + i));
             if (pongs < ws.countReceived(kBybitPing)) {
                 ++pongs;
-                ws.send(R"({"op":"pong","args":["1700000000000"],"conn_id":"c1"})");
+                ws.send(kBybitPong);
             }
         }
         pongs_sent->store(static_cast<int>(pongs));
@@ -1142,10 +1158,7 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     CHECK_GE(pings, std::size_t{3});
     CHECK_GE(n, 3);  // 数据一直在来（每 10 ms 一条）：心跳由周期规则（每 40 ms）发出，不依赖空闲
     // 心跳不会比间隔更频繁：会话开始（"connected" 日志）之后的窗口内最多 window / 40 ms 个
-    std::int64_t connected_ns = 0;
-    for (const EventLog::Event& e : events.events()) {
-        if (connected_ns == 0 && contains(e.line, "[Bybit] connected to")) connected_ns = e.time_ns;
-    }
+    const std::int64_t connected_ns = events.firstTime("[Bybit] connected to");
     REQUIRE(connected_ns != 0);
     CHECK_LE(static_cast<double>(pings), ms(window_end_ns - connected_ns) / 40.0 + 1.0);
     const BookSnapshot& last = log.all.back();
@@ -1166,211 +1179,6 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     CHECK(server.errors().empty());
 }
 
-// ---------------------------------------------------------------------------
-// 心跳：安静的连接也按空闲时间发心跳；回应刷新停顿看门狗；没有回应时看门狗照常踢断
-// ---------------------------------------------------------------------------
-
-// 一个快照之后只有心跳往来的会话：idle_ping = min(适配器默认 20000, stall 600 / 2) = 300 ms，
-// 运行 5 个空闲间隔：心跳按空闲时间发出、回应让看门狗不动手
-void checkIdleAppKeepalive(Exchange exchange, const std::string& ping, const std::string& pong,
-                           const std::function<void(WsSession&)>& start) {
-    MockExchangeServer server;
-    server.setWebSocketScript([start, ping, pong](WsSession& ws) {
-        start(ws);
-        answerPings(ws, ping, pong);
-    });
-    FeedConfig cfg = baseConfig(exchange, server);
-    cfg.ping_interval_ms = -1;  // 适配器默认间隔（20 s）
-    cfg.stall_timeout_ms = 600;
-    FeedRunner runner(cfg);
-    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
-    runHealthChecks(runner.feed, 1500);
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.stalls, 0u);
-    CHECK_EQ(s.reconnects, 0u);
-    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
-    CHECK_GE(s.pings, 3u);
-    CHECK_EQ(s.pongs, 0u);  // 应用层 pong 是普通消息
-    const std::vector<std::string> frames = server.framesReceived(0);
-    const std::vector<std::int64_t> pings = timesOf(frames, server.frameTimesNs(0), ping);
-    REQUIRE(pings.size() >= 3);
-    REQUIRE(!frames.empty());
-    // 第一个心跳在快照之后空闲约 300 ms 才发出；之后每个间隔都 >= 300 ms（回应刷新了空闲计时）
-    CHECK_GE(ms(pings[0] - server.frameTimesNs(0)[0]), 280.0);
-    for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);
-    CHECK_LE(pings.size(), std::size_t{6});
-    CHECK(waitFor([&] { return runner.feed.stats().messages >= 1 + pings.size(); }, 1000));  // 快照 + 每个 pong
-    CHECK(server.errors().empty());
-}
-
-TEST_CASE("feed: an idle OKX books5 session pings on idle time (\"ping\" -> \"pong\"): no stall, no reconnect") {
-    checkIdleAppKeepalive(Exchange::OKX, "ping", "pong", [](WsSession& ws) {
-        ws.expectText(kOkxBooks5Sub);
-        ws.send(simpleBook(0));  // 之后市场安静：books5 只在前 5 档变化时推送
-    });
-}
-
-TEST_CASE("feed: an idle Bybit session pings on idle time ({\"op\":\"ping\"} -> pong): no stall, no reconnect") {
-    checkIdleAppKeepalive(Exchange::BYBIT, kBybitPing, R"({"op":"pong","args":["1700000000000"],"conn_id":"c1"})",
-                          [](WsSession& ws) {
-                              ws.expectText(kBybitSub);
-                              ws.send(bybitBook("snapshot", {{"65000.0", "1"}}, {{"65000.5", "2"}}, 100, 1700000000000));
-                          });
-}
-
-TEST_CASE("feed: a silent Binance stream gets WebSocket ping frames; the server's pongs keep it up") {
-    MockExchangeServer server;
-    server.setWebSocketScript([](WsSession& ws) {
-        ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));  // 之后静默（Beast 自动应答 ping）
-    });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth20@100ms";
-    cfg.ping_interval_ms = -1;  // Binance 没有应用层心跳：空闲 stall / 2 = 300 ms 发 WebSocket ping
-    cfg.stall_timeout_ms = 600;
-    FeedRunner runner(cfg);
-    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
-    runHealthChecks(runner.feed, 1500);
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.stalls, 0u);
-    CHECK_EQ(s.reconnects, 0u);
-    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
-    CHECK_GE(s.pings, 3u);
-    CHECK_GE(s.pongs + 1, s.pings);  // 最后一个 pong 可能还在路上
-    CHECK_EQ(s.messages, 1u);        // 控制帧不算消息
-    CHECK(server.framesReceived(0).empty());  // 没有发任何文本帧
-    const std::vector<std::int64_t> pings = server.pingTimesNs(0);
-    CHECK_GE(pings.size(), std::size_t{3});
-    for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);
-    CHECK(server.errors().empty());
-}
-
-TEST_CASE("feed: a server that never answers pings is still kicked by the stall watchdog (app-level and WebSocket)") {
-    {  // OKX：收到 "ping" 但从不回 "pong"
-        MockExchangeServer server;
-        server.setWebSocketScripts({
-            [](WsSession& ws) {
-                ws.expectText(kOkxBooks5Sub);
-                ws.send(simpleBook(0));
-                answerPings(ws, "ping", std::string());
-            },
-            [](WsSession& ws) { ws.send(simpleBook(1)); },
-        });
-        FeedConfig cfg = baseConfig(Exchange::OKX, server);
-        cfg.ping_interval_ms = -1;
-        cfg.stall_timeout_ms = 600;
-        FeedRunner runner(cfg);
-        REQUIRE(waitFor(
-            [&] {
-                runner.feed.checkHealth(hft::nowNs());
-                return runner.feed.stats().stalls >= 1 && server.wsSessionCount() >= 2;
-            },
-            5000, 10));
-        CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 600 ms during read"));
-        const std::vector<std::string> frames = server.framesReceived(0);
-        CHECK_GE(std::count(frames.begin(), frames.end(), std::string("ping")), 1);  // 心跳确实发了
-    }
-    {  // Binance：服务器卡住（不运行 io_context，不应答 WebSocket ping）
-        MockExchangeServer server;
-        server.setWebSocketScripts({
-            [](WsSession& ws) {
-                ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));
-                ws.freezeMs(3000);
-            },
-            [](WsSession& ws) { ws.send(binanceDepth(1001, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}})); },
-        });
-        FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-        cfg.path = "/ws/btcusdt@depth20@100ms";
-        cfg.ping_interval_ms = -1;
-        cfg.stall_timeout_ms = 600;
-        FeedRunner runner(cfg);
-        REQUIRE(waitFor(
-            [&] {
-                runner.feed.checkHealth(hft::nowNs());
-                return runner.feed.stats().stalls >= 1 && server.wsSessionCount() >= 2;
-            },
-            5000, 10));
-        CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 600 ms during read"));
-        const FeedStats s = runner.feed.stats();
-        CHECK_GE(s.pings, 1u);
-        CHECK_EQ(s.pongs, 0u);
-    }
-}
-
-TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as healthy and resets the backoff") {
-    MockExchangeServer server;
-    // 连接 0..2 失败；3 = 安静的会话：一条 depth20 推送，之后约 600 ms 只有 WebSocket ping/pong，然后服务器关闭；
-    // 4 及以后失败
-    server.setAcceptHandler([](std::size_t i) { return i == 3 ? AcceptAction::Serve : AcceptAction::CloseImmediately; });
-    server.setWebSocketScript([](WsSession& ws) {
-        ws.send(binanceDepth(1000, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}}));
-        ws.sleepMs(600);  // 期间 Beast 自动应答客户端的 ping
-        ws.close();
-    });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth20@100ms";
-    cfg.ping_interval_ms = -1;  // WebSocket ping：空闲 100 ms 就发
-    cfg.stall_timeout_ms = 200;
-    cfg.healthy_session_ms = 300;
-    cfg.reconnect_initial_ms = 30;
-    cfg.reconnect_max_ms = 4000;
-    EventLog events;
-    FeedRunner runner(cfg, events.callback());
-    REQUIRE(waitFor(
-        [&] {
-            runner.feed.checkHealth(hft::nowNs());
-            return server.acceptCount() >= 5;
-        },
-        10000, 10));
-    runner.stop();
-    // 失败 0,1,2：30, 60, 120；安静但健康的会话 3 之后重置：30（不重置则为 240）
-    checkAnnouncedBackoff(events, server, {30, 60, 120, 30}, 4000);
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.stalls, 0u);
-    CHECK_GE(s.pongs, 3u);
-    CHECK(server.errors().empty());
-}
-
-TEST_CASE("feed: handler memory reuses the smallest fitting block and only touches the heap when the cache misses") {
-    feed_detail::HandlerMemory mem;
-    void* a = mem.allocate(100);   // 新块：128
-    void* b = mem.allocate(300);   // 新块：384
-    CHECK_EQ(mem.heapAllocations(), 2u);
-    mem.deallocate(a);
-    mem.deallocate(b);
-    void* c = mem.allocate(90);    // 最小的够用块：a
-    CHECK(c == a);
-    void* d = mem.allocate(200);   // b
-    CHECK(d == b);
-    void* e = mem.allocate(50);    // 缓存已空：新块
-    CHECK_EQ(mem.heapAllocations(), 3u);
-    mem.deallocate(c);
-    mem.deallocate(d);
-    mem.deallocate(e);
-    // 稳态：反复申请 / 释放同几种大小不再访问全局堆
-    for (int i = 0; i < 1000; ++i) {
-        void* x = mem.allocate(120);
-        void* y = mem.allocate(380);
-        void* z = mem.allocate(64);
-        mem.deallocate(y);
-        mem.deallocate(x);
-        mem.deallocate(z);
-    }
-    CHECK_EQ(mem.heapAllocations(), 3u);
-    // 缓存满（8 块）时再释放：留下较大的块
-    std::vector<void*> blocks;
-    for (std::size_t i = 0; i < feed_detail::HandlerMemory::kSlots + 1; ++i) blocks.push_back(mem.allocate(1000));
-    for (void* p : blocks) mem.deallocate(p);
-    void* big = mem.allocate(1000);  // 不需要新块
-    CHECK_EQ(mem.heapAllocations(), 3u + feed_detail::HandlerMemory::kSlots + 1);
-    mem.deallocate(big);
-    feed_detail::HandlerAllocator<int> alloc(mem);
-    int* p = alloc.allocate(4);
-    p[3] = 7;
-    CHECK_EQ(p[3], 7);
-    alloc.deallocate(p, 4);
-    CHECK(alloc == feed_detail::HandlerAllocator<double>(mem));
-}
-
 TEST_CASE("feed: Binance depth20 partial book stream goes LIVE on the first message (no REST)") {
     MockExchangeServer server;
     server.setWebSocketScript([](WsSession& ws) {
@@ -1380,15 +1188,150 @@ TEST_CASE("feed: Binance depth20 partial book stream goes LIVE on the first mess
         }
     });
     FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth20@100ms";
+    cfg.path = kBinanceDepth20Path;
     FeedRunner runner(cfg);
     SnapshotLog log;
     REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() >= 5; }, 5000));
-    CHECK_EQ(idsToString(log.updateIds()), std::string("[1000,1001,1002,1003,1004]"));
+    CHECK_EQ(log.updateIds(), std::string("[1000,1001,1002,1003,1004]"));
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
     CHECK_EQ(server.httpRequestCount(), std::size_t{0});
     CHECK_EQ(log.all[0].exchange_ts_ms, std::int64_t{0});  // depth20 推送没有时间戳
     CHECK_EQ(runner.feed.getExchangeLatency().count(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// 心跳：安静的连接也按空闲时间发心跳；回应刷新停顿看门狗；没有回应时看门狗照常踢断
+// ---------------------------------------------------------------------------
+
+TEST_CASE("feed: an idle session pings on idle time (OKX \"ping\", Bybit {\"op\":\"ping\"}, Binance WebSocket ping); answers keep it up") {
+    // 一个快照之后只有心跳往来的会话：idle_ping = min(适配器默认间隔, stall 600 / 2) = 300 ms，运行 5 个空闲间隔：
+    // 心跳按空闲时间发出、回应让看门狗不动手。OKX / Bybit 的应用层心跳由脚本回应；Binance 没有应用层心跳，
+    // 发 WebSocket ping 控制帧，由服务器端的 Beast 自动应答
+    struct Case {
+        Exchange exchange;
+        std::string ping, pong;  // 应用层心跳与回应；"" = WebSocket ping
+        std::function<void(WsSession&)> start;
+    };
+    const Case cases[] = {
+        {Exchange::OKX, "ping", "pong",
+         [](WsSession& ws) {
+             ws.expectText(kOkxBooks5Sub);
+             ws.send(simpleBook(0));  // 之后市场安静：books5 只在前 5 档变化时推送
+         }},
+        {Exchange::BYBIT, kBybitPing, kBybitPong,
+         [](WsSession& ws) {
+             ws.expectText(kBybitSub);
+             ws.send(bybitBook("snapshot", {{"65000.0", "1"}}, {{"65000.5", "2"}}, 100, 1700000000000));
+         }},
+        {Exchange::BINANCE, "", "", [](WsSession& ws) { ws.send(binanceTop(1000)); }},
+    };
+    for (const Case& k : cases) {
+        MockExchangeServer server;
+        server.setWebSocketScript([k](WsSession& ws) {  // 按值捕获：脚本线程可能比本次循环活得久
+            k.start(ws);
+            if (!k.ping.empty()) answerPings(ws, k.ping, k.pong);
+        });
+        FeedConfig cfg = baseConfig(k.exchange, server);
+        if (k.exchange == Exchange::BINANCE) cfg.path = kBinanceDepth20Path;
+        cfg.ping_interval_ms = -1;  // 适配器默认间隔（OKX/Bybit 20 s；Binance 没有，空闲 stall / 2 才发）
+        cfg.stall_timeout_ms = 600;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
+        runHealthChecks(runner.feed, 1500);
+        const FeedStats s = runner.feed.stats();
+        CHECK_EQ(s.stalls, 0u);
+        CHECK_EQ(s.reconnects, 0u);
+        CHECK_EQ(runner.feed.status(), FeedStatus::Live);
+        CHECK_GE(s.pings, 3u);
+        const std::vector<std::string> frames = server.framesReceived(0);
+        std::vector<std::int64_t> pings;
+        if (k.ping.empty()) {
+            CHECK_GE(s.pongs + 1, s.pings);  // 最后一个 pong 可能还在路上
+            CHECK_EQ(s.messages, 1u);        // 控制帧不算消息
+            CHECK(frames.empty());           // 没有发任何文本帧
+            pings = server.pingTimesNs(0);
+        } else {
+            CHECK_EQ(s.pongs, 0u);  // 应用层 pong 是普通消息
+            pings = timesOf(frames, server.frameTimesNs(0), k.ping);
+            REQUIRE(pings.size() >= 3);
+            REQUIRE(!frames.empty());
+            CHECK_GE(ms(pings[0] - server.frameTimesNs(0)[0]), 280.0);  // 第一个心跳在快照之后空闲约 300 ms 才发出
+            CHECK_LE(pings.size(), std::size_t{6});
+            CHECK(waitFor([&] { return runner.feed.stats().messages >= 1 + pings.size(); }, 1000));  // 快照 + 每个 pong
+        }
+        CHECK_GE(pings.size(), std::size_t{3});
+        for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);  // 回应刷新了空闲计时
+        CHECK(server.errors().empty());
+    }
+}
+
+TEST_CASE("feed: a server that never answers pings is still kicked by the stall watchdog (app-level and WebSocket)") {
+    for (const bool app_level : {true, false}) {
+        MockExchangeServer server;
+        if (app_level) {  // OKX：收到 "ping" 但从不回 "pong"
+            server.setWebSocketScripts({
+                [](WsSession& ws) {
+                    ws.expectText(kOkxBooks5Sub);
+                    ws.send(simpleBook(0));
+                    answerPings(ws, "ping", std::string());
+                },
+                [](WsSession& ws) { ws.send(simpleBook(1)); },
+            });
+        } else {  // Binance：服务器卡住（不运行 io_context，不应答 WebSocket ping）
+            server.setWebSocketScripts({
+                [](WsSession& ws) {
+                    ws.send(binanceTop(1000));
+                    ws.freezeMs(3000);
+                },
+                [](WsSession& ws) { ws.send(binanceTop(1001)); },
+            });
+        }
+        FeedConfig cfg = baseConfig(app_level ? Exchange::OKX : Exchange::BINANCE, server);
+        if (!app_level) cfg.path = kBinanceDepth20Path;
+        cfg.ping_interval_ms = -1;
+        cfg.stall_timeout_ms = 600;
+        FeedRunner runner(cfg);
+        REQUIRE(waitChecking(
+            runner.feed, [&] { return runner.feed.stats().stalls >= 1 && server.wsSessionCount() >= 2; }, 5000));
+        CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 600 ms during read"));
+        const FeedStats s = runner.feed.stats();
+        CHECK_GE(s.pings, 1u);
+        if (app_level) {
+            const std::vector<std::string> frames = server.framesReceived(0);
+            CHECK_GE(std::count(frames.begin(), frames.end(), std::string("ping")), 1);  // 心跳确实发了
+        } else {
+            CHECK_EQ(s.pongs, 0u);
+        }
+    }
+}
+
+TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as healthy and resets the backoff") {
+    MockExchangeServer server;
+    // 连接 0..2 失败；3 = 安静的会话：一条 depth20 推送，之后约 600 ms 只有 WebSocket ping/pong，然后服务器关闭；
+    // 4 及以后失败
+    server.setAcceptHandler([](std::size_t i) { return i == 3 ? AcceptAction::Serve : AcceptAction::CloseImmediately; });
+    server.setWebSocketScript([](WsSession& ws) {
+        ws.send(binanceTop(1000));
+        ws.sleepMs(600);  // 期间 Beast 自动应答客户端的 ping
+        ws.close();
+    });
+    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
+    cfg.path = kBinanceDepth20Path;
+    cfg.ping_interval_ms = -1;  // WebSocket ping：空闲 100 ms 就发
+    cfg.stall_timeout_ms = 200;
+    cfg.healthy_session_ms = 300;
+    cfg.reconnect_initial_ms = 30;
+    cfg.reconnect_max_ms = 4000;
+    EventLog events;
+    FeedRunner runner(cfg, events.callback());
+    REQUIRE(waitChecking(runner.feed, [&] { return server.acceptCount() >= 5; }, 10000));
+    runner.stop();
+    // 失败 0,1,2：30, 60, 120；安静但健康的会话 3 之后重置：30（不重置则为 240）
+    checkAnnouncedBackoff(events, server, {30, 60, 120, 30}, 4000);
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.stalls, 0u);
+    CHECK_GE(s.pongs, 3u);
+    CHECK(server.errors().empty());
 }
 
 // ===========================================================================
@@ -1426,9 +1369,10 @@ TEST_CASE("feed: server closes the WebSocket -> RECONNECTING, backoff, reconnect
             5000));
         watcher.stopWatching();
         // 每次状态变化都有对应的日志事件：按顺序检查（采样式的 StatusWatcher 可能错过很短的状态）
-        CHECK(events.inOrder({"[OKX] connecting to", "[OKX] connected to", "[OKX] book synced (LIVE)",
+        const std::string connected = "[OKX] connected to wss://127.0.0.1:" + server.portString() + "/ws";
+        CHECK(events.inOrder({"[OKX] connecting to", connected.c_str(), "[OKX] book synced (LIVE)",
                               graceful ? "[OKX] server closed the WebSocket" : "[OKX] connection lost",
-                              "[OKX] reconnecting in ", "[OKX] connecting to", "[OKX] connected to",
+                              "[OKX] reconnecting in ", "[OKX] connecting to", connected.c_str(),
                               "[OKX] book synced (LIVE)"}));
         // 采样只做"至少看到"的弱检查：断线后的 RECONNECTING（持续约 100 ms 退避）
         CHECK(watcher.sawInOrder({FeedStatus::Reconnecting, FeedStatus::Live}));
@@ -1459,9 +1403,6 @@ TEST_CASE("feed: server closes the WebSocket -> RECONNECTING, backoff, reconnect
         } else {
             CHECK(contains(err, "connection lost"));
         }
-        CHECK(events.any("[OKX] connected to wss://127.0.0.1:" + server.portString() + "/ws"));
-        CHECK(events.any(graceful ? "[OKX] server closed the WebSocket" : "[OKX] connection lost"));
-        CHECK(events.any("[OKX] book synced (LIVE)"));
         CHECK(server.errors().empty());
     }
 }
@@ -1482,13 +1423,13 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
     EventLog events;
     FeedRunner runner(cfg, events.callback());
     SnapshotLog log;
-    REQUIRE(waitFor(
+    REQUIRE(waitChecking(
+        runner.feed,
         [&] {
-            runner.feed.checkHealth(hft::nowNs());  // 模拟主线程每次刷新调用
             log.pump(runner.feed);
             return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live && log.all.size() >= 3;
         },
-        5000, 10));
+        5000));
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.stalls, 1u);
     CHECK_EQ(s.reconnects, 1u);
@@ -1497,43 +1438,34 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);  // 第一个会话的快照确实收到了（停顿计时从它开始）
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
     // 客户端时间线：连接日志 -> 快照（之后静默）-> 至少 300 ms 后踢断
-    std::int64_t connected_ns = 0, stalled_ns = 0;
-    for (const EventLog::Event& e : events.events()) {
-        if (connected_ns == 0 && contains(e.line, "[OKX] connected to")) connected_ns = e.time_ns;
-        if (stalled_ns == 0 && contains(e.line, "[OKX] stalled")) stalled_ns = e.time_ns;
-    }
+    const std::int64_t connected_ns = events.firstTime("[OKX] connected to");
+    const std::int64_t stalled_ns = events.firstTime("[OKX] stalled");
     REQUIRE(connected_ns != 0);
     REQUIRE(stalled_ns != 0);
     CHECK_GE(ms(stalled_ns - connected_ns), 300.0);
     CHECK_LT(ms(stalled_ns - connected_ns), 3000.0);
     // 健康的第二个会话不会被误踢
-    for (int i = 0; i < 40; ++i) {
-        runner.feed.checkHealth(hft::nowNs());
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    runHealthChecks(runner.feed, 400);
     CHECK_EQ(runner.feed.stats().stalls, 1u);
     CHECK(server.errors().empty());
 }
 
-TEST_CASE("feed: stop() while blocked in read returns and run() exits within 500 ms") {
-    MockExchangeServer server;
-    server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });  // 之后静默
-    FeedRunner runner(baseConfig(Exchange::OKX, server));
-    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 确保阻塞在 ws.read 中
-    CHECK(runner.feed.isRunning());
-    const double elapsed = runner.stop();
-    CHECK_LT(elapsed, 500.0);
-    CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
-    CHECK(!runner.feed.isRunning());
-    CHECK(waitFor([&] { return server.openConnections() == 0; }, 2000));  // 服务器看到连接关闭
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.connected_since_ns, std::int64_t{0});
-    CHECK_EQ(s.connect_failures, 0u);
-    CHECK_EQ(runner.feed.lastError(), std::string());  // 主动停止不是错误
-}
-
-TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS handshake, REST request, before run)") {
+TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TLS handshake, REST request, before run)") {
+    {  // 阻塞在读中：run() 在 500 ms 内退出，服务器看到连接关闭；主动停止不是错误
+        MockExchangeServer server;
+        server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });  // 之后静默
+        FeedRunner runner(baseConfig(Exchange::OKX, server));
+        REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 确保阻塞在读中
+        CHECK_EQ(runner.feed.status(), FeedStatus::Live);
+        CHECK_LT(runner.stop(), 500.0);
+        CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
+        CHECK(waitFor([&] { return server.openConnections() == 0; }, 2000));
+        const FeedStats s = runner.feed.stats();
+        CHECK_EQ(s.connected_since_ns, std::int64_t{0});
+        CHECK_EQ(s.connect_failures, 0u);
+        CHECK_EQ(runner.feed.lastError(), std::string());
+    }
     {  // 退避等待中
         MockExchangeServer server;
         server.setAcceptHandler([](std::size_t) { return AcceptAction::CloseImmediately; });
@@ -1547,20 +1479,15 @@ TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS hand
         CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
         CHECK_EQ(runner.feed.stats().connect_failures, 1u);
     }
-    {  // 阻塞在 TCP connect（SYN_SENT）中
-        BlackholeListener hole;
+    {  // 阻塞在 TCP connect（SYN_SENT）中：在一个轮询片之内返回
+        Listener hole(true);
         REQUIRE(hole.ok());
-        FeedConfig cfg;
-        cfg.exchange = Exchange::OKX;
-        cfg.name = "OKX";
-        cfg.host = "127.0.0.1";
-        cfg.port = hole.portString();
-        cfg.log_to_stderr = false;
-        FeedRunner runner(cfg);
+        FeedRunner runner(unreachableConfig(hole.port()));
         REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Connecting; }, 2000));
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
-        CHECK_LT(runner.stop(), 500.0);
+        CHECK_LT(runner.stop(), 200.0);
+        CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);  // 主动停止不计为连接失败
     }
     {  // TCP 已连接，服务器不做 TLS 握手
@@ -1576,11 +1503,7 @@ TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS hand
         MockExchangeServer server;
         server.setHttpHandler([](const HttpRequestInfo&) { return HttpReply{200, "{}", "application/json", 10000}; });
         server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(1, 2, {{"1.00", "1"}}, {})); });
-        FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-        cfg.rest_host = "127.0.0.1";
-        cfg.rest_port = server.portString();
-        cfg.snapshot_path = kBinanceSnapshotPath;
-        FeedRunner runner(cfg);
+        FeedRunner runner(binanceDiffConfig(server));
         REQUIRE(waitFor([&] { return server.httpRequestCount() == 1; }, 5000));
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         CHECK_EQ(runner.feed.status(), FeedStatus::Syncing);
@@ -1595,7 +1518,6 @@ TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS hand
         cfg.log_to_stderr = false;
         MarketDataFeed feed(cfg);
         CHECK_EQ(feed.status(), FeedStatus::Idle);
-        CHECK(!feed.isRunning());
         feed.stop();
         const std::int64_t t0 = hft::nowNs();
         feed.run();
@@ -1605,47 +1527,28 @@ TEST_CASE("feed: stop() is prompt in every phase (backoff, TCP connect, TLS hand
     }
 }
 
-TEST_CASE("feed: stop() during a blackholed TCP connect returns within 200 ms, also when it lands before connect() starts") {
-    BlackholeListener hole;
+TEST_CASE("feed: stop() or a connect timeout landing before connect() starts still ends the attempt within 200 ms") {
+    // feed 线程停在 connect() 系统调用之前（套接字已登记）：此刻的 shutdown 对套接字是空操作
+    Listener hole(true);
     REQUIRE(hole.ok());
-    FeedConfig cfg;
-    cfg.exchange = Exchange::OKX;
-    cfg.name = "OKX";
-    cfg.host = "127.0.0.1";
-    cfg.port = hole.portString();
-    cfg.tls_verify = false;
-    cfg.log_to_stderr = false;
-    {  // 已在 SYN_SENT 中
-        FeedRunner runner(cfg);
-        REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Connecting; }, 2000));
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
-        CHECK_LT(runner.stop(), 200.0);
-        CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
-    }
-    {  // feed 线程停在 connect() 系统调用之前（套接字已登记）：此刻的 shutdown 对套接字是空操作
-        g_connect_parked.store(false);
-        g_connect_release.store(false);
-        g_connect_park.store(true);
-        FeedRunner runner(cfg);
+    {  // stop()
+        parkNextConnect();
+        FeedRunner runner(unreachableConfig(hole.port()));
         REQUIRE(waitFor([] { return g_connect_parked.load(); }, 2000));
         const std::int64_t t0 = hft::nowNs();
         runner.feed.stop();
         g_connect_release.store(true);
-        const bool stopped = waitFor([&] { return runner.feed.status() == FeedStatus::Stopped; }, 1000);
-        CHECK(stopped);
+        CHECK(waitFor([&] { return runner.feed.status() == FeedStatus::Stopped; }, 1000));
         CHECK_LT(ms(hft::nowNs() - t0), 200.0);
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);
     }
-    {  // 连接超时的踢断落在同一个窗口里：这次尝试仍在约一个轮询片内结束（而不是等内核放弃 SYN 重传）
-        FeedConfig c = cfg;
-        c.connect_timeout_ms = 300;
-        c.reconnect_initial_ms = 5000;
-        c.reconnect_max_ms = 5000;
-        g_connect_parked.store(false);
-        g_connect_release.store(false);
-        g_connect_park.store(true);
-        FeedRunner runner(c);
+    {  // 连接超时的踢断：这次尝试仍在约一个轮询片内结束（而不是等内核放弃 SYN 重传）
+        FeedConfig cfg = unreachableConfig(hole.port());
+        cfg.connect_timeout_ms = 300;
+        cfg.reconnect_initial_ms = 5000;
+        cfg.reconnect_max_ms = 5000;
+        parkNextConnect();
+        FeedRunner runner(cfg);
         REQUIRE(waitFor([] { return g_connect_parked.load(); }, 2000));
         const std::int64_t t0 = hft::nowNs();
         runner.feed.checkHealth(hft::nowNs() + std::int64_t{10} * 1000000000);  // 连接时限早已过去
@@ -1661,71 +1564,56 @@ TEST_CASE("feed: stop() during a blackholed TCP connect returns within 200 ms, a
 }
 
 TEST_CASE("feed: a blackholed first address falls through to the next one within connect_timeout_ms (WebSocket host)") {
-    MockExchangeServer server(dualHostServerOptions());
-    server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });
-    BlackholeListener hole;
-    REQUIRE(hole.ok());
-    const DualHost dual(hole.port(), server.port());
-    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    BlackholeThenServer env;
+    REQUIRE(env.hole.ok());
+    env.server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });
+    FeedConfig cfg = baseConfig(Exchange::OKX, env.server);
     cfg.host = "dual.test";
     cfg.connect_timeout_ms = 2000;  // 每个地址 max(1000, 2000 / 2) = 1000 ms
     FeedRunner runner(cfg);
     const std::int64_t t0 = hft::nowNs();
-    REQUIRE(waitFor(
-        [&] {
-            runner.feed.checkHealth(hft::nowNs());  // 模拟主线程每次刷新调用
-            return runner.feed.status() == FeedStatus::Live;
-        },
-        5000, 10));
+    REQUIRE(waitChecking(runner.feed, [&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
     const double took = ms(hft::nowNs() - t0);
     CHECK_GE(took, 990.0);   // 黑洞地址用满了自己的时限
     CHECK_LT(took, 2000.0);  // 同一个会话、在总时限之内换到了第二个地址
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.connect_failures, 0u);
     CHECK_EQ(s.reconnects, 0u);
-    CHECK_EQ(server.acceptCount(), std::size_t{1});
-    CHECK(server.errors().empty());
+    CHECK_EQ(env.server.acceptCount(), std::size_t{1});
+    CHECK(env.server.errors().empty());
 }
 
 TEST_CASE("feed: a blackholed first REST address falls through to the next one before the stall watchdog fires") {
-    MockExchangeServer server(dualHostServerOptions());
-    server.setHttpHandler([](const HttpRequestInfo&) {
+    BlackholeThenServer env;
+    REQUIRE(env.hole.ok());
+    env.server.setHttpHandler([](const HttpRequestInfo&) {
         return HttpReply{200, binanceDepth(105, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}})};
     });
-    server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {})); });
-    BlackholeListener hole;
-    REQUIRE(hole.ok());
-    const DualHost dual(hole.port(), server.port());
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth@100ms";
+    env.server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {})); });
+    FeedConfig cfg = binanceDiffConfig(env.server);
     cfg.rest_host = "dual.test";
     cfg.rest_port = "443";  // 替换后的解析忽略端口
-    cfg.snapshot_path = kBinanceSnapshotPath;
     cfg.connect_timeout_ms = 2000;  // REST 连接总时限 min(2000, 10000 / 2) = 2000 ms → 每个地址 1000 ms
     FeedRunner runner(cfg);
-    REQUIRE(waitFor(
-        [&] {
-            runner.feed.checkHealth(hft::nowNs());
-            return runner.feed.status() == FeedStatus::Live;
-        },
-        5000, 10));
+    REQUIRE(waitChecking(runner.feed, [&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.rest_snapshots, 1u);
     CHECK_EQ(s.stalls, 0u);
     CHECK_EQ(s.reconnects, 0u);
     CHECK_EQ(s.connect_failures, 0u);
-    const std::vector<HttpRequestInfo> reqs = server.httpRequests();
-    const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
+    const std::vector<HttpRequestInfo> reqs = env.server.httpRequests();
+    const std::vector<std::int64_t> sessions = env.server.wsSessionTimesNs();
     REQUIRE_EQ(reqs.size(), std::size_t{1});
     REQUIRE_EQ(sessions.size(), std::size_t{1});
     CHECK_GE(ms(reqs[0].time_ns - sessions[0]), 990.0);  // 先在黑洞地址上用满 1000 ms
     CHECK_LT(ms(reqs[0].time_ns - sessions[0]), 2000.0);
-    CHECK(server.errors().empty());
+    CHECK(env.server.errors().empty());
 }
 
 TEST_CASE("feed: after a connect timeout on a blackholed address the next session starts at the next address") {
-    MockExchangeServer server(dualHostServerOptions());
-    server.setWebSocketScripts({
+    BlackholeThenServer env;
+    REQUIRE(env.hole.ok());
+    env.server.setWebSocketScripts({
         [](WsSession& ws) {
             ws.send(simpleBook(0));
             ws.sleepMs(50);
@@ -1733,27 +1621,21 @@ TEST_CASE("feed: after a connect timeout on a blackholed address the next sessio
         },
         [](WsSession& ws) { ws.send(simpleBook(1)); },
     });
-    BlackholeListener hole;
-    REQUIRE(hole.ok());
-    const DualHost dual(hole.port(), server.port());
-    FeedConfig cfg = baseConfig(Exchange::OKX, server);
+    FeedConfig cfg = baseConfig(Exchange::OKX, env.server);
     cfg.host = "dual.test";
     cfg.connect_timeout_ms = 400;  // 单个地址的下限 1000 ms 比总时限还长：第一个会话耗在黑洞地址上
     EventLog events;
     FeedRunner runner(cfg, events.callback());
-    REQUIRE(waitFor(
-        [&] {
-            runner.feed.checkHealth(hft::nowNs());
-            return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live;
-        },
-        5000, 10));
+    REQUIRE(waitChecking(
+        runner.feed,
+        [&] { return env.server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live; }, 5000));
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.connect_failures, 1u);  // 只有第一个会话失败；服务器关闭之后的会话仍从连上过的地址开始
     CHECK_EQ(s.reconnects, 2u);
-    CHECK_EQ(server.acceptCount(), std::size_t{2});
+    CHECK_EQ(env.server.acceptCount(), std::size_t{2});
     CHECK(events.inOrder({"[OKX] connect timeout: TCP connect did not complete within 400 ms", "[OKX] connected to",
                           "[OKX] server closed the WebSocket", "[OKX] connected to"}));
-    CHECK(server.errors().empty());
+    CHECK(env.server.errors().empty());
 }
 
 TEST_CASE("feed: wrong CA / untrusted certificate -> connect_failures and a clear lastError, never LIVE") {
@@ -1792,7 +1674,7 @@ TEST_CASE("feed: wrong CA / untrusted certificate -> connect_failures and a clea
     CHECK(!server.tlsFailures().empty());  // 服务器端看到客户端拒绝证书的 alert
 }
 
-TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls_verify=false still connects") {
+TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls_verify=false connects without any CA") {
     mock_exchange::ServerOptions opt;
     opt.certificate.common_name = "example.invalid";
     opt.certificate.dns_names = {"example.invalid"};
@@ -1813,34 +1695,26 @@ TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls
         CHECK_EQ(runner.feed.stats().messages, 0u);
     }
     CHECK_EQ(server.wsSessionCount(), std::size_t{0});
-    {
+    {  // tls_verify=false：不需要任何 CA、也不比对主机名；host = localhost 同时走后台线程的 DNS 解析路径
         FeedConfig cfg = baseConfig(Exchange::OKX, server);
         cfg.tls_verify = false;
         cfg.ca_file.clear();
+        cfg.host = "localhost";
         FeedRunner runner(cfg);
         SnapshotLog log;
         REQUIRE(waitFor([&] { log.pump(runner.feed); return !log.all.empty(); }, 5000));
         CHECK_EQ(runner.feed.status(), FeedStatus::Live);
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);
+        CHECK_EQ(log.all[0].bids[0].price, 65000.0);
+        // 脚本不等订阅帧就推送：服务器线程只在下一次运行 io_context 时才记录客户端的帧，先等它记录下来
+        CHECK(waitFor([&] { return !server.framesReceived(0).empty(); }, 2000));
+        CHECK_EQ(server.framesReceived(0), std::vector<std::string>{kOkxBooks5Sub});
     }
 }
 
-TEST_CASE("feed: tls_verify=false connects to the self-signed server without any CA") {
-    MockExchangeServer server;
-    server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });
-    FeedConfig cfg = baseConfig(Exchange::OKX, server);
-    cfg.tls_verify = false;
-    cfg.ca_file.clear();
-    cfg.host = "localhost";  // 同时走后台线程的 DNS 解析路径
-    FeedRunner runner(cfg);
-    SnapshotLog log;
-    REQUIRE(waitFor([&] { log.pump(runner.feed); return !log.all.empty(); }, 5000));
-    CHECK_EQ(runner.feed.status(), FeedStatus::Live);
-    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
-    // 脚本不等订阅帧就推送：服务器线程只在下一次运行 io_context 时才记录客户端的帧，先等它记录下来
-    CHECK(waitFor([&] { return !server.framesReceived(0).empty(); }, 2000));
-    CHECK_EQ(server.framesReceived(0), std::vector<std::string>{kOkxBooks5Sub});
-}
+// ===========================================================================
+// 快照发布
+// ===========================================================================
 
 TEST_CASE("feed: snapshots arrive through the SPSC queue with increasing seq, sane timestamps and the venue id") {
     MockExchangeServer server;
@@ -1879,12 +1753,10 @@ TEST_CASE("feed: snapshots arrive through the SPSC queue with increasing seq, sa
     CHECK_EQ(s.book_updates, static_cast<std::uint64_t>(kCount));
     CHECK_GT(s.bytes, static_cast<std::uint64_t>(kCount * 100));
     CHECK_GT(s.last_message_ns, s.connected_since_ns);
-    CHECK_EQ(runner.feed.getMessageCount(), kCount);
     CHECK_EQ(runner.feed.getLatencyTracker().count(), static_cast<std::uint64_t>(kCount));
     CHECK_EQ(runner.feed.getExchangeLatency().count(), static_cast<std::uint64_t>(kCount));
     CHECK_LT(runner.feed.getLatencyTracker().maxNs(), static_cast<std::uint64_t>(1000000000));
     CHECK_EQ(runner.feed.venueId(), 7u);
-    CHECK_EQ(runner.feed.exchange(), Exchange::OKX);
     CHECK_EQ(runner.feed.getName(), std::string("OKX"));
 }
 
@@ -1920,45 +1792,9 @@ TEST_CASE("feed: dropped_snapshots counts publishes that found the tiny queue fu
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});
 }
 
-TEST_CASE("feed: the empty book of a disconnect always fits: a full queue keeps its last slot for it") {
-    // 队列容量 2 代表"消费者卡住、1024 个槽位已满"；断线之后交易所长时间不可用（退避 3 s）
-    MockExchangeServer server;
-    server.setWebSocketScripts({
-        [](WsSession& ws) {
-            for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
-            ws.sleepMs(50);
-            ws.close(1001, "going away");
-        },
-        [](WsSession& ws) { ws.send(simpleBook(9)); },
-    });
-    FeedConfig cfg = baseConfig(Exchange::OKX, server);
-    cfg.queue_capacity = 2;
-    cfg.reconnect_initial_ms = 3000;
-    cfg.reconnect_max_ms = 3000;
-    FeedRunner runner(cfg);
-    // 消费者直到断线之后才开始取
-    REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Reconnecting; }, 5000));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.published, 2u);          // 第 1 本簿与断线时的空簿
-    CHECK_EQ(s.dropped_snapshots, 2u);  // 第 2、3 本簿：非空快照不能占用最后一个槽位
-    // 队列里最后一个就是空簿：消费者一腾出位置就不再使用断线前的价格，不必等任何重试
-    SnapshotLog log;
-    log.pump(runner.feed);
-    REQUIRE_EQ(log.all.size(), std::size_t{2});
-    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
-    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
-    CHECK_EQ(log.all[1].seq, 4u);  // 2、3 号（第 2、3 本簿）确实丢了
-    CHECK_LE(log.all[1].publish_ns, log.pop_ns[1]);
-    CHECK_EQ(runner.feed.status(), FeedStatus::Reconnecting);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
-    CHECK_EQ(runner.feed.stats().published, 2u);
-}
-
 namespace {
 
-// 消费者在 feed 线程卡在下一个会话的某个同步步骤里时才腾出队列：它取到的最后一个快照必须是断线时的空簿
+// 消费者在 feed 线程退避或卡在下一个会话的某个同步步骤里时才腾出队列：它取到的最后一个快照必须是断线时的空簿
 //（第 1 本簿、空簿；第 2、3 本簿被丢弃），而且立即就能取到
 void checkDrainEndsWithEmptyBook(MarketDataFeed& feed, const char* phase) {
     SnapshotLog log;
@@ -1966,31 +1802,42 @@ void checkDrainEndsWithEmptyBook(MarketDataFeed& feed, const char* phase) {
     const FeedStats s = feed.stats();
     const char* last = "-";
     if (!log.all.empty()) last = log.all.back().bid_count + log.all.back().ask_count == 0 ? "empty" : "NOT empty";
-    std::printf("    next session stuck in %s: consumer drained %zu snapshot(s), last one %s (published %llu, "
-                "dropped %llu)\n",
+    std::printf("    feed in %s: consumer drained %zu snapshot(s), last one %s (published %llu, dropped %llu)\n",
                 phase, log.all.size(), last, static_cast<unsigned long long>(s.published),
                 static_cast<unsigned long long>(s.dropped_snapshots));
     REQUIRE_EQ(log.all.size(), std::size_t{2});
-    CHECK_GT(log.all[0].bid_count + log.all[0].ask_count, 0u);
+    REQUIRE(log.all[0].bid_count > 0u);
+    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
-    CHECK_EQ(log.all[1].seq, 4u);
+    CHECK_EQ(log.all[1].seq, 4u);  // 2、3 号（第 2、3 本簿）确实丢了
+    CHECK_LE(log.all[1].publish_ns, log.pop_ns[1]);
     CHECK_EQ(s.published, 2u);
-    CHECK_EQ(s.dropped_snapshots, 2u);
-}
-
-// 第一个会话：三本簿，然后服务器关闭
-void threeBooksThenClose(WsSession& ws) {
-    for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
-    ws.sleepMs(50);
-    ws.close(1001, "going away");
+    CHECK_EQ(s.dropped_snapshots, 2u);  // 非空快照不能占用最后一个槽位
 }
 
 }  // namespace
 
-TEST_CASE("feed: a consumer that drains while the next session is stuck (TLS, WebSocket upgrade, REST) gets the empty book") {
-    // 队列容量 2 代表"消费者卡住、队列已满"。之前断线时的空簿没能入队、保持待发布，而 TLS 握手、WebSocket 升级和
-    // 第一个读处理器里的 REST 请求都是同步的、期间没有重试：消费者腾出位置之后仍拿着断线前的价格，直到
-    // connect_timeout_ms（默认 10 s）或停顿看门狗结束那个会话
+TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (TLS, WebSocket upgrade, REST) gets the empty book") {
+    // 队列容量 2 代表"消费者卡住、1024 个槽位已满"。断线时的空簿用掉为它预留的最后一个槽位；TLS 握手、WebSocket
+    // 升级和第一个读处理器里的 REST 请求都是同步的、期间没有重试：空簿要是没能入队，消费者腾出位置之后仍拿着断线前的
+    // 价格，直到 connect_timeout_ms（默认 10 s）或停顿看门狗结束那个会话
+    {  // 退避等待中：交易所长时间不可用（退避 3 s）
+        MockExchangeServer server;
+        server.setWebSocketScripts({threeBooksThenClose, [](WsSession& ws) { ws.send(simpleBook(9)); }});
+        FeedConfig cfg = baseConfig(Exchange::OKX, server);
+        cfg.queue_capacity = 2;
+        cfg.reconnect_initial_ms = 3000;
+        cfg.reconnect_max_ms = 3000;
+        FeedRunner runner(cfg);
+        REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Reconnecting; }, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        checkDrainEndsWithEmptyBook(runner.feed, "the backoff wait");
+        CHECK_EQ(runner.feed.status(), FeedStatus::Reconnecting);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        SnapshotLog more;
+        CHECK_EQ(more.pump(runner.feed), std::size_t{0});  // 只送一次
+        CHECK_EQ(runner.feed.stats().published, 2u);
+    }
     {  // TCP 已连上，服务器不做 TLS 握手
         MockExchangeServer server;
         server.setAcceptHandler([](std::size_t i) { return i == 0 ? AcceptAction::Serve : AcceptAction::Silent; });
@@ -2002,7 +1849,7 @@ TEST_CASE("feed: a consumer that drains while the next session is stuck (TLS, We
         REQUIRE(waitFor([&] { return server.acceptCount() >= 2; }, 5000));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
-        checkDrainEndsWithEmptyBook(runner.feed, "the TLS handshake");
+        checkDrainEndsWithEmptyBook(runner.feed, "the next TLS handshake");
     }
     {  // WebSocket 升级请求迟迟得不到应答
         std::atomic<int> upgrades{0};      // 声明在服务器之前：服务器线程里的过滤器可能用到它们，直到服务器析构
@@ -2026,7 +1873,7 @@ TEST_CASE("feed: a consumer that drains while the next session is stuck (TLS, We
         REQUIRE(waitFor([&] { return upgrades.load() >= 2; }, 5000));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         CHECK_EQ(runner.feed.status(), FeedStatus::Connecting);
-        checkDrainEndsWithEmptyBook(runner.feed, "the WebSocket upgrade");
+        checkDrainEndsWithEmptyBook(runner.feed, "the next WebSocket upgrade");
         release.store(true);
     }
     {  // Binance 增量深度：下一个会话第一条消息触发的 REST 快照请求迟迟得不到应答
@@ -2048,26 +1895,22 @@ TEST_CASE("feed: a consumer that drains while the next session is stuck (TLS, We
             },
             [](WsSession& ws) { ws.send(binanceDiff(201, 210, {{"65000.00", "1.5"}}, {})); },
         });
-        FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-        cfg.path = "/ws/btcusdt@depth@100ms";
-        cfg.rest_host = "127.0.0.1";
-        cfg.rest_port = server.portString();
-        cfg.snapshot_path = kBinanceSnapshotPath;
+        FeedConfig cfg = binanceDiffConfig(server);
         cfg.queue_capacity = 2;
         FeedRunner runner(cfg);
         REQUIRE(waitFor([&] { return server.httpRequestCount() >= 2; }, 5000));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         CHECK_EQ(runner.feed.status(), FeedStatus::Syncing);
         CHECK_EQ(server.wsSessionCount(), std::size_t{2});
-        checkDrainEndsWithEmptyBook(runner.feed, "a REST snapshot request");
+        checkDrainEndsWithEmptyBook(runner.feed, "the next session's REST snapshot request");
     }
 }
 
-TEST_CASE("feed: the publish callback runs on the feed thread right after every successful push, empty books and retries included") {
+TEST_CASE("feed: a pending book is retried once the queue has room; the publish callback runs after every successful push") {
     MockExchangeServer server;
     server.setWebSocketScripts({
         threeBooksThenClose,
-        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静
+        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静：没有新的推送来替换消费者手里的空簿
     });
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
     // 第 2、3 本簿入队失败（非空快照要给空簿留一个槽位），断线时的空簿用掉最后一个；新会话的第一本簿入队失败、
@@ -2088,6 +1931,7 @@ TEST_CASE("feed: the publish callback runs on the feed thread right after every 
         calls->published.push_back(published);
         calls->threads.push_back(std::this_thread::get_id());
     });
+    // 消费者直到新会话 LIVE（其第一本簿因队列满没能入队）之后才开始取
     REQUIRE(waitFor(
         [&] {
             return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live &&
@@ -2101,9 +1945,20 @@ TEST_CASE("feed: the publish callback runs on the feed thread right after every 
         CHECK_EQ(calls->published, (std::vector<std::uint64_t>{1, 2}));    // 计数已包含这一次
     }
     SnapshotLog log;
-    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));  // 重试送达新会话的簿
-    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
+    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));
+    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
+    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);  // 断线时的空簿
+    CHECK_EQ(log.all[1].seq, 4u);
+    // 消费者手里是空簿：新会话没能入队的簿保持待发布，腾出位置之后送达（推送稀少的交易所不会一直显示空簿）
+    REQUIRE_EQ(log.all[2].bid_count, 1u);
     CHECK_EQ(log.all[2].bids[0].price, 65009.0);
+    CHECK_EQ(log.all[2].seq, 5u);
+    CHECK_LT(ms(log.pop_ns[2] - log.all[2].publish_ns), 100.0);  // publish_ns = 真正入队的时刻
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.published, 3u);
+    CHECK_EQ(s.dropped_snapshots, 3u);  // 重试不重复计数
     std::lock_guard<std::mutex> lock(calls->mutex);
     CHECK_EQ(calls->queue_sizes.size(), std::size_t{3});  // 丢弃的 3 次没有回调，重试成功的那次有
     CHECK_EQ(calls->published.back(), 3u);
@@ -2123,39 +1978,6 @@ TEST_CASE("feed: an exception thrown by the publish callback is swallowed and th
     REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 5; }, 5000));
     CHECK_EQ(calls->load(), 5);
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
-}
-
-TEST_CASE("feed: after a disconnect, the next session's book that found the queue full is retried once there is room") {
-    MockExchangeServer server;
-    server.setWebSocketScripts({
-        threeBooksThenClose,
-        [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静：没有新的推送来替换消费者手里的空簿
-    });
-    FeedConfig cfg = baseConfig(Exchange::OKX, server);
-    cfg.queue_capacity = 2;
-    FeedRunner runner(cfg);
-    // 消费者直到新会话 LIVE（其第一本簿因队列满没能入队）之后才开始取
-    REQUIRE(waitFor(
-        [&] {
-            return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live &&
-                   runner.feed.stats().dropped_snapshots == 3;
-        },
-        5000));
-    SnapshotLog log;
-    REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));
-    CHECK_EQ(log.all[0].bids[0].price, 65000.0);
-    CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);  // 断线时的空簿
-    CHECK_EQ(log.all[1].seq, 4u);
-    // 消费者手里是空簿：新会话没能入队的簿保持待发布，腾出位置之后送达（推送稀少的交易所不会一直显示空簿）
-    REQUIRE_EQ(log.all[2].bid_count, 1u);
-    CHECK_EQ(log.all[2].bids[0].price, 65009.0);
-    CHECK_EQ(log.all[2].seq, 5u);
-    CHECK_LT(ms(log.pop_ns[2] - log.all[2].publish_ns), 100.0);  // publish_ns = 真正入队的时刻
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.published, 3u);
-    CHECK_EQ(s.dropped_snapshots, 3u);  // 重试不重复计数
 }
 
 TEST_CASE("feed: a book still pending when its session ends is dropped with it, never delivered after the empty book") {
@@ -2197,6 +2019,10 @@ TEST_CASE("feed: a book still pending when its session ends is dropped with it, 
     CHECK_EQ(runner.feed.stats().published, 2u);
     CHECK_NE(runner.feed.status(), FeedStatus::Live);
 }
+
+// ===========================================================================
+// 退避、重连与 REST 额度
+// ===========================================================================
 
 TEST_CASE("feed: failed attempts back off exponentially (initial, 2x, 4x ... capped at max)") {
     MockExchangeServer server;
@@ -2256,7 +2082,7 @@ TEST_CASE("feed: adapter-requested reconnect (Binance serverShutdown) is immedia
         ws.send(R"({"e":"serverShutdown","E":1700000000000})");
     });
     FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth20@100ms";
+    cfg.path = kBinanceDepth20Path;
     cfg.reconnect_initial_ms = 400;
     cfg.reconnect_max_ms = 400;
     EventLog events;
@@ -2270,45 +2096,6 @@ TEST_CASE("feed: adapter-requested reconnect (Binance serverShutdown) is immedia
     CHECK_EQ(s.connect_failures, 0u);
     CHECK_GE(s.reconnects, 4u);
     CHECK(contains(runner.feed.lastError(), "serverShutdown"));
-}
-
-TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session ends after rest_max_attempts") {
-    MockExchangeServer server;
-    server.setHttpHandler([](const HttpRequestInfo&) {
-        return HttpReply{500, R"({"code":-1001,"msg":"Internal error; unable to process your request."})",
-                         "application/json", 0};
-    });
-    server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(100, 110, {{"65000.00", "1"}}, {})); });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.rest_host = "127.0.0.1";
-    cfg.rest_port = server.portString();
-    cfg.snapshot_path = kBinanceSnapshotPath;
-    cfg.rest_max_attempts = 3;
-    cfg.rest_min_interval_ms = 20;
-    const ConnectTrace trace(server);
-    FeedRunner runner(cfg);
-    REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
-    const std::vector<HttpRequestInfo> reqs = server.httpRequests();
-    REQUIRE(reqs.size() >= 3);
-    CHECK_GE(trace.requestGapMs(reqs, 1), 20 * 0.8 - 2.0);  // 第 1 次重试：20 ms ±20%
-    CHECK_GE(trace.requestGapMs(reqs, 2), 40 * 0.8 - 2.0);  // 连续失败 2 次：间隔加倍，40 ms ±20%
-    // 第一个会话恰好请求了 rest_max_attempts 次就放弃并重连
-    const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
-    REQUIRE(sessions.size() >= 2);
-    std::size_t first_session_requests = 0;
-    for (const HttpRequestInfo& r : reqs) {
-        if (r.time_ns > sessions[0] && r.time_ns < sessions[1]) ++first_session_requests;
-    }
-    CHECK_EQ(first_session_requests, std::size_t{3});
-    runner.stop();
-    const FeedStats s = runner.feed.stats();
-    CHECK_EQ(s.connect_failures, 0u);
-    CHECK_GE(s.reconnects, 1u);
-    CHECK_EQ(s.rest_snapshots, 0u);
-    CHECK_EQ(s.parse_errors, 0u);  // 非 200 不交给适配器解析
-    const std::string err = runner.feed.lastError();
-    CHECK(contains(err, "HTTP 500"));
-    CHECK(contains(err, "REST snapshot request limit reached (rest_max_attempts 3)"));
 }
 
 namespace {
@@ -2334,6 +2121,37 @@ std::vector<HttpRequestInfo> firstSessionRequests(const MockExchangeServer& serv
 
 }  // namespace
 
+TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session ends after rest_max_attempts") {
+    MockExchangeServer server;
+    server.setHttpHandler([](const HttpRequestInfo&) {
+        return HttpReply{500, R"({"code":-1001,"msg":"Internal error; unable to process your request."})",
+                         "application/json", 0};
+    });
+    server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(100, 110, {{"65000.00", "1"}}, {})); });
+    FeedConfig cfg = binanceDiffConfig(server);
+    cfg.rest_max_attempts = 3;
+    cfg.rest_min_interval_ms = 20;
+    const ConnectTrace trace(server);
+    FeedRunner runner(cfg);
+    REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
+    const std::vector<HttpRequestInfo> reqs = server.httpRequests();
+    REQUIRE(reqs.size() >= 3);
+    CHECK_GE(trace.requestGapMs(reqs, 1), 20 * 0.8 - 2.0);  // 第 1 次重试：20 ms ±20%
+    CHECK_GE(trace.requestGapMs(reqs, 2), 40 * 0.8 - 2.0);  // 连续失败 2 次：间隔加倍，40 ms ±20%
+    // 第一个会话恰好请求了 rest_max_attempts 次就放弃并重连
+    REQUIRE(server.wsSessionTimesNs().size() >= 2);
+    CHECK_EQ(firstSessionRequests(server).size(), std::size_t{3});
+    runner.stop();
+    const FeedStats s = runner.feed.stats();
+    CHECK_EQ(s.connect_failures, 0u);
+    CHECK_GE(s.reconnects, 1u);
+    CHECK_EQ(s.rest_snapshots, 0u);
+    CHECK_EQ(s.parse_errors, 0u);  // 非 200 不交给适配器解析
+    const std::string err = runner.feed.lastError();
+    CHECK(contains(err, "HTTP 500"));
+    CHECK(contains(err, "REST snapshot request limit reached (rest_max_attempts 3)"));
+}
+
 TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when every resync succeeds; requests are spaced") {
     // 上游每个事件都有缺口：每次 REST 快照都能同步成功，但下一个事件又触发一轮重同步
     MockExchangeServer server;
@@ -2347,11 +2165,7 @@ TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when ev
             ws.sleepMs(30);
         }
     });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth@100ms";
-    cfg.rest_host = "127.0.0.1";
-    cfg.rest_port = server.portString();
-    cfg.snapshot_path = kBinanceSnapshotPath;
+    FeedConfig cfg = binanceDiffConfig(server);
     cfg.rest_max_attempts = 2;
     cfg.rest_min_interval_ms = 150;
     cfg.reconnect_initial_ms = 100;
@@ -2388,21 +2202,20 @@ TEST_CASE("feed: the per-session REST budget refills once the book has stayed in
             ws.send(binanceDiff(1000 * g + 1, 1000 * g + 10, {{"65000.00", "1.0"}}, {}));
         }
     });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    cfg.path = "/ws/btcusdt@depth@100ms";
-    cfg.rest_host = "127.0.0.1";
-    cfg.rest_port = server.portString();
-    cfg.snapshot_path = kBinanceSnapshotPath;
+    FeedConfig cfg = binanceDiffConfig(server);
     cfg.rest_max_attempts = 2;
     cfg.rest_min_interval_ms = 50;
     cfg.healthy_session_ms = 200;
     FeedRunner runner(cfg);
     REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
-    const std::vector<HttpRequestInfo> reqs = firstSessionRequests(server);
-    CHECK_EQ(reqs.size(), std::size_t{3});
+    CHECK_EQ(firstSessionRequests(server).size(), std::size_t{3});
     CHECK(contains(runner.feed.lastError(), "REST snapshot request limit reached (rest_max_attempts 2)"));
     CHECK_GE(runner.feed.stats().gaps, 3u);
 }
+
+// ===========================================================================
+// 连接失败
+// ===========================================================================
 
 TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never completes the TLS handshake") {
     MockExchangeServer server;
@@ -2412,12 +2225,7 @@ TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never compl
     cfg.connect_timeout_ms = 300;
     EventLog events;
     FeedRunner runner(cfg, events.callback());
-    REQUIRE(waitFor(
-        [&] {
-            runner.feed.checkHealth(hft::nowNs());  // 模拟主线程每次刷新调用
-            return runner.feed.status() == FeedStatus::Live;
-        },
-        5000, 10));
+    REQUIRE(waitChecking(runner.feed, [&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.connect_failures, 1u);
     CHECK_EQ(s.stalls, 0u);
@@ -2425,11 +2233,8 @@ TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never compl
     CHECK_EQ(server.acceptCount(), std::size_t{2});
     CHECK(contains(runner.feed.lastError(), "connect timeout: TLS handshake did not complete within 300 ms"));
     // 客户端时间线：第一次 "connecting" 日志（早于连接计时起点）到超时错误日志至少 300 ms
-    std::int64_t connecting_ns = 0, timeout_ns = 0;
-    for (const EventLog::Event& e : events.events()) {
-        if (connecting_ns == 0 && contains(e.line, "[OKX] connecting to wss://127.0.0.1:")) connecting_ns = e.time_ns;
-        if (timeout_ns == 0 && contains(e.line, "[OKX] connect timeout")) timeout_ns = e.time_ns;
-    }
+    const std::int64_t connecting_ns = events.firstTime("[OKX] connecting to wss://127.0.0.1:");
+    const std::int64_t timeout_ns = events.firstTime("[OKX] connect timeout");
     REQUIRE(connecting_ns != 0);
     REQUIRE(timeout_ns != 0);
     CHECK_GE(ms(timeout_ns - connecting_ns), 300.0);
@@ -2454,8 +2259,7 @@ TEST_CASE("feed: WebSocket upgrade rejected with HTTP 404 -> connect failure nam
 TEST_CASE("feed: Binance diff stream without REST configuration ends the session with a clear error") {
     MockExchangeServer server;
     server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(100, 110, {{"65000.00", "1"}}, {})); });
-    FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
-    FeedRunner runner(cfg);
+    FeedRunner runner(baseConfig(Exchange::BINANCE, server));
     REQUIRE(waitFor(
         [&] {
             return runner.feed.stats().reconnects >= 1 && server.wsSessionCount() >= 2 &&
@@ -2466,6 +2270,10 @@ TEST_CASE("feed: Binance diff stream without REST configuration ends the session
     CHECK_EQ(runner.feed.stats().connect_failures, 0u);
     CHECK_EQ(server.httpRequestCount(), std::size_t{0});
 }
+
+// ===========================================================================
+// 稳态
+// ===========================================================================
 
 TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, adapter, publish, ping); loopback rate") {
     MockExchangeServer server;
