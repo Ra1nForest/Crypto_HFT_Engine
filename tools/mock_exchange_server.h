@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "hft/timing.h"
+
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -68,6 +70,7 @@
 // 脚本必须通过 WsSession 的方法等待，不要直接 sleep 线程（否则停止时要等它返回）。
 // 其他线程产生了需要推送的数据时，可通过 WsSession::waker() 取得的 SessionWaker 立即唤醒正在等待的脚本。
 // 长期运行的服务器（tools/mock_exchange.h）把脚本、HTTP 处理与升级过滤直接放进 ServerOptions，开始监听之前即生效。
+// 所有时间戳都是 hft::nowNs()（steady_clock 纳秒），测试可以直接与自己的时间戳比较。
 namespace mock_exchange {
 
 namespace asio = boost::asio;
@@ -78,11 +81,6 @@ namespace ssl = asio::ssl;
 using tcp = asio::ip::tcp;
 using error_code = boost::system::error_code;
 using Clock = std::chrono::steady_clock;
-
-// 与 hft::nowNs() 相同的时钟（steady_clock 纳秒），测试可以直接比较两边的时间戳
-inline std::int64_t nowNs() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
-}
 
 // 轮询等待条件成立（测试线程用）；超时返回 pred() 的最终结果
 template <class Pred>
@@ -108,7 +106,6 @@ struct CertificateOptions {
     std::string common_name = "localhost";
     std::vector<std::string> dns_names{"localhost"};
     std::vector<std::string> ip_addresses{"127.0.0.1"};
-    int valid_days = 7;
 };
 
 namespace detail {
@@ -156,10 +153,25 @@ inline void addNameEntry(X509_NAME* name, const char* field, const std::string& 
     }
 }
 
+// 读掉并丢弃套接字上收到的数据，直到对端关闭（EOF）、出错、到达 deadline 或 stop() 成立（每 10 ms 检查一次）
+template <class Stop>
+void drainUntilPeerCloses(int fd, Clock::time_point deadline, Stop&& stop) noexcept {
+    char buf[1024];
+    while (fd >= 0 && Clock::now() < deadline && !stop()) {
+        pollfd p{fd, POLLIN, 0};
+        const int r = ::poll(&p, 1, 10);
+        if (r < 0 && errno != EINTR) break;
+        if (r > 0) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+        }
+    }
+}
+
 }  // namespace detail
 
 // 生成 EC P-256 自签名证书：CN 与 SAN（DNS/IP）按 opt；basicConstraints CA:TRUE（自身即信任锚），
-// keyUsage digitalSignature + keyCertSign，extendedKeyUsage serverAuth，有效期从 1 小时前开始。
+// keyUsage digitalSignature + keyCertSign，extendedKeyUsage serverAuth，有效期从 1 小时前开始、为期 7 天。
 inline TlsIdentity generateSelfSigned(const CertificateOptions& opt = CertificateOptions()) {
     std::unique_ptr<EVP_PKEY, detail::FreeKey> key(EVP_EC_gen("P-256"));
     if (!key) detail::throwOpenSsl("EVP_EC_gen(P-256)");
@@ -174,7 +186,7 @@ inline TlsIdentity generateSelfSigned(const CertificateOptions& opt = Certificat
         detail::throwOpenSsl("ASN1_INTEGER_set_uint64");
     }
     if (X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) == nullptr ||
-        X509_gmtime_adj(X509_getm_notAfter(cert.get()), static_cast<long>(opt.valid_days) * 86400L) == nullptr) {
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), 7 * 86400L) == nullptr) {
         detail::throwOpenSsl("X509_gmtime_adj");
     }
     if (X509_set_pubkey(cert.get(), key.get()) != 1) detail::throwOpenSsl("X509_set_pubkey");
@@ -207,8 +219,6 @@ inline TlsIdentity generateSelfSigned(const CertificateOptions& opt = Certificat
 // 临时文件（mkstemps 创建，析构时删除）：用于把证书写成客户端的 ca_file
 class TempFile {
 public:
-    TempFile() = default;
-
     TempFile(const std::string& contents, const std::string& prefix, const std::string& suffix = ".pem") {
         const std::string pattern =
             (std::filesystem::temp_directory_path() / (prefix + "_XXXXXX" + suffix)).string();
@@ -233,25 +243,9 @@ public:
         path_ = buf.data();
     }
 
-    ~TempFile() { reset(); }
+    ~TempFile() { ::unlink(path_.c_str()); }
     TempFile(const TempFile&) = delete;
     TempFile& operator=(const TempFile&) = delete;
-    TempFile(TempFile&& o) noexcept : path_(std::move(o.path_)) { o.path_.clear(); }
-    TempFile& operator=(TempFile&& o) noexcept {
-        if (this != &o) {
-            reset();
-            path_ = std::move(o.path_);
-            o.path_.clear();
-        }
-        return *this;
-    }
-
-    void reset() noexcept {
-        if (!path_.empty()) {
-            ::unlink(path_.c_str());
-            path_.clear();
-        }
-    }
 
     const std::string& path() const noexcept { return path_; }
 
@@ -287,7 +281,7 @@ struct HttpRequestInfo {
     std::string target;
     std::string host;
     std::string user_agent;
-    std::int64_t time_ns = 0;    // 收到请求的 nowNs()
+    std::int64_t time_ns = 0;    // 收到请求的 hft::nowNs()
 };
 
 struct HttpReply {
@@ -302,12 +296,14 @@ using HttpHandler = std::function<HttpReply(const HttpRequestInfo&)>;
 class WsSession;
 using WsScript = std::function<void(WsSession&)>;
 
+// TLS 握手 / 读取 HTTP 请求 / WebSocket 升级的时限
+inline constexpr int kHandshakeTimeoutMs = 5000;
+
 struct ServerOptions {
     std::string bind_address = "127.0.0.1";
     unsigned short port = 0;               // 0 = 临时端口
     std::optional<TlsIdentity> identity;   // 未提供时按 certificate 生成
     CertificateOptions certificate;
-    int handshake_timeout_ms = 5000;       // TLS 握手 / 读取 HTTP 请求 / WebSocket 升级的时限
     // 初始行为：在开始监听之前就生效（长期运行的服务器不存在"已开始接受连接、行为尚未设置"的窗口）。
     // 之后仍可用 setWebSocketScript / setHttpHandler / setUpgradeFilter 修改。
     WsScript script;
@@ -316,7 +312,6 @@ struct ServerOptions {
 };
 
 class MockExchangeServer;
-class WsSession;
 
 // 跨线程唤醒句柄（可复制）：wake() 可在任意线程调用，让该会话线程上正在进行的等待（waitUntil / sleepMs /
 // expectText ...）立即重新检查条件，而不必等到下一个 10 ms 的轮询片。会话结束之后调用是空操作，
@@ -355,10 +350,9 @@ public:
     WsSession& operator=(const WsSession&) = delete;
     ~WsSession() { detachWaker(); }
 
-    std::size_t connectionIndex() const noexcept { return connection_; }   // TCP 连接编号（接受顺序）
     std::size_t sessionIndex() const noexcept { return session_; }         // WebSocket 会话编号
     const std::string& target() const noexcept { return target_; }         // 升级请求的路径
-    inline MockExchangeServer& server() noexcept;
+    MockExchangeServer& server() noexcept { return server_; }
 
     // 本会话的跨线程唤醒句柄（首次调用时创建；之后返回指向同一状态的句柄）
     SessionWaker waker() {
@@ -373,23 +367,10 @@ public:
     void send(std::string_view text) {
         ensureOpen();
         wbuf_.assign(text.data(), text.size());
-        write_done_ = false;
-        ws_.async_write(asio::buffer(wbuf_), [this](error_code ec, std::size_t) {
-            write_ec_ = ec;
-            write_done_ = true;
-        });
-        runUntil([this] { return write_done_; }, -1);
-        if (write_ec_) {
+        runOp(write_, [this](auto handler) { ws_.async_write(asio::buffer(wbuf_), std::move(handler)); }, -1);
+        if (write_.ec) {
             open_ = false;
-            throw ConnectionClosed("mock_exchange: write failed: " + write_ec_.message());
-        }
-    }
-
-    // 依次发送，帧之间间隔 gap_ms
-    void sendAll(const std::vector<std::string>& frames, int gap_ms = 0) {
-        for (std::size_t i = 0; i < frames.size(); ++i) {
-            if (i > 0 && gap_ms > 0) sleepMs(gap_ms);
-            send(frames[i]);
+            throw ConnectionClosed("mock_exchange: write failed: " + write_.ec.message());
         }
     }
 
@@ -463,16 +444,17 @@ public:
         beast::get_lowest_layer(ws_).close(ec);
     }
 
-    // 保持静默直到客户端断开（timeout_ms < 0：直到服务器停止）；返回客户端是否已断开
-    bool waitForClientDisconnect(int timeout_ms = -1) {
-        return runUntil([this] { return peer_closed_; }, timeout_ms);
-    }
-
     bool clientConnected() const noexcept { return open_ && !peer_closed_; }
 
 private:
     friend class MockExchangeServer;
     using Stream = websocket::stream<beast::ssl_stream<tcp::socket>>;
+
+    // 一个异步操作的完成状态（处理器只写这里）
+    struct Op {
+        bool done = false;
+        error_code ec;
+    };
 
     WsSession(MockExchangeServer& server, asio::io_context& ioc, tcp::socket&& sock, ssl::context& ctx,
               std::size_t connection)
@@ -483,13 +465,14 @@ private:
     inline bool serveHttp();
     inline void serveWebSocket();
     inline bool stopping() const noexcept;
-    inline int handshakeTimeoutMs() const noexcept;
+    inline void onFrame(const std::string& frame);
+    inline void onPing();
 
     void ensureOpen() const {
         if (!open_ || peer_closed_) throw ConnectionClosed("mock_exchange: connection closed");
     }
 
-    // 运行 io_context 直到 pred() 成立（true）或超时（false）；服务器停止时抛出 ConnectionClosed
+    // 运行 io_context 直到 pred() 成立（true）或超时（false；timeout_ms < 0 不限时）；服务器停止时抛出 ConnectionClosed
     template <class Pred>
     bool runUntil(Pred&& pred, int timeout_ms) {
         const auto deadline =
@@ -502,6 +485,31 @@ private:
             const Clock::duration slice = std::chrono::milliseconds(10);
             ioc_.run_one_for(std::min(slice, deadline - now));
         }
+    }
+
+    // 用 start(handler) 发起一个异步操作，运行 io_context 直到它完成（true，结果在 op.ec）或超时（false）
+    template <class Start>
+    bool runOp(Op& op, Start&& start, int timeout_ms) {
+        op.done = false;
+        start([&op](error_code ec, auto&&...) {
+            op.ec = ec;
+            op.done = true;
+        });
+        return runUntil([&op] { return op.done; }, timeout_ms);
+    }
+
+    // 写一个 HTTP 应答（阻塞到写完）；返回是否写成功
+    bool writeResponse(unsigned status, const std::string& content_type, std::string body, bool keep_alive) {
+        res_ = {};
+        res_.version(req_.version());
+        res_.result(status);
+        res_.set(http::field::server, "mock_exchange");
+        res_.set(http::field::content_type, content_type);
+        res_.keep_alive(keep_alive);
+        res_.body() = std::move(body);
+        res_.prepare_payload();
+        runOp(op_, [this](auto handler) { http::async_write(ws_.next_layer(), res_, std::move(handler)); }, -1);
+        return !op_.ec;
     }
 
     void startRead() {
@@ -519,26 +527,13 @@ private:
         });
     }
 
-    inline void onFrame(const std::string& frame);
-    inline void onPing();
-
     // 写完应答后的收尾：关闭发送方向，读到客户端 EOF（最多 timeout_ms）再关闭，避免未读数据触发 RST
     void gracefulTcpClose(int timeout_ms) noexcept {
         auto& sock = beast::get_lowest_layer(ws_);
         error_code ec;
         sock.shutdown(tcp::socket::shutdown_send, ec);
-        const int fd = sock.native_handle();
-        const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-        char buf[1024];
-        while (fd >= 0 && Clock::now() < deadline && !stopping()) {
-            pollfd p{fd, POLLIN, 0};
-            const int r = ::poll(&p, 1, 10);
-            if (r < 0 && errno != EINTR) break;
-            if (r > 0) {
-                const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
-            }
-        }
+        detail::drainUntilPeerCloses(sock.native_handle(), Clock::now() + std::chrono::milliseconds(timeout_ms),
+                                     [this] { return stopping(); });
         sock.close(ec);
     }
 
@@ -579,10 +574,8 @@ private:
     std::size_t session_ = std::numeric_limits<std::size_t>::max();
     std::string target_;
     // 异步操作状态（处理器只写这些成员）
-    bool op_done_ = false;
-    error_code op_ec_;
-    bool write_done_ = false;
-    error_code write_ec_;
+    Op op_;                     // 握手、HTTP 读写、WebSocket 升级（依次进行）
+    Op write_;                  // send()
     bool close_done_ = false;
     bool reading_ = false;
     bool peer_closed_ = false;  // WebSocket 读循环已结束（客户端关闭或连接出错）
@@ -597,8 +590,7 @@ private:
 class MockExchangeServer {
 public:
     explicit MockExchangeServer(ServerOptions opt = ServerOptions())
-        : opt_(std::move(opt)),
-          identity_(opt_.identity ? *opt_.identity : generateSelfSigned(opt_.certificate)),
+        : identity_(opt.identity ? *opt.identity : generateSelfSigned(opt.certificate)),
           ssl_ctx_(ssl::context::tls_server),
           acceptor_(acceptor_ioc_),
           accept_socket_(acceptor_ioc_) {
@@ -608,10 +600,10 @@ public:
         ssl_ctx_.set_options(ssl::context::default_workarounds);
         ssl_ctx_.use_certificate_chain(asio::buffer(identity_.cert_pem));
         ssl_ctx_.use_private_key(asio::buffer(identity_.key_pem), ssl::context::pem);
-        if (opt_.script) scripts_.assign(1, opt_.script);
-        http_handler_ = opt_.http_handler;
-        upgrade_filter_ = opt_.upgrade_filter;
-        const tcp::endpoint ep(asio::ip::make_address(opt_.bind_address), opt_.port);
+        if (opt.script) scripts_.assign(1, std::move(opt.script));
+        http_handler_ = std::move(opt.http_handler);
+        upgrade_filter_ = std::move(opt.upgrade_filter);
+        const tcp::endpoint ep(asio::ip::make_address(opt.bind_address), opt.port);
         acceptor_.open(ep.protocol());
         acceptor_.set_option(asio::socket_base::reuse_address(true));
         acceptor_.bind(ep);
@@ -642,10 +634,7 @@ public:
         });
         if (accept_thread_.joinable()) accept_thread_.join();
         std::vector<Worker> workers;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            workers.swap(workers_);
-        }
+        withLock([&] { workers.swap(workers_); });
         for (Worker& w : workers) {
             if (w.thread.joinable()) w.thread.join();
         }
@@ -655,45 +644,40 @@ public:
 
     unsigned short port() const noexcept { return port_; }
     std::string portString() const { return std::to_string(port_); }
-    const TlsIdentity& identity() const noexcept { return identity_; }
 
     // 把证书写到临时文件（首次调用时；服务器析构时删除），返回路径：客户端的 ca_file
     const std::string& caFile() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (ca_file_.path().empty()) ca_file_ = TempFile(identity_.cert_pem, "mock_exchange_ca");
-        return ca_file_.path();
+        return withLock([&]() -> const std::string& {
+            if (!ca_file_) ca_file_.emplace(identity_.cert_pem, "mock_exchange_ca");
+            return ca_file_->path();
+        });
     }
 
     // ---------------- 行为（任意时刻可设置；之后建立的连接/会话使用新设置）----------------
 
     // 所有 WebSocket 会话使用同一个脚本
     void setWebSocketScript(WsScript script) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        scripts_.assign(1, std::move(script));
+        withLock([&] { scripts_.assign(1, std::move(script)); });
     }
 
     // 第 i 个 WebSocket 会话使用 scripts[i]；超出部分重复最后一个
     void setWebSocketScripts(std::vector<WsScript> scripts) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        scripts_ = std::move(scripts);
+        withLock([&] { scripts_ = std::move(scripts); });
     }
 
     // HTTP 请求处理（未设置时一律 404）
     void setHttpHandler(HttpHandler handler) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        http_handler_ = std::move(handler);
+        withLock([&] { http_handler_ = std::move(handler); });
     }
 
     // 新 TCP 连接的处理方式（参数为连接编号；未设置时一律 Serve）
     void setAcceptHandler(std::function<AcceptAction(std::size_t)> handler) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        accept_handler_ = std::move(handler);
+        withLock([&] { accept_handler_ = std::move(handler); });
     }
 
     // WebSocket 升级过滤：返回 false 时以 HTTP 404 拒绝升级（参数为请求路径）
     void setUpgradeFilter(std::function<bool(const std::string&)> filter) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        upgrade_filter_ = std::move(filter);
+        withLock([&] { upgrade_filter_ = std::move(filter); });
     }
 
     // 按请求顺序依次应答（第 i 个 HTTP 请求得到 replies[i]，超出部分重复最后一个）
@@ -705,75 +689,52 @@ public:
         };
     }
 
-    // ---------------- 观测（线程安全，返回拷贝）----------------
+    // ---------------- 观测（线程安全，返回拷贝；时间均为 hft::nowNs()）----------------
 
-    std::size_t acceptCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return accept_times_.size();
-    }
-    std::size_t wsSessionCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ws_frames_.size();
-    }
-    std::size_t httpRequestCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return http_requests_.size();
-    }
-    // 每个 TCP 连接被接受的时刻（nowNs）
-    std::vector<std::int64_t> acceptTimesNs() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return accept_times_;
-    }
-    // 每个 TCP 连接结束的时刻（nowNs；仍在进行中为 0）
-    std::vector<std::int64_t> endTimesNs() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return end_times_;
-    }
+    std::size_t acceptCount() const { return withLock([&] { return accept_times_.size(); }); }
+    std::size_t wsSessionCount() const { return withLock([&] { return ws_frames_.size(); }); }
+    std::size_t httpRequestCount() const { return withLock([&] { return http_requests_.size(); }); }
+    // 每个 TCP 连接被接受的时刻
+    std::vector<std::int64_t> acceptTimesNs() const { return withLock([&] { return accept_times_; }); }
     std::size_t openConnections() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return static_cast<std::size_t>(std::count(end_times_.begin(), end_times_.end(), std::int64_t{0}));
+        return withLock([&] {
+            return static_cast<std::size_t>(std::count(end_times_.begin(), end_times_.end(), std::int64_t{0}));
+        });
     }
     // 第 session 个 WebSocket 会话收到的文本帧
-    std::vector<std::string> framesReceived(std::size_t session) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return session < ws_frames_.size() ? ws_frames_[session] : std::vector<std::string>();
-    }
-    // 与 framesReceived(session) 一一对应的到达时刻（nowNs）
-    std::vector<std::int64_t> frameTimesNs(std::size_t session) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return session < ws_frame_times_.size() ? ws_frame_times_[session] : std::vector<std::int64_t>();
-    }
-    // 第 session 个 WebSocket 会话收到的 WebSocket ping 控制帧的到达时刻（nowNs；Beast 自动应答 pong）
-    std::vector<std::int64_t> pingTimesNs(std::size_t session) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return session < ws_ping_times_.size() ? ws_ping_times_[session] : std::vector<std::int64_t>();
-    }
-    std::vector<std::string> wsTargets() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ws_targets_;
-    }
-    // 每个 WebSocket 会话开始（收到升级请求）的时刻（nowNs）
-    std::vector<std::int64_t> wsSessionTimesNs() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ws_times_;
-    }
-    std::vector<HttpRequestInfo> httpRequests() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return http_requests_;
-    }
+    std::vector<std::string> framesReceived(std::size_t session) const { return sessionCopy(ws_frames_, session); }
+    // 与 framesReceived(session) 一一对应的到达时刻
+    std::vector<std::int64_t> frameTimesNs(std::size_t session) const { return sessionCopy(ws_frame_times_, session); }
+    // 第 session 个 WebSocket 会话收到的 WebSocket ping 控制帧的到达时刻（Beast 自动应答 pong）
+    std::vector<std::int64_t> pingTimesNs(std::size_t session) const { return sessionCopy(ws_ping_times_, session); }
+    std::vector<std::string> wsTargets() const { return withLock([&] { return ws_targets_; }); }
+    // 每个 WebSocket 会话开始（收到升级请求）的时刻
+    std::vector<std::int64_t> wsSessionTimesNs() const { return withLock([&] { return ws_times_; }); }
+    std::vector<HttpRequestInfo> httpRequests() const { return withLock([&] { return http_requests_; }); }
     // 脚本错误（期望未满足、异常）
-    std::vector<std::string> errors() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return errors_;
-    }
+    std::vector<std::string> errors() const { return withLock([&] { return errors_; }); }
     // TLS 握手失败（例如客户端不信任证书时发出的 alert）
-    std::vector<std::string> tlsFailures() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return tls_failures_;
-    }
+    std::vector<std::string> tlsFailures() const { return withLock([&] { return tls_failures_; }); }
 
 private:
     friend class WsSession;
+
+    struct Worker {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;  // 连接线程函数已返回
+    };
+
+    // 在 mutex_ 内执行 f 并返回其结果（处理器、脚本等回调一律在锁外调用：它们可以调用观测方法）
+    template <class F>
+    auto withLock(F&& f) const -> decltype(f()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return f();
+    }
+
+    template <class T>
+    std::vector<T> sessionCopy(const std::vector<std::vector<T>>& per_session, std::size_t session) const {
+        return withLock([&] { return session < per_session.size() ? per_session[session] : std::vector<T>(); });
+    }
 
     void doAccept() {
         acceptor_.async_accept(accept_socket_, [this](error_code ec) {
@@ -788,13 +749,15 @@ private:
                 doAccept();
                 return;
             }
-            const std::size_t index = recordAccept();
             std::vector<std::thread> finished;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                accept_times_.push_back(hft::nowNs());
+                end_times_.push_back(0);
+                const std::size_t index = accept_times_.size() - 1;
                 if (stopping()) {
                     ::close(fd);
-                    end_times_[index] = nowNs();
+                    end_times_[index] = hft::nowNs();
                     return;
                 }
                 // 回收已结束的连接线程（长时间运行的模拟交易所不会积累未 join 的线程）
@@ -826,79 +789,52 @@ private:
             sock.assign(protocol_, fd, ec);
             if (ec) {
                 ::close(fd);
+            } else if (const AcceptAction action = acceptAction(index); action == AcceptAction::CloseImmediately) {
+                sock.close(ec);
+            } else if (action == AcceptAction::Silent) {  // 不做 TLS 握手，等待客户端断开（或服务器停止）
+                detail::drainUntilPeerCloses(sock.native_handle(), Clock::time_point::max(),
+                                             [this] { return stopping(); });
+                sock.close(ec);
             } else {
-                const AcceptAction action = acceptAction(index);
-                if (action == AcceptAction::CloseImmediately) {
-                    sock.close(ec);
-                } else if (action == AcceptAction::Silent) {
-                    silentUntilPeerCloses(sock);
-                } else {
-                    WsSession session(*this, ioc, std::move(sock), ssl_ctx_, index);
-                    try {
-                        session.serve();
-                    } catch (const ConnectionClosed&) {
-                    } catch (const std::exception& e) {
-                        recordError(e.what());
-                    } catch (...) {
-                        recordError("mock_exchange: connection " + std::to_string(index) + ": unknown exception");
-                    }
-                    session.teardown();
+                WsSession session(*this, ioc, std::move(sock), ssl_ctx_, index);
+                try {
+                    session.serve();
+                } catch (const ConnectionClosed&) {
+                } catch (const std::exception& e) {
+                    recordError(e.what());
+                } catch (...) {
+                    recordError("mock_exchange: connection " + std::to_string(index) + ": unknown exception");
                 }
+                session.teardown();
             }
         } catch (const std::exception& e) {
             recordError(std::string("mock_exchange: connection ") + std::to_string(index) + ": " + e.what());
         } catch (...) {
             recordError("mock_exchange: connection " + std::to_string(index) + ": unknown exception");
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        end_times_[index] = nowNs();
-    }
-
-    // 不做 TLS 握手，等待客户端断开（或服务器停止）
-    void silentUntilPeerCloses(tcp::socket& sock) noexcept {
-        const int fd = sock.native_handle();
-        char buf[1024];
-        while (!stopping()) {
-            pollfd p{fd, POLLIN, 0};
-            const int r = ::poll(&p, 1, 10);
-            if (r < 0 && errno != EINTR) break;
-            if (r > 0) {
-                const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
-            }
-        }
-        error_code ec;
-        sock.close(ec);
-    }
-
-    std::size_t recordAccept() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        accept_times_.push_back(nowNs());
-        end_times_.push_back(0);
-        return accept_times_.size() - 1;
+        withLock([&] { end_times_[index] = hft::nowNs(); });
     }
 
     std::size_t registerWsSession(const std::string& target) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ws_frames_.emplace_back();
-        ws_frame_times_.emplace_back();
-        ws_ping_times_.emplace_back();
-        ws_targets_.push_back(target);
-        ws_times_.push_back(nowNs());
-        return ws_frames_.size() - 1;
+        return withLock([&] {
+            ws_frames_.emplace_back();
+            ws_frame_times_.emplace_back();
+            ws_ping_times_.emplace_back();
+            ws_targets_.push_back(target);
+            ws_times_.push_back(hft::nowNs());
+            return ws_frames_.size() - 1;
+        });
     }
 
     void recordFrame(std::size_t session, const std::string& frame) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session < ws_frames_.size()) {
+        withLock([&] {
             ws_frames_[session].push_back(frame);
-            ws_frame_times_[session].push_back(nowNs());
-        }
+            ws_frame_times_[session].push_back(hft::nowNs());
+        });
     }
 
     void recordPing(std::size_t session) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session < ws_ping_times_.size()) ws_ping_times_[session].push_back(nowNs());
+        withLock([&] { ws_ping_times_[session].push_back(hft::nowNs()); });
     }
 
     HttpRequestInfo recordHttpRequest(std::size_t connection, const http::request<http::string_body>& req) {
@@ -908,59 +844,42 @@ private:
         info.target = std::string(req.target());
         info.host = std::string(req[http::field::host]);
         info.user_agent = std::string(req[http::field::user_agent]);
-        info.time_ns = nowNs();
-        std::lock_guard<std::mutex> lock(mutex_);
-        info.index = http_requests_.size();
-        http_requests_.push_back(info);
-        return info;
+        info.time_ns = hft::nowNs();
+        return withLock([&] {
+            info.index = http_requests_.size();
+            http_requests_.push_back(info);
+            return info;
+        });
     }
 
     void recordError(const std::string& e) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        errors_.push_back(e);
+        withLock([&] { errors_.push_back(e); });
     }
 
     void recordTlsFailure(std::size_t connection, const std::string& e) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tls_failures_.push_back("connection " + std::to_string(connection) + ": " + e);
+        withLock([&] { tls_failures_.push_back("connection " + std::to_string(connection) + ": " + e); });
     }
 
     WsScript scriptFor(std::size_t session) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (scripts_.empty()) return WsScript();
-        return scripts_[std::min(session, scripts_.size() - 1)];
+        return withLock([&] { return scripts_.empty() ? WsScript() : scripts_[std::min(session, scripts_.size() - 1)]; });
     }
 
-    // 处理器在锁外调用（处理器可以调用观测方法）
     HttpReply httpReply(const HttpRequestInfo& info) const {
-        HttpHandler handler;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            handler = http_handler_;
-        }
+        const HttpHandler handler = withLock([&] { return http_handler_; });
         if (!handler) return HttpReply{404, R"({"code":-1,"msg":"not found"})", "application/json", 0};
         return handler(info);
     }
 
     AcceptAction acceptAction(std::size_t index) const {
-        std::function<AcceptAction(std::size_t)> handler;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            handler = accept_handler_;
-        }
+        const auto handler = withLock([&] { return accept_handler_; });
         return handler ? handler(index) : AcceptAction::Serve;
     }
 
     bool acceptUpgrade(const std::string& target) const {
-        std::function<bool(const std::string&)> filter;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            filter = upgrade_filter_;
-        }
-        return filter ? filter(target) : true;
+        const auto filter = withLock([&] { return upgrade_filter_; });
+        return !filter || filter(target);
     }
 
-    ServerOptions opt_;
     TlsIdentity identity_;
     ssl::context ssl_ctx_;                     // 各连接线程共享（OpenSSL 的 SSL_CTX 可并发创建 SSL）
     asio::io_context acceptor_ioc_;
@@ -971,20 +890,15 @@ private:
     std::atomic<bool> stopping_{false};
     std::thread accept_thread_;
 
-    struct Worker {
-        std::thread thread;
-        std::shared_ptr<std::atomic<bool>> done;  // 连接线程函数已返回
-    };
-
     mutable std::mutex mutex_;                 // 保护以下全部成员
     std::vector<Worker> workers_;
-    TempFile ca_file_;
+    std::optional<TempFile> ca_file_;
     std::vector<WsScript> scripts_;
     HttpHandler http_handler_;
     std::function<AcceptAction(std::size_t)> accept_handler_;
     std::function<bool(const std::string&)> upgrade_filter_;
     std::vector<std::int64_t> accept_times_;
-    std::vector<std::int64_t> end_times_;
+    std::vector<std::int64_t> end_times_;      // 每个 TCP 连接结束的时刻（仍在进行中为 0）
     std::vector<std::vector<std::string>> ws_frames_;
     std::vector<std::vector<std::int64_t>> ws_frame_times_;
     std::vector<std::vector<std::int64_t>> ws_ping_times_;
@@ -999,38 +913,27 @@ private:
 // WsSession 中依赖服务器定义的部分
 // ---------------------------------------------------------------------------
 
-inline MockExchangeServer& WsSession::server() noexcept { return server_; }
-
 inline bool WsSession::stopping() const noexcept { return server_.stopping(); }
-
-inline int WsSession::handshakeTimeoutMs() const noexcept { return server_.opt_.handshake_timeout_ms; }
 
 inline void WsSession::onFrame(const std::string& frame) { server_.recordFrame(session_, frame); }
 
 inline void WsSession::onPing() { server_.recordPing(session_); }
 
 inline void WsSession::serve() {
-    op_done_ = false;
-    ws_.next_layer().async_handshake(ssl::stream_base::server, [this](error_code ec) {
-        op_ec_ = ec;
-        op_done_ = true;
-    });
-    if (!runUntil([this] { return op_done_; }, handshakeTimeoutMs())) {
-        server_.recordTlsFailure(connection_, "TLS handshake timed out");
-        return;
-    }
-    if (op_ec_) {
-        server_.recordTlsFailure(connection_, op_ec_.message());
+    const bool handshake_done = runOp(
+        op_, [this](auto handler) { ws_.next_layer().async_handshake(ssl::stream_base::server, std::move(handler)); },
+        kHandshakeTimeoutMs);
+    if (!handshake_done || op_.ec) {
+        server_.recordTlsFailure(connection_, handshake_done ? op_.ec.message() : std::string("TLS handshake timed out"));
         return;
     }
     for (;;) {
         req_ = {};
-        op_done_ = false;
-        http::async_read(ws_.next_layer(), buffer_, req_, [this](error_code ec, std::size_t) {
-            op_ec_ = ec;
-            op_done_ = true;
-        });
-        if (!runUntil([this] { return op_done_; }, handshakeTimeoutMs()) || op_ec_) return;
+        if (!runOp(op_, [this](auto handler) { http::async_read(ws_.next_layer(), buffer_, req_, std::move(handler)); },
+                   kHandshakeTimeoutMs) ||
+            op_.ec) {
+            return;
+        }
         if (websocket::is_upgrade(req_)) {
             serveWebSocket();
             return;
@@ -1043,21 +946,10 @@ inline bool WsSession::serveHttp() {
     const HttpRequestInfo info = server_.recordHttpRequest(connection_, req_);
     HttpReply reply = server_.httpReply(info);
     if (reply.delay_ms > 0) sleepMs(reply.delay_ms);
-    res_ = {};
-    res_.version(req_.version());
-    res_.result(static_cast<unsigned>(reply.status));
-    res_.set(http::field::server, "mock_exchange");
-    res_.set(http::field::content_type, reply.content_type);
-    res_.keep_alive(req_.keep_alive());
-    res_.body() = std::move(reply.body);
-    res_.prepare_payload();
-    op_done_ = false;
-    http::async_write(ws_.next_layer(), res_, [this](error_code ec, std::size_t) {
-        op_ec_ = ec;
-        op_done_ = true;
-    });
-    runUntil([this] { return op_done_; }, -1);
-    if (op_ec_) return false;
+    if (!writeResponse(static_cast<unsigned>(reply.status), reply.content_type, std::move(reply.body),
+                       req_.keep_alive())) {
+        return false;
+    }
     if (!res_.keep_alive()) {
         gracefulTcpClose(1000);
         return false;
@@ -1068,34 +960,16 @@ inline bool WsSession::serveHttp() {
 inline void WsSession::serveWebSocket() {
     target_ = std::string(req_.target());
     if (!server_.acceptUpgrade(target_)) {
-        res_ = {};
-        res_.version(req_.version());
-        res_.result(http::status::not_found);
-        res_.set(http::field::server, "mock_exchange");
-        res_.set(http::field::content_type, "text/plain");
-        res_.keep_alive(false);
-        res_.body() = "no such stream: " + target_;
-        res_.prepare_payload();
-        op_done_ = false;
-        http::async_write(ws_.next_layer(), res_, [this](error_code ec, std::size_t) {
-            op_ec_ = ec;
-            op_done_ = true;
-        });
-        runUntil([this] { return op_done_; }, -1);
-        if (!op_ec_) gracefulTcpClose(1000);
+        if (writeResponse(404, "text/plain", "no such stream: " + target_, false)) gracefulTcpClose(1000);
         return;
     }
     session_ = server_.registerWsSession(target_);
     ws_.set_option(websocket::stream_base::decorator(
         [](websocket::response_type& res) { res.set(http::field::server, "mock_exchange"); }));
-    op_done_ = false;
-    ws_.async_accept(req_, [this](error_code ec) {
-        op_ec_ = ec;
-        op_done_ = true;
-    });
-    if (!runUntil([this] { return op_done_; }, handshakeTimeoutMs()) || op_ec_) {
+    if (!runOp(op_, [this](auto handler) { ws_.async_accept(req_, std::move(handler)); }, kHandshakeTimeoutMs) ||
+        op_.ec) {
         server_.recordError("mock_exchange: session " + std::to_string(session_) + ": WebSocket accept failed: " +
-                            (op_done_ ? op_ec_.message() : std::string("timed out")));
+                            (op_.done ? op_.ec.message() : std::string("timed out")));
         return;
     }
     open_ = true;
@@ -1106,7 +980,7 @@ inline void WsSession::serveWebSocket() {
     startRead();
     const WsScript script = server_.scriptFor(session_);
     if (script) script(*this);
-    if (open_ && !peer_closed_) waitForClientDisconnect(-1);  // 脚本结束：保持静默直到客户端断开
+    if (clientConnected()) runUntil([this] { return peer_closed_; }, -1);  // 脚本结束：保持静默直到客户端断开
 }
 
 }  // namespace mock_exchange

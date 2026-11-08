@@ -108,9 +108,8 @@ int parseOptions(int argc, char** argv, Options& o) {
         if (std::find(std::begin(kWithValue), std::end(kWithValue), arg) == std::end(kWithValue)) {
             return bad("unknown option '" + arg + "'");
         }
-        const char* value = i + 1 < argc ? argv[i + 1] : nullptr;
-        if (value == nullptr) return bad("option '" + arg + "' needs a value");
-        ++i;
+        if (i + 1 >= argc) return bad("option '" + arg + "' needs a value");
+        const char* value = argv[++i];
         std::uint64_t u = 0;
         double d = 0.0;
         if (arg == "--binance-port" || arg == "--okx-port" || arg == "--bybit-port") {
@@ -135,19 +134,14 @@ int parseOptions(int argc, char** argv, Options& o) {
         } else if (arg == "--drop-rate") {
             if (!parseSeconds(value, d) || d > 1.0) return bad("--drop-rate needs a probability in [0, 1]");
             o.ex.drop_rate = d;
-        } else if (arg == "--status-interval") {
+        } else {  // --status-interval
             if (!parseSeconds(value, d)) return bad("--status-interval needs a non-negative number of seconds");
             o.status_interval_s = d;
-        } else {
-            return bad("unknown option '" + arg + "'");
         }
     }
-    const unsigned short ports[3] = {o.ex.binance_port, o.ex.okx_port, o.ex.bybit_port};
-    for (int a = 0; a < 3; ++a) {
-        for (int b = a + 1; b < 3; ++b) {
-            if (ports[a] != 0 && ports[a] == ports[b]) return bad("the three venues need different ports");
-        }
-    }
+    // 端口 0（临时端口）可以重复
+    const unsigned short b = o.ex.binance_port, k = o.ex.okx_port, y = o.ex.bybit_port;
+    if ((b != 0 && (b == k || b == y)) || (k != 0 && k == y)) return bad("the three venues need different ports");
     return 0;
 }
 

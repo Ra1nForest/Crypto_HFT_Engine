@@ -91,17 +91,10 @@ for bin in "$mock_bin" "$monitor_bin"; do
         exit 1
     fi
 done
-# 旧版监控程序不认识 --config（会直接连真实交易所），先确认二进制里有这些选项
-if ! grep -aq -- '--config' "$monitor_bin" || ! grep -aq -- '--duration' "$monitor_bin"; then
-    echo "run_mock_demo: $monitor_bin does not support --config/--duration (needs the 3-venue monitor)" >&2
-    exit 1
-fi
 
 config=tools/mock_config.json
 # CA 证书路径以配置文件的 connection.ca_file 为准：模拟交易所把证书写到这里，监控程序从这里加载
 ca_file=$(sed -n 's/.*"ca_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config")
-ca_file=${ca_file%%$'\n'*}
-ca_file=${ca_file:-/tmp/mock_exchange_ca.pem}
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/mock_demo.XXXXXX")
 if [[ -n "$fee_rate" ]]; then

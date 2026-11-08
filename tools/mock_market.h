@@ -13,12 +13,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <random>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 // ============================================================================
@@ -37,9 +37,9 @@
 //   * 深度提供者 DepthProvider：每侧维持 N 张远端挂单（离公允价 [inner, outer] tick，越靠内越密），
 //     越界（带滞回）即撤，按每步上限补足，另有随机改量/撤单，给深档带来持续的增量变化。
 //   * 吃单者 Taker：泊松到达的 IOC 限价单 / 市价单，方向偏向"让盘口回到本地公允价"，偶有大单扫簿。
-// - 订单 id 编码"代理 / 槽位 / 序号"：监听器据此在 O(1) 内把成交、撤单回报同步到槽位；
-//   代理每次自己下单/改单之后还会用 findOrder() 以引擎为准再同步一次（双保险）。
-//   监听器只更新槽位与统计，从不在回调里调用 submit/cancel/modify（引擎的要求）。
+// - 订单 id 编码"代理 / 槽位 / 序号"：撮合引擎的监听器（Venue 本身）据此在 O(1) 内把成交、撤单、改单回报
+//   同步到槽位，槽位因此总与引擎一致（测试逐个核对）。监听器只更新槽位与统计，从不在回调里调用
+//   submit/cancel/modify（引擎的要求）。
 // ============================================================================
 namespace mock_exchange::sim {
 
@@ -69,8 +69,6 @@ constexpr std::uint64_t splitmix64(std::uint64_t x) noexcept {
 class Random {
 public:
     explicit Random(std::uint64_t seed) : engine_(seed) {}
-
-    std::uint64_t next() { return engine_(); }
 
     // [0, 1)
     double uniform() { return static_cast<double>(engine_() >> 11) * 0x1.0p-53; }
@@ -171,7 +169,6 @@ struct VenueParams {
     std::vector<MakerParams> makers;
     DepthParams depth;
     TakerParams taker;
-    std::size_t reserve_orders = 8192;   // 撮合引擎预留的订单容量
 };
 
 struct MarketParams {
@@ -237,7 +234,6 @@ public:
     void step(double dt, Random& rng) {
         const double sigma = p_.start_price * p_.volatility_bps * 1e-4;  // USDT / √s
         price_ += -p_.reversion_per_s * (price_ - p_.start_price) * dt + sigma * std::sqrt(dt) * rng.normal();
-        price_ = std::max(price_, p_.start_price * 0.5);
     }
 
     double price() const noexcept { return price_; }
@@ -250,26 +246,24 @@ private:
 // 交易所偏移（基点）：OU 噪声 + 泊松跳跃错位（目标值指数衰减，实际值一阶追随目标）
 class OffsetProcess {
 public:
-    void step(double dt, Random& rng, const OffsetParams& p) {
-        const double a = std::exp(-p.noise_reversion_per_s * dt);
-        noise_ = noise_ * a + p.noise_bps * std::sqrt(std::max(0.0, 1.0 - a * a)) * rng.normal();
-        target_ *= std::exp(-dt / std::max(1e-3, p.jump_decay_s));
-        if (rng.chance(p.small_jump_rate_per_s * dt)) {
-            target_ += signedMagnitude(rng, p.small_jump_min_bps, p.small_jump_max_bps);
+    explicit OffsetProcess(const OffsetParams& p) : p_(p) {}
+
+    void step(double dt, Random& rng) {
+        const double a = std::exp(-p_.noise_reversion_per_s * dt);
+        noise_ = noise_ * a + p_.noise_bps * std::sqrt(1.0 - a * a) * rng.normal();
+        target_ *= std::exp(-dt / p_.jump_decay_s);
+        if (rng.chance(p_.small_jump_rate_per_s * dt)) {
+            target_ += signedMagnitude(rng, p_.small_jump_min_bps, p_.small_jump_max_bps);
         }
-        if (rng.chance(p.large_jump_rate_per_s * dt)) {
-            const double j = signedMagnitude(rng, p.large_jump_min_bps, p.large_jump_max_bps);
-            target_ += j;
-            last_large_jump_bps_ = j;
+        if (rng.chance(p_.large_jump_rate_per_s * dt)) {
+            target_ += signedMagnitude(rng, p_.large_jump_min_bps, p_.large_jump_max_bps);
             ++large_jumps_;
         }
-        disloc_ += (target_ - disloc_) * (1.0 - std::exp(-dt / std::max(1e-3, p.jump_rise_s)));
+        disloc_ += (target_ - disloc_) * (1.0 - std::exp(-dt / p_.jump_rise_s));
     }
 
     double bps() const noexcept { return noise_ + disloc_; }
-    double dislocationBps() const noexcept { return disloc_; }
     std::uint64_t largeJumps() const noexcept { return large_jumps_; }
-    double lastLargeJumpBps() const noexcept { return last_large_jump_bps_; }
 
 private:
     static double signedMagnitude(Random& rng, double lo, double hi) {
@@ -277,10 +271,10 @@ private:
         return rng.chance(0.5) ? m : -m;
     }
 
+    OffsetParams p_;
     double noise_ = 0.0;
     double target_ = 0.0;
     double disloc_ = 0.0;
-    double last_large_jump_bps_ = 0.0;
     std::uint64_t large_jumps_ = 0;
 };
 
@@ -291,8 +285,6 @@ private:
 inline constexpr unsigned kSerialBits = 36;
 inline constexpr unsigned kSlotBits = 20;
 inline constexpr std::uint32_t kNoSlot = (1u << kSlotBits) - 1;  // 不占槽位的订单（吃单者）
-inline constexpr std::size_t kMaxAgents = 255;
-inline constexpr std::size_t kMaxSlots = kNoSlot;                 // 槽位编号 [0, kNoSlot)
 
 constexpr OrderId makeOrderId(std::uint32_t agent, std::uint32_t slot, std::uint64_t serial) noexcept {
     return (OrderId{agent} << (kSlotBits + kSerialBits)) | (OrderId{slot & kNoSlot} << kSerialBits) |
@@ -315,28 +307,13 @@ struct Slot {
 };
 
 struct VenueStats {
-    std::uint64_t steps = 0;
     std::uint64_t book_events = 0;       // 受理 / 成交 / 撤单 / 改单回调总数（推进各协议的更新号）
-    std::uint64_t submits = 0, modifies = 0, cancels = 0, taker_orders = 0;
     std::uint64_t trades = 0;
-    std::uint64_t rejects = 0;           // 引擎拒单（代理自己会先校验，正常应为 0）
+    std::uint64_t rejects = 0;           // 引擎拒单（代理只发合法请求，正常应为 0）
     Qty volume = 0;                      // 成交量（lot）
-    double notional = 0.0;               // 成交额（USDT）
-    Price last_trade_price = 0;
 };
 
 class Venue;
-
-// 撮合引擎监听器：只更新槽位与统计（不得在回调里调用 submit/cancel/modify）
-struct VenueListener {
-    Venue* venue = nullptr;
-
-    inline void onAccepted(mt::SymbolId, const mt::OrderRequest&) noexcept;
-    inline void onRejected(mt::SymbolId, OrderId id, mt::RequestType request, mt::RejectReason) noexcept;
-    inline void onTrade(mt::SymbolId, const mt::Trade& trade) noexcept;
-    inline void onCancelled(mt::SymbolId, OrderId id, Qty, mt::CancelReason) noexcept;
-    inline void onModified(mt::SymbolId, OrderId id, Price new_price, Qty new_qty) noexcept;
-};
 
 // ---------------------------------------------------------------------------
 // 代理
@@ -344,72 +321,57 @@ struct VenueListener {
 
 class Agent {
 public:
-    Agent(std::uint32_t index, AccountId account, std::size_t slots) : index_(index), account_(account) {
-        if (index >= kMaxAgents) throw std::invalid_argument("mock venue: too many agents");
-        if (slots > kMaxSlots) throw std::invalid_argument("mock venue: too many quote slots");
-        slots_.resize(slots);
-    }
+    Agent(std::uint32_t index, AccountId account, std::size_t slots)
+        : index_(index), account_(account), slots_(slots) {}
     virtual ~Agent() = default;
     Agent(const Agent&) = delete;
     Agent& operator=(const Agent&) = delete;
 
     virtual void step(Venue& venue, double dt) = 0;
 
-    // 监听器：订单 id 的剩余量变化（<= 0 表示订单已不在簿上）
+    // 监听器：订单的剩余量变化（<= 0 表示订单已不在簿上）
     void onRemaining(std::uint32_t slot, OrderId id, Qty remaining) noexcept {
-        if (slot >= slots_.size()) return;
-        Slot& s = slots_[slot];
-        if (!s.live || s.id != id) return;
-        if (remaining <= 0) {
-            s.live = false;
-        } else {
-            s.qty = remaining;
+        if (Slot* s = liveSlot(slot, id)) {
+            if (remaining <= 0) {
+                s->live = false;
+            } else {
+                s->qty = remaining;
+            }
         }
     }
 
     void onModified(std::uint32_t slot, OrderId id, Price price, Qty qty) noexcept {
-        if (slot >= slots_.size()) return;
-        Slot& s = slots_[slot];
-        if (!s.live || s.id != id) return;
-        s.price = price;
-        s.qty = qty;
-    }
-
-    std::size_t liveOrders() const noexcept {
-        std::size_t n = 0;
-        for (const Slot& s : slots_) n += s.live ? 1 : 0;
-        return n;
+        if (Slot* s = liveSlot(slot, id)) {
+            s->price = price;
+            s->qty = qty;
+        }
     }
 
     const std::vector<Slot>& slots() const noexcept { return slots_; }
-    std::uint32_t index() const noexcept { return index_; }
     AccountId account() const noexcept { return account_; }
 
 protected:
-    // 以下操作都会在调用引擎之后按引擎状态重新同步槽位（findOrder），因此槽位总与引擎一致
-    inline bool place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty);
+    // 下单 / 改单 / 撤单（调用方保证槽位状态与参数合法）；槽位随后由监听器按引擎回报更新
+    inline void place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty);
     inline void move(Venue& v, std::uint32_t slot, Price price, Qty qty);
     inline void cancel(Venue& v, std::uint32_t slot);
-    inline void resync(Venue& v, std::uint32_t slot);
-    inline OrderId nextTakerId() noexcept { return makeOrderId(index_, kNoSlot, ++serial_); }
+    OrderId nextTakerId() noexcept { return makeOrderId(index_, kNoSlot, ++serial_); }
 
     std::uint32_t index_;
     AccountId account_;
     std::vector<Slot> slots_;   // 构造后大小固定（引用稳定）
     std::uint64_t serial_ = 0;
+
+private:
+    Slot* liveSlot(std::uint32_t slot, OrderId id) noexcept {
+        return slot < slots_.size() && slots_[slot].live && slots_[slot].id == id ? &slots_[slot] : nullptr;
+    }
 };
 
 class MarketMaker final : public Agent {
 public:
     MarketMaker(std::uint32_t index, AccountId account, const MakerParams& p)
-        : Agent(index, account, static_cast<std::size_t>(std::max(1, p.levels)) * 2), p_(p),
-          jitter_(slots_.size(), 0) {
-        p_.levels = std::max(1, p_.levels);
-        p_.half_spread = std::max<Price>(1, p_.half_spread);
-        p_.level_gap = std::max<Price>(1, p_.level_gap);
-        p_.jitter = std::max<Price>(0, p_.jitter);
-        p_.base_size = std::max<Qty>(1, p_.base_size);
-    }
+        : Agent(index, account, static_cast<std::size_t>(p.levels) * 2), p_(p), jitter_(slots_.size(), 0) {}
 
     inline void step(Venue& v, double dt) override;
 
@@ -430,12 +392,7 @@ private:
 class DepthProvider final : public Agent {
 public:
     DepthProvider(std::uint32_t index, AccountId account, const DepthParams& p)
-        : Agent(index, account, static_cast<std::size_t>(std::max(1, p.orders_per_side)) * 2), p_(p) {
-        p_.orders_per_side = std::max(1, p_.orders_per_side);
-        p_.inner = std::max<Price>(2, p_.inner);
-        p_.outer = std::max<Price>(p_.inner + 1, p_.outer);
-        p_.base_size = std::max<Qty>(1, p_.base_size);
-        p_.max_adds_per_step = std::max(1, p_.max_adds_per_step);
+        : Agent(index, account, static_cast<std::size_t>(p.orders_per_side) * 2), p_(p) {
         free_.reserve(slots_.size());
     }
 
@@ -459,30 +416,30 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 交易所：撮合引擎 + 代理 + 偏移过程
+// 交易所：撮合引擎 + 代理 + 偏移过程；同时是撮合引擎的监听器
 // ---------------------------------------------------------------------------
 
 class Venue {
 public:
-    using Engine = mt::MatchingEngine<VenueListener>;
+    using Engine = mt::MatchingEngine<Venue>;
     using Book = Engine::Book;
 
     static constexpr AccountId kDepthAccount = 100;
     static constexpr AccountId kMakerAccountBase = 1;
     static constexpr AccountId kTakerAccount = 200;
+    static constexpr std::size_t kReserveOrders = 8192;   // 撮合引擎预留的订单容量（活动订单约 3000 张）
 
-    Venue(VenueParams params, std::uint64_t seed)
-        : params_(std::move(params)), rng_(seed), engine_(listener_) {
-        listener_.venue = this;
-        symbol_ = engine_.addSymbol("BTCUSDT", 0, std::max<std::size_t>(1024, params_.reserve_orders));
+    Venue(const VenueParams& params, std::uint64_t seed)
+        : name_(params.name), rng_(seed), offset_(params.offset), engine_(*this) {
+        symbol_ = engine_.addSymbol("BTCUSDT", 0, kReserveOrders);
         std::uint32_t index = 0;
         // 顺序即每步的执行顺序：先撤掉越界的远端挂单，再让做市商重新报价，最后是吃单者
-        agents_.push_back(std::make_unique<DepthProvider>(index++, kDepthAccount, params_.depth));
-        for (std::size_t i = 0; i < params_.makers.size(); ++i) {
+        agents_.push_back(std::make_unique<DepthProvider>(index++, kDepthAccount, params.depth));
+        for (std::size_t i = 0; i < params.makers.size(); ++i) {
             agents_.push_back(std::make_unique<MarketMaker>(index++, kMakerAccountBase + static_cast<AccountId>(i),
-                                                            params_.makers[i]));
+                                                            params.makers[i]));
         }
-        agents_.push_back(std::make_unique<Taker>(index++, kTakerAccount, params_.taker));
+        agents_.push_back(std::make_unique<Taker>(index++, kTakerAccount, params.taker));
     }
 
     Venue(const Venue&) = delete;
@@ -490,20 +447,15 @@ public:
 
     // 推进一步：偏移过程 → 本地公允价 → 各代理依次行动
     void step(double dt, double market_fair) {
-        offset_.step(dt, rng_, params_.offset);
+        offset_.step(dt, rng_);
         fair_ticks_ = market_fair * (1.0 + offset_.bps() * 1e-4) * static_cast<double>(kTicksPerUnit);
         for (auto& agent : agents_) agent->step(*this, dt);
-        ++stats_.steps;
     }
 
-    const std::string& name() const noexcept { return params_.name; }
-    const VenueParams& params() const noexcept { return params_; }
+    const std::string& name() const noexcept { return name_; }
     double fairTicks() const noexcept { return fair_ticks_; }
     double fairPrice() const noexcept { return fair_ticks_ / static_cast<double>(kTicksPerUnit); }
-    double offsetBps() const noexcept { return offset_.bps(); }
-    double dislocationBps() const noexcept { return offset_.dislocationBps(); }
     std::uint64_t largeDislocations() const noexcept { return offset_.largeJumps(); }
-    double lastLargeDislocationBps() const noexcept { return offset_.lastLargeJumpBps(); }
 
     const Book& book() const { return engine_.book(symbol_); }
     std::vector<mt::LevelInfo> depth(Side side, std::size_t max_levels) const {
@@ -512,13 +464,6 @@ public:
     std::uint64_t bookEvents() const noexcept { return stats_.book_events; }
     const VenueStats& stats() const noexcept { return stats_; }
 
-    // 代理认为挂在簿上的订单数（应与引擎的 orderCount() 相等）
-    std::size_t trackedOrders() const noexcept {
-        std::size_t n = 0;
-        for (const auto& a : agents_) n += a->liveOrders();
-        return n;
-    }
-
     // 一致性检查（测试用）：引擎不变量；每个槽位的活动订单都在引擎中且价格/剩余量一致；数量相等；无拒单
     bool checkConsistency(std::string* why = nullptr) const {
         auto fail = [why](const std::string& msg) {
@@ -526,25 +471,25 @@ public:
             return false;
         };
         std::string inner;
-        if (!book().checkInvariants(&inner)) return fail(params_.name + ": engine invariant violated: " + inner);
+        if (!book().checkInvariants(&inner)) return fail(name_ + ": engine invariant violated: " + inner);
         std::size_t live = 0;
         for (const auto& a : agents_) {
             for (const Slot& s : a->slots()) {
                 if (!s.live) continue;
                 ++live;
                 const std::optional<mt::OrderInfo> info = book().findOrder(s.id);
-                if (!info) return fail(params_.name + ": slot order " + std::to_string(s.id) + " is not in the book");
+                if (!info) return fail(name_ + ": slot order " + std::to_string(s.id) + " is not in the book");
                 if (info->price != s.price || info->remaining != s.qty || info->side != s.side ||
                     info->account != a->account()) {
-                    return fail(params_.name + ": slot order " + std::to_string(s.id) + " differs from the book");
+                    return fail(name_ + ": slot order " + std::to_string(s.id) + " differs from the book");
                 }
             }
         }
         if (live != book().orderCount()) {
-            return fail(params_.name + ": agents track " + std::to_string(live) + " orders, the book holds " +
+            return fail(name_ + ": agents track " + std::to_string(live) + " orders, the book holds " +
                         std::to_string(book().orderCount()));
         }
-        if (stats_.rejects != 0) return fail(params_.name + ": " + std::to_string(stats_.rejects) + " engine rejects");
+        if (stats_.rejects != 0) return fail(name_ + ": " + std::to_string(stats_.rejects) + " engine rejects");
         return true;
     }
 
@@ -552,41 +497,43 @@ public:
     Engine& engine() noexcept { return engine_; }
     mt::SymbolId symbol() const noexcept { return symbol_; }
     Random& rng() noexcept { return rng_; }
-    VenueStats& mutableStats() noexcept { return stats_; }
 
-    // ---- 监听器使用 ----
-    void noteEvent() noexcept { ++stats_.book_events; }
-    void noteReject(OrderId id, mt::RequestType request) noexcept {
+    // ---- 撮合引擎监听器：只更新槽位与统计（不得在回调里调用 submit/cancel/modify）----
+    void onAccepted(mt::SymbolId, const mt::OrderRequest&) noexcept { ++stats_.book_events; }
+    void onRejected(mt::SymbolId, OrderId id, mt::RequestType request, mt::RejectReason) noexcept {
         ++stats_.rejects;
         if (request != mt::RequestType::Modify) remaining(id, 0);
     }
-    void noteTrade(const mt::Trade& t) noexcept {
+    void onTrade(mt::SymbolId, const mt::Trade& t) noexcept {
         ++stats_.book_events;
         ++stats_.trades;
         stats_.volume += t.qty;
-        stats_.notional += static_cast<double>(t.price) / static_cast<double>(kTicksPerUnit) *
-                           static_cast<double>(t.qty) / static_cast<double>(kLotsPerUnit);
-        stats_.last_trade_price = t.price;
         remaining(t.maker_id, t.maker_remaining);
         remaining(t.taker_id, t.taker_remaining);
     }
-    void remaining(OrderId id, Qty qty) noexcept {
-        const std::uint32_t a = agentOf(id);
-        if (a < agents_.size()) agents_[a]->onRemaining(slotOf(id), id, qty);
-    }
-    void modified(OrderId id, Price price, Qty qty) noexcept {
+    void onCancelled(mt::SymbolId, OrderId id, Qty, mt::CancelReason) noexcept {
         ++stats_.book_events;
-        const std::uint32_t a = agentOf(id);
-        if (a < agents_.size()) agents_[a]->onModified(slotOf(id), id, price, qty);
+        remaining(id, 0);
+    }
+    void onModified(mt::SymbolId, OrderId id, Price new_price, Qty new_qty) noexcept {
+        ++stats_.book_events;
+        if (Agent* a = agentFor(id)) a->onModified(slotOf(id), id, new_price, new_qty);
     }
 
 private:
-    VenueParams params_;
+    Agent* agentFor(OrderId id) noexcept {
+        const std::uint32_t a = agentOf(id);
+        return a < agents_.size() ? agents_[a].get() : nullptr;
+    }
+    void remaining(OrderId id, Qty qty) noexcept {
+        if (Agent* a = agentFor(id)) a->onRemaining(slotOf(id), id, qty);
+    }
+
+    std::string name_;
     Random rng_;
-    VenueListener listener_;   // 必须先于 engine_ 构造（引擎持有其引用）
+    OffsetProcess offset_;
     Engine engine_;
     mt::SymbolId symbol_ = 0;
-    OffsetProcess offset_;
     double fair_ticks_ = 0.0;
     std::vector<std::unique_ptr<Agent>> agents_;
     VenueStats stats_;
@@ -598,120 +545,59 @@ private:
 
 class Market {
 public:
-    Market(MarketParams params, std::uint64_t seed)
-        : params_(std::move(params)), rng_(splitmix64(seed)), fair_(params_.fair) {
-        if (!(params_.step_s > 0.0)) throw std::invalid_argument("mock market: step_s must be positive");
-        for (std::size_t i = 0; i < params_.venues.size(); ++i) {
-            venues_.push_back(std::make_unique<Venue>(params_.venues[i], splitmix64(seed ^ (0x5EED0000ULL + i))));
+    Market(const MarketParams& params, std::uint64_t seed)
+        : step_s_(params.step_s), rng_(splitmix64(seed)), fair_(params.fair) {
+        for (std::size_t i = 0; i < params.venues.size(); ++i) {
+            venues_.emplace_back(params.venues[i], splitmix64(seed ^ (0x5EED0000ULL + i)));
         }
     }
 
     void step() {
-        fair_.step(params_.step_s, rng_);
-        for (auto& v : venues_) v->step(params_.step_s, fair_.price());
+        fair_.step(step_s_, rng_);
+        for (Venue& v : venues_) v.step(step_s_, fair_.price());
         ++steps_;
     }
 
     // 推进 seconds 秒（按步长取整）
     void advance(double seconds) {
-        const auto n = static_cast<std::uint64_t>(std::llround(std::max(0.0, seconds) / params_.step_s));
+        if (!(seconds > 0.0)) return;  // 负数与 NaN：不推进（llround 的结果转无符号会变成巨大的步数）
+        const auto n = static_cast<std::uint64_t>(std::llround(seconds / step_s_));
         for (std::uint64_t i = 0; i < n; ++i) step();
     }
 
     std::size_t venueCount() const noexcept { return venues_.size(); }
-    Venue& venue(std::size_t i) { return *venues_.at(i); }
-    const Venue& venue(std::size_t i) const { return *venues_.at(i); }
+    const Venue& venue(std::size_t i) const { return venues_.at(i); }
     double fair() const noexcept { return fair_.price(); }
-    std::uint64_t steps() const noexcept { return steps_; }
-    double stepSeconds() const noexcept { return params_.step_s; }
-    double simSeconds() const noexcept { return static_cast<double>(steps_) * params_.step_s; }
-    const MarketParams& params() const noexcept { return params_; }
+    double stepSeconds() const noexcept { return step_s_; }
+    double simSeconds() const noexcept { return static_cast<double>(steps_) * step_s_; }
 
 private:
-    MarketParams params_;
+    double step_s_;
     Random rng_;
     FairValue fair_;
-    std::vector<std::unique_ptr<Venue>> venues_;
+    std::deque<Venue> venues_;   // 元素地址稳定（引擎持有 Venue 监听器的引用）
     std::uint64_t steps_ = 0;
 };
-
-// ===========================================================================
-// 实现：监听器
-// ===========================================================================
-
-inline void VenueListener::onAccepted(mt::SymbolId, const mt::OrderRequest&) noexcept { venue->noteEvent(); }
-
-inline void VenueListener::onRejected(mt::SymbolId, OrderId id, mt::RequestType request, mt::RejectReason) noexcept {
-    venue->noteReject(id, request);
-}
-
-inline void VenueListener::onTrade(mt::SymbolId, const mt::Trade& trade) noexcept { venue->noteTrade(trade); }
-
-inline void VenueListener::onCancelled(mt::SymbolId, OrderId id, Qty, mt::CancelReason) noexcept {
-    venue->noteEvent();
-    venue->remaining(id, 0);
-}
-
-inline void VenueListener::onModified(mt::SymbolId, OrderId id, Price new_price, Qty new_qty) noexcept {
-    venue->modified(id, new_price, new_qty);
-}
 
 // ===========================================================================
 // 实现：代理的公共操作
 // ===========================================================================
 
-inline bool Agent::place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty) {
+inline void Agent::place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty) {
     Slot& s = slots_[slot];
-    if (s.live || price <= 0 || qty <= 0) return false;
-    s.id = makeOrderId(index_, slot, ++serial_);
-    s.side = side;
-    s.price = price;
-    s.qty = qty;
-    s.live = true;  // 先登记：撮合过程中的成交回报据此更新剩余量
-    mt::OrderRequest req;
-    req.id = s.id;
-    req.account = account_;
-    req.side = side;
-    req.type = mt::OrderType::Limit;
-    req.tif = mt::TimeInForce::GTC;
-    req.price = price;
-    req.qty = qty;
-    req.stp = mt::StpMode::CancelTaker;  // 不与自己的挂单成交：撞上时撤掉新单
-    ++v.mutableStats().submits;
+    s = Slot{makeOrderId(index_, slot, ++serial_), price, qty, side, true};  // 先登记：撮合过程中的回报据此更新槽位
+    // GTC 限价单；STP CancelTaker：不与自己的挂单成交，撞上时撤掉新单
+    const mt::OrderRequest req{s.id, account_, side, mt::OrderType::Limit, mt::TimeInForce::GTC, price, qty, false,
+                               mt::StpMode::CancelTaker};
     v.engine().submit(v.symbol(), req);
-    resync(v, slot);
-    return s.live;
 }
 
 inline void Agent::move(Venue& v, std::uint32_t slot, Price price, Qty qty) {
-    Slot& s = slots_[slot];
-    if (!s.live || price <= 0 || qty <= 0) return;
-    if (price == s.price && qty == s.qty) return;
-    ++v.mutableStats().modifies;
-    v.engine().modify(v.symbol(), s.id, price, qty);
-    resync(v, slot);
+    const Slot& s = slots_[slot];
+    if (price != s.price || qty != s.qty) v.engine().modify(v.symbol(), s.id, price, qty);
 }
 
-inline void Agent::cancel(Venue& v, std::uint32_t slot) {
-    Slot& s = slots_[slot];
-    if (!s.live) return;
-    ++v.mutableStats().cancels;
-    v.engine().cancel(v.symbol(), s.id);
-    s.live = false;
-}
-
-inline void Agent::resync(Venue& v, std::uint32_t slot) {
-    Slot& s = slots_[slot];
-    if (!s.live) return;
-    const std::optional<mt::OrderInfo> info = v.book().findOrder(s.id);
-    if (!info) {
-        s.live = false;
-        return;
-    }
-    s.price = info->price;
-    s.qty = info->remaining;
-    s.side = info->side;
-}
+inline void Agent::cancel(Venue& v, std::uint32_t slot) { v.engine().cancel(v.symbol(), slots_[slot].id); }
 
 // ===========================================================================
 // 实现：做市商
@@ -720,9 +606,8 @@ inline void Agent::resync(Venue& v, std::uint32_t slot) {
 inline Price MarketMaker::target(Side side, int level, double fair) const noexcept {
     const Price distance = p_.half_spread + static_cast<Price>(level) * p_.level_gap +
                            jitter_[slotIndex(side, level)];
-    const Price price = side == Side::Buy ? static_cast<Price>(std::floor(fair)) - distance
-                                          : static_cast<Price>(std::ceil(fair)) + distance;
-    return std::max<Price>(1, price);
+    return side == Side::Buy ? static_cast<Price>(std::floor(fair)) - distance
+                             : static_cast<Price>(std::ceil(fair)) + distance;
 }
 
 inline Qty MarketMaker::size(int level, Random& rng) const {
@@ -770,7 +655,7 @@ inline Price DepthProvider::placementPrice(Side side, Price floor_fair, Price ce
     const double u = rng.uniform();
     const Price distance =
         p_.inner + static_cast<Price>(std::llround(static_cast<double>(p_.outer - p_.inner) * std::pow(u, p_.inner_bias)));
-    return side == Side::Buy ? std::max<Price>(1, floor_fair - distance) : ceil_fair + distance;
+    return side == Side::Buy ? floor_fair - distance : ceil_fair + distance;
 }
 
 inline void DepthProvider::step(Venue& v, double dt) {
@@ -837,33 +722,26 @@ inline void Taker::step(Venue& v, double dt) {
     const std::optional<Price> ask = v.book().bestAsk();
     if (!bid && !ask) return;
     const double mid = bid && ask ? 0.5 * static_cast<double>(*bid + *ask) : static_cast<double>(bid ? *bid : *ask);
-    const double dev = (v.fairTicks() - mid) / std::max(1.0, p_.pressure_scale);
+    const double dev = (v.fairTicks() - mid) / p_.pressure_scale;
     const double logistic = 1.0 / (1.0 + std::exp(-std::clamp(dev, -40.0, 40.0)));
-    const double p_buy = 0.5 + std::clamp(p_.pressure, 0.0, 1.0) * (logistic - 0.5);
+    const double p_buy = 0.5 + p_.pressure * (logistic - 0.5);
     const Side side = rng.chance(p_buy) ? Side::Buy : Side::Sell;
     const std::optional<Price> opposite = side == Side::Buy ? ask : bid;
     if (!opposite) return;  // 对手方为空：这次不下单
     Qty qty = 0;
     if (rng.chance(p_.whale_prob)) {
-        qty = rng.uniformInt(std::max<Qty>(1, p_.whale_min), std::max<Qty>(1, p_.whale_max));
+        qty = rng.uniformInt(p_.whale_min, p_.whale_max);
     } else {
         qty = static_cast<Qty>(std::llround(static_cast<double>(p_.median_size) * std::exp(p_.size_sigma * rng.normal())));
     }
-    qty = std::max<Qty>(1, qty);
-    mt::OrderRequest req;
-    req.id = nextTakerId();
-    req.account = account_;
-    req.side = side;
-    req.qty = qty;
-    req.tif = mt::TimeInForce::IOC;
-    if (rng.chance(p_.market_prob)) {
-        req.type = mt::OrderType::Market;
-    } else {
+    // IOC：市价单，或越过对手最优价至多 max_slippage tick 的限价单
+    mt::OrderRequest req{nextTakerId(), account_, side, mt::OrderType::Market, mt::TimeInForce::IOC, 0,
+                         std::max<Qty>(1, qty)};
+    if (!rng.chance(p_.market_prob)) {
         req.type = mt::OrderType::Limit;
-        const Price slip = rng.uniformInt(0, std::max<Price>(0, p_.max_slippage));
-        req.price = side == Side::Buy ? *opposite + slip : std::max<Price>(1, *opposite - slip);
+        const Price slip = rng.uniformInt(0, p_.max_slippage);
+        req.price = side == Side::Buy ? *opposite + slip : *opposite - slip;
     }
-    ++v.mutableStats().taker_orders;
     v.engine().submit(v.symbol(), req);
 }
 

@@ -25,9 +25,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -38,6 +38,7 @@ namespace {
 
 using namespace mock_exchange;
 using sim::Side;
+namespace dom = simdjson::dom;
 
 constexpr const char* kOkxBooksSub = R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
 constexpr const char* kBybitSub = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
@@ -48,6 +49,11 @@ bool contains(const std::string& s, const std::string& part) { return s.find(par
 
 double tickPrice(sim::Price p) { return static_cast<double>(p) / static_cast<double>(sim::kTicksPerUnit); }
 double lotQty(sim::Qty q) { return static_cast<double>(q) / static_cast<double>(sim::kLotsPerUnit); }
+
+// simdjson DOM 取值的简写（字段缺失或类型不符时抛异常，用例随之失败）
+std::string_view str(dom::element e) { return e.get_string(); }
+std::int64_t i64(dom::element e) { return e.get_int64(); }
+std::uint64_t u64(dom::element e) { return e.get_uint64(); }
 
 // 适配器簿的一侧与引擎深度逐档比较：价格、数量用 double 精确相等（同一个十进制数，from_chars 与整数相除
 // 都是正确舍入，结果逐位相同）。失败时在 why 里写明第一处差异。
@@ -73,20 +79,12 @@ bool bookEquals(const OrderBook& book, const wire::Levels& bids, const wire::Lev
     return sideEquals(book.getBids(), bids, "bids", why) && sideEquals(book.getAsks(), asks, "asks", why);
 }
 
-// 快照（feed 发布的前 N 档）与引擎深度的前 N 档比较
-bool snapshotEquals(const BookSnapshot& s, const wire::Levels& bids, const wire::Levels& asks, std::string* why) {
-    const std::vector<PriceLevel> b(s.bids, s.bids + s.bid_count);
-    const std::vector<PriceLevel> a(s.asks, s.asks + s.ask_count);
-    const auto nb = static_cast<std::ptrdiff_t>(std::min<std::size_t>(s.bid_count, bids.size()));
-    const auto na = static_cast<std::ptrdiff_t>(std::min<std::size_t>(s.ask_count, asks.size()));
-    const wire::Levels wb(bids.begin(), bids.begin() + nb);
-    const wire::Levels wa(asks.begin(), asks.begin() + na);
-    if (s.bid_count != std::min<std::size_t>(BookSnapshot::kMaxLevels, bids.size()) ||
-        s.ask_count != std::min<std::size_t>(BookSnapshot::kMaxLevels, asks.size())) {
-        *why = "snapshot has " + std::to_string(s.bid_count) + "/" + std::to_string(s.ask_count) + " levels";
-        return false;
-    }
-    return sideEquals(b, wb, "bids", why) && sideEquals(a, wa, "asks", why);
+// feed 发布的快照（前 BookSnapshot::kMaxLevels 档）与交易所引擎同样档数的深度逐档比较
+bool snapshotMatches(const BookSnapshot& s, const sim::Venue& v, std::string* why) {
+    return sideEquals(std::vector<PriceLevel>(s.bids, s.bids + s.bid_count), v.depth(Side::Buy, BookSnapshot::kMaxLevels),
+                      "bids", why) &&
+           sideEquals(std::vector<PriceLevel>(s.asks, s.asks + s.ask_count), v.depth(Side::Sell, BookSnapshot::kMaxLevels),
+                      "asks", why);
 }
 
 // 独立的 CRC-32（逐位实现，不用 hft/crc32.h 的查表），以及按有符号 int32 的解释
@@ -109,11 +107,11 @@ struct OkxStringModel {
     std::map<double, std::pair<std::string, std::string>> asks;
 
     template <class Map>
-    static void apply(Map& side, simdjson::dom::array levels) {
-        for (simdjson::dom::element e : levels) {
-            simdjson::dom::array lv = e.get_array();
-            const std::string px(std::string_view(lv.at(0).get_string()));
-            const std::string sz(std::string_view(lv.at(1).get_string()));
+    static void apply(Map& side, dom::array levels) {
+        for (dom::element e : levels) {
+            dom::array lv = e.get_array();
+            const std::string px(str(lv.at(0)));
+            const std::string sz(str(lv.at(1)));
             const double p = std::stod(px);
             if (std::stod(sz) == 0.0) {
                 side.erase(p);
@@ -121,15 +119,6 @@ struct OkxStringModel {
                 side[p] = {px, sz};
             }
         }
-    }
-
-    void apply(simdjson::dom::element data0, bool snapshot) {
-        if (snapshot) {
-            bids.clear();
-            asks.clear();
-        }
-        apply(bids, data0["bids"].get_array());
-        apply(asks, data0["asks"].get_array());
     }
 
     std::int32_t checksum() const {
@@ -145,6 +134,24 @@ struct OkxStringModel {
             if (a != asks.end()) add((a++)->second);
         }
         return asSigned(bitwiseCrc32(s));
+    }
+
+    // 应用一条 books 推送：prev_seq < 0 时必须是快照（prevSeqId 为 -1），否则是 prevSeqId == prev_seq 的增量；
+    // 按文档规则独立核对推送里的 checksum。返回 data[0]（有效到 parser 下一次解析）
+    dom::element applyBooks(dom::parser& parser, const std::string& msg, std::int64_t prev_seq) {
+        const dom::element doc = parser.parse(msg);
+        const bool snapshot = prev_seq < 0;
+        REQUIRE_EQ(str(doc["action"]), std::string_view(snapshot ? "snapshot" : "update"));
+        const dom::element d = doc["data"].at(0);
+        CHECK_EQ(i64(d["prevSeqId"]), snapshot ? std::int64_t{-1} : prev_seq);
+        if (snapshot) {
+            bids.clear();
+            asks.clear();
+        }
+        apply(bids, d["bids"].get_array());
+        apply(asks, d["asks"].get_array());
+        CHECK_EQ(checksum(), std::int32_t(i64(d["checksum"])));
+        return d;
     }
 };
 
@@ -207,6 +214,69 @@ struct FeedRunner {
     }
 };
 
+// 三家的真实 MarketDataFeed 连到同一个模拟交易所（下标 = 交易所编号：Binance、OKX、Bybit）
+struct ThreeFeeds {
+    static constexpr std::array<Exchange, 3> kVenues{Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT};
+    std::array<std::unique_ptr<FeedRunner>, 3> runners;
+    std::array<BookSnapshot, 3> last{};   // 每个 feed 最近发布的快照
+
+    // rest_max_attempts > 0 时覆盖每个会话的 REST 快照额度
+    ThreeFeeds(const MockExchange& ex, const std::string& ca_file, int rest_max_attempts = 0) {
+        for (std::size_t i = 0; i < 3; ++i) {
+            FeedConfig cfg = feedConfig(kVenues[i], ex, ca_file);
+            if (rest_max_attempts > 0) cfg.rest_max_attempts = rest_max_attempts;
+            runners[i] = std::make_unique<FeedRunner>(cfg);
+        }
+    }
+
+    MarketDataFeed& feed(std::size_t i) { return runners[i]->feed; }
+    const char* name(std::size_t i) const { return exchangeName(kVenues[i]); }
+
+    // 取走各 feed 队列里的快照，并做健康检查（与监控程序的主循环一样）
+    void pump() {
+        for (std::size_t i = 0; i < 3; ++i) {
+            BookSnapshot s;
+            while (feed(i).queue().tryPop(s)) last[i] = s;
+            feed(i).checkHealth(hft::nowNs());
+        }
+    }
+
+    // 实时运行 ms 毫秒，期间持续 pump
+    void runFor(std::int64_t ms) {
+        const std::int64_t t0 = hft::nowNs();
+        while (hft::nowNs() - t0 < ms * 1'000'000) {
+            pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    // 暂停交易所并立即发布一次（各发布者的窗口 = 引擎此刻的深度），等 feed 消费完（快照的更新号追上发布者），
+    // 再把每个 feed 最近的快照与引擎深度逐档比较；不一致时 FAIL（what 说明场景）
+    void pauseAndCompare(MockExchange& ex, const std::string& what) {
+        ex.pause();
+        const std::array<std::uint64_t, 3> want{ex.binance().lastUpdateId(),
+                                                static_cast<std::uint64_t>(ex.okx().lastSeqId()),
+                                                ex.bybit().lastUpdateId(1)};
+        CHECK(waitFor(
+            [&] {
+                pump();
+                return last[0].update_id == want[0] && last[1].update_id == want[1] && last[2].update_id == want[2];
+            },
+            5000));
+        ex.withMarket([&](const sim::Market& m) {
+            for (std::size_t i = 0; i < 3; ++i) {
+                std::string why;
+                if (!snapshotMatches(last[i], m.venue(i), &why)) FAIL(std::string(name(i)) + " " + what + ": " + why);
+                CHECK_EQ(last[i].venue, static_cast<std::uint32_t>(kVenues[i]));
+            }
+        });
+    }
+
+    void stop() {
+        for (auto& r : runners) r->stop();
+    }
+};
+
 // 所有测试用的交易所：临时端口、较短预热
 MockExchangeOptions testOptions(std::uint64_t seed) {
     MockExchangeOptions o;
@@ -253,7 +323,6 @@ public:
     }
 
     bool open() const noexcept { return !handshake_ec_; }
-    const error_code& handshakeError() const noexcept { return handshake_ec_; }
     int responseStatus() const { return static_cast<int>(response_.result_int()); }
 
     void send(const std::string& text) {
@@ -266,14 +335,12 @@ public:
         return beast::buffers_to_string(buf.data());
     }
 
-    // 读到第一条满足 pred 的报文并返回（之前的报文交给 skipped，可为空）；最多读 max_messages 条
+    // 读到第一条满足 pred 的报文并返回（跳过之前的报文）；最多读 2000 条
     template <class Pred>
-    std::string readUntil(Pred&& pred, int max_messages = 2000,
-                          const std::function<void(const std::string&)>& skipped = {}) {
-        for (int i = 0; i < max_messages; ++i) {
+    std::string readUntil(Pred&& pred) {
+        for (int i = 0; i < 2000; ++i) {
             std::string m = read();
             if (pred(m)) return m;
-            if (skipped) skipped(m);
         }
         throw std::runtime_error("WsClient: expected message not received");
     }
@@ -452,26 +519,28 @@ TEST_CASE("mock wire: OKX checksum string uses the exact pushed strings (documen
 }
 
 TEST_CASE("mock wire: Binance stream names, Bybit topics and HTTP targets parse like the real endpoints") {
-    wire::BinanceStream s;
-    REQUIRE(wire::parseBinanceStream("btcusdt@depth@100ms", "btcusdt", s));
-    CHECK_EQ(s.levels, 0);
-    CHECK_EQ(s.period_ms, 100);
-    REQUIRE(wire::parseBinanceStream("btcusdt@depth", "btcusdt", s));
-    CHECK_EQ(s.period_ms, 1000);
-    REQUIRE(wire::parseBinanceStream("btcusdt@depth20@100ms", "btcusdt", s));
-    CHECK_EQ(s.levels, 20);
-    REQUIRE(wire::parseBinanceStream("btcusdt@depth5", "btcusdt", s));
-    CHECK_EQ(s.levels, 5);
-    CHECK_EQ(s.period_ms, 1000);
-    CHECK(!wire::parseBinanceStream("btcusdt@depth15", "btcusdt", s));
-    CHECK(!wire::parseBinanceStream("ethusdt@depth", "btcusdt", s));
-    CHECK(!wire::parseBinanceStream("btcusdt@trade", "btcusdt", s));
-    CHECK(!wire::parseBinanceStream("btcusdt@depth@250ms", "btcusdt", s));
+    struct StreamCase {
+        const char* name;
+        bool ok;
+        int levels;
+        int period_ms;
+    };
+    for (const StreamCase& k : {StreamCase{"btcusdt@depth@100ms", true, 0, 100}, StreamCase{"btcusdt@depth", true, 0, 1000},
+                                StreamCase{"btcusdt@depth20@100ms", true, 20, 100}, StreamCase{"btcusdt@depth5", true, 5, 1000},
+                                StreamCase{"btcusdt@depth15", false, 0, 0}, StreamCase{"ethusdt@depth", false, 0, 0},
+                                StreamCase{"btcusdt@trade", false, 0, 0}, StreamCase{"btcusdt@depth@250ms", false, 0, 0}}) {
+        wire::BinanceStream s;
+        CHECK_EQ(wire::parseBinanceStream(k.name, s), k.ok);
+        if (k.ok) {
+            CHECK_EQ(s.levels, k.levels);
+            CHECK_EQ(s.period_ms, k.period_ms);
+        }
+    }
     int depth = 0;
-    CHECK(wire::parseBybitTopic("orderbook.50.BTCUSDT", "BTCUSDT", depth));
+    CHECK(wire::parseBybitTopic("orderbook.50.BTCUSDT", depth));
     CHECK_EQ(depth, 50);
-    CHECK(!wire::parseBybitTopic("orderbook.7.BTCUSDT", "BTCUSDT", depth));
-    CHECK(!wire::parseBybitTopic("orderbook.50.ETHUSDT", "BTCUSDT", depth));
+    CHECK(!wire::parseBybitTopic("orderbook.7.BTCUSDT", depth));
+    CHECK(!wire::parseBybitTopic("orderbook.50.ETHUSDT", depth));
     const wire::HttpTarget t = wire::parseHttpTarget("/api/v3/depth?symbol=BTCUSDT&limit=1000&x=%41+b&symbol=ETH");
     CHECK_EQ(t.path, std::string("/api/v3/depth"));
     REQUIRE(t.param("symbol") != nullptr);
@@ -610,7 +679,7 @@ TEST_CASE("mock publishers: Binance diff stream + REST snapshot round-trip throu
     BinanceAdapter adapter(adapterConfig("Binance"));
     adapter.onConnected();
     AdapterResult out;
-    simdjson::dom::parser parser;
+    dom::parser parser;
     std::string msg;
     std::uint64_t last_u = pub.lastUpdateId();
     int published = 0, compared = 0, rest_at = -1;
@@ -623,20 +692,20 @@ TEST_CASE("mock publishers: Binance diff stream + REST snapshot round-trip throu
         if (pub.publish(bids, asks, v.bookEvents(), kBaseTs + tick * 100, msg)) {
             ++published;
             // 独立检查报文：U = 上一条 u + 1，u >= U，E 为给定时间
-            const simdjson::dom::element doc = parser.parse(msg);
-            CHECK_EQ(std::string_view(doc["e"].get_string()), std::string_view("depthUpdate"));
-            CHECK_EQ(std::int64_t(doc["E"].get_int64()), kBaseTs + tick * 100);
-            const std::uint64_t U = doc["U"].get_uint64();
-            const std::uint64_t u = doc["u"].get_uint64();
+            const dom::element doc = parser.parse(msg);
+            CHECK_EQ(str(doc["e"]), std::string_view("depthUpdate"));
+            CHECK_EQ(i64(doc["E"]), kBaseTs + tick * 100);
+            const std::uint64_t U = u64(doc["U"]);
+            const std::uint64_t u = u64(doc["u"]);
             CHECK_EQ(U, last_u + 1);
             CHECK_GE(u, U);
             last_u = u;
             // 被挤出窗口的删除：数量 0、但引擎里该价位仍有挂单
-            for (simdjson::dom::element e : doc["b"].get_array()) {
-                simdjson::dom::array lv = e.get_array();
+            for (dom::element e : doc["b"].get_array()) {
+                dom::array lv = e.get_array();
                 double px = 0.0, qty = 0.0;
-                REQUIRE(adapter_detail::parseDecimal(std::string_view(lv.at(0).get_string()), px));
-                REQUIRE(adapter_detail::parseDecimal(std::string_view(lv.at(1).get_string()), qty));
+                REQUIRE(adapter_detail::parseDecimal(str(lv.at(0)), px));
+                REQUIRE(adapter_detail::parseDecimal(str(lv.at(1)), qty));
                 if (qty == 0.0 && v.book().volumeAt(Side::Buy, static_cast<sim::Price>(std::llround(px * 100))) > 0) {
                     ++boundary_deletes;
                 }
@@ -730,20 +799,12 @@ TEST_CASE("mock publishers: OKX books snapshot + updates round-trip through OkxA
     }
     OkxAdapter adapter(adapterConfig("OKX", kOkxBooksSub));
     adapter.onConnected();
-    simdjson::dom::parser parser;
+    dom::parser parser;
     OkxStringModel model;
     AdapterResult out;
     const std::string snap = pub.snapshot(kBaseTs + 600);
-    {
-        const simdjson::dom::element doc = parser.parse(snap);
-        CHECK_EQ(std::string_view(doc["action"].get_string()), std::string_view("snapshot"));
-        const simdjson::dom::element d = doc["data"].at(0);
-        CHECK_EQ(std::int64_t(d["prevSeqId"].get_int64()), std::int64_t{-1});
-        CHECK_EQ(std::int64_t(d["seqId"].get_int64()), pub.lastSeqId());
-        model.apply(d, true);
-        CHECK_EQ(model.checksum(), std::int32_t(std::int64_t(d["checksum"].get_int64())));
-        CHECK_EQ(model.bids.size(), std::size_t{400});
-    }
+    CHECK_EQ(i64(model.applyBooks(parser, snap, -1)["seqId"]), pub.lastSeqId());
+    CHECK_EQ(model.bids.size(), std::size_t{400});
     adapter.onMessage(snap, out);
     REQUIRE(adapter.synced());
     std::int64_t last_seq = pub.lastSeqId();
@@ -755,23 +816,16 @@ TEST_CASE("mock publishers: OKX books snapshot + updates round-trip through OkxA
         const wire::Levels asks = v.depth(Side::Sell, 400);
         if (!pub.publish(bids, asks, static_cast<std::int64_t>(v.bookEvents()), kBaseTs + tick * 100, msg)) continue;
         ++updates;
-        const simdjson::dom::element doc = parser.parse(msg);
-        CHECK_EQ(std::string_view(doc["action"].get_string()), std::string_view("update"));
-        const simdjson::dom::element d = doc["data"].at(0);
-        CHECK_EQ(std::int64_t(d["prevSeqId"].get_int64()), last_seq);
-        last_seq = d["seqId"].get_int64();
-        CHECK_GT(last_seq, std::int64_t(d["prevSeqId"].get_int64()));
-        CHECK_EQ(std::string(std::string_view(d["ts"].get_string())), std::to_string(kBaseTs + tick * 100));
-        model.apply(d, false);
-        const std::int32_t expected = std::int32_t(std::int64_t(d["checksum"].get_int64()));
-        if (model.checksum() != expected) FAIL("independent checksum mismatch at tick " + std::to_string(tick));
+        const dom::element d = model.applyBooks(parser, msg, last_seq);   // 衔接上一条、checksum 独立核对
+        last_seq = i64(d["seqId"]);
+        CHECK_GT(last_seq, i64(d["prevSeqId"]));
+        CHECK_EQ(std::string(str(d["ts"])), std::to_string(kBaseTs + tick * 100));
         // 第 4 个字段是该价位的订单数（删除档为 "0"）
-        for (simdjson::dom::element e : d["bids"].get_array()) {
-            simdjson::dom::array lv = e.get_array();
-            const std::string sz(std::string_view(lv.at(1).get_string()));
-            const std::string n(std::string_view(lv.at(3).get_string()));
-            const std::string px(std::string_view(lv.at(0).get_string()));
-            const auto p = static_cast<sim::Price>(std::llround(std::stod(px) * 100));
+        for (dom::element e : d["bids"].get_array()) {
+            dom::array lv = e.get_array();
+            const std::string sz(str(lv.at(1)));
+            const std::string n(str(lv.at(3)));
+            const auto p = static_cast<sim::Price>(std::llround(std::stod(std::string(str(lv.at(0)))) * 100));
             const auto it = std::find_if(bids.begin(), bids.end(), [p](const wire::Level& l) { return l.price == p; });
             if (std::stod(sz) == 0.0) {
                 CHECK_EQ(n, std::string("0"));
@@ -800,7 +854,7 @@ TEST_CASE("mock publishers: OKX books snapshot + updates round-trip through OkxA
 TEST_CASE("mock publishers: OKX heartbeat after an idle period passes the adapter's continuity and checksum checks") {
     const wire::Levels bids{{6500000, 1000000, 2}, {6499900, 2000000, 1}};
     const wire::Levels asks{{6500100, 1500000, 1}};
-    pub::OkxBooksPublisher pub("BTC-USDT", 400, 1000);
+    pub::OkxBooksPublisher pub(1000);   // 心跳间隔 1 s
     pub.reset(bids, asks, 500, kBaseTs);
     OkxAdapter adapter(adapterConfig("OKX", kOkxBooksSub));
     adapter.onConnected();
@@ -880,17 +934,16 @@ TEST_CASE("mock publishers: Bybit orderbook.{1,50,200} snapshot + deltas round-t
     for (const std::size_t depth : {std::size_t{1}, std::size_t{50}, std::size_t{200}}) {
         pub::BybitBookPublisher pub(depth);
         pub.reset(v.depth(Side::Buy, depth), v.depth(Side::Sell, depth), v.bookEvents());
-        const std::string sub = R"({"op":"subscribe","args":[")" + pub.topic() + R"("]})";
-        BybitAdapter adapter(adapterConfig("Bybit", sub));
+        BybitAdapter adapter(adapterConfig("Bybit", R"({"op":"subscribe","args":[")" + pub.topic() + R"("]})"));
         adapter.onConnected();
         AdapterResult out;
-        simdjson::dom::parser parser;
+        dom::parser parser;
         const std::string snap = pub.snapshot(kBaseTs, kBaseTs);
         {
-            const simdjson::dom::element doc = parser.parse(snap);
-            CHECK_EQ(std::string_view(doc["type"].get_string()), std::string_view("snapshot"));
-            CHECK_EQ(std::string_view(doc["topic"].get_string()), std::string_view(pub.topic()));
-            CHECK_EQ(std::uint64_t(doc["data"]["u"].get_uint64()), pub.lastUpdateId());
+            const dom::element doc = parser.parse(snap);
+            CHECK_EQ(str(doc["type"]), std::string_view("snapshot"));
+            CHECK_EQ(str(doc["topic"]), std::string_view(pub.topic()));
+            CHECK_EQ(u64(doc["data"]["u"]), pub.lastUpdateId());
         }
         adapter.onMessage(snap, out);
         REQUIRE(adapter.synced());
@@ -904,10 +957,10 @@ TEST_CASE("mock publishers: Bybit orderbook.{1,50,200} snapshot + deltas round-t
             const wire::Levels asks = v.depth(Side::Sell, depth);
             if (!pub.publish(bids, asks, v.bookEvents(), kBaseTs + tick * 20, kBaseTs + tick * 20, msg)) continue;
             ++deltas;
-            const simdjson::dom::element doc = parser.parse(msg);
-            CHECK_EQ(std::string_view(doc["type"].get_string()), std::string_view("delta"));
-            CHECK_EQ(std::uint64_t(doc["data"]["u"].get_uint64()), u + 1);
-            const std::uint64_t new_seq = doc["data"]["seq"].get_uint64();
+            const dom::element doc = parser.parse(msg);
+            CHECK_EQ(str(doc["type"]), std::string_view("delta"));
+            CHECK_EQ(u64(doc["data"]["u"]), u + 1);
+            const std::uint64_t new_seq = u64(doc["data"]["seq"]);
             CHECK_GT(new_seq, seq);
             u += 1;
             seq = new_seq;
@@ -976,7 +1029,7 @@ TEST_CASE("mock server: SessionWaker wakes a waiting script within the poll slic
         ready.store(true);
         for (int i = 0; i < kRounds; ++i) {
             if (!ws.waitUntil([&] { return round.load() > i; }, 5000)) return;
-            woke_ns[static_cast<std::size_t>(i)].store(nowNs());
+            woke_ns[static_cast<std::size_t>(i)].store(hft::nowNs());
             ws.send("woke " + std::to_string(i));
         }
     });
@@ -987,7 +1040,7 @@ TEST_CASE("mock server: SessionWaker wakes a waiting script within the poll slic
     std::mt19937 rng(1);
     for (int i = 0; i < kRounds; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(3 + static_cast<int>(rng() % 8)));  // 让脚本停在轮询片中间
-        const std::int64_t t0 = nowNs();
+        const std::int64_t t0 = hft::nowNs();
         round.store(i + 1);
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1022,38 +1075,20 @@ TEST_CASE("mock exchange: OKX protocol over TLS (ping, subscribe ack + snapshot,
     c.send("ping");
     CHECK_EQ(c.read(), std::string("pong"));
     c.send(R"({"id":"req7","op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})");
-    simdjson::dom::parser parser;
+    dom::parser parser;
     {
-        const std::string ack = c.read();
-        const simdjson::dom::element doc = parser.parse(ack);
-        CHECK_EQ(std::string_view(doc["event"].get_string()), std::string_view("subscribe"));
-        CHECK_EQ(std::string_view(doc["id"].get_string()), std::string_view("req7"));
-        CHECK_EQ(std::string_view(doc["arg"]["channel"].get_string()), std::string_view("books"));
-        CHECK_EQ(std::string_view(doc["connId"].get_string()).size(), std::size_t{8});
+        const dom::element doc = parser.parse(c.read());
+        CHECK_EQ(str(doc["event"]), std::string_view("subscribe"));
+        CHECK_EQ(str(doc["id"]), std::string_view("req7"));
+        CHECK_EQ(str(doc["arg"]["channel"]), std::string_view("books"));
+        CHECK_EQ(str(doc["connId"]).size(), std::size_t{8});
     }
     OkxStringModel model;
-    std::int64_t seq = 0;
-    {
-        const std::string snap = c.read();
-        const simdjson::dom::element doc = parser.parse(snap);
-        CHECK_EQ(std::string_view(doc["action"].get_string()), std::string_view("snapshot"));
-        const simdjson::dom::element d = doc["data"].at(0);
-        CHECK_EQ(std::int64_t(d["prevSeqId"].get_int64()), std::int64_t{-1});
-        seq = d["seqId"].get_int64();
-        model.apply(d, true);
-        CHECK_EQ(model.checksum(), std::int32_t(std::int64_t(d["checksum"].get_int64())));
-        CHECK_EQ(model.bids.size(), std::size_t{400});
-        CHECK_EQ(model.asks.size(), std::size_t{400});
-    }
+    std::int64_t seq = i64(model.applyBooks(parser, c.read(), -1)["seqId"]);   // 快照：checksum 独立核对
+    CHECK_EQ(model.bids.size(), std::size_t{400});
+    CHECK_EQ(model.asks.size(), std::size_t{400});
     for (int i = 0; i < 10; ++i) {  // 增量严格衔接快照，每条的 checksum 都对
-        const std::string upd = c.read();
-        const simdjson::dom::element doc = parser.parse(upd);
-        REQUIRE_EQ(std::string_view(doc["action"].get_string()), std::string_view("update"));
-        const simdjson::dom::element d = doc["data"].at(0);
-        CHECK_EQ(std::int64_t(d["prevSeqId"].get_int64()), seq);
-        seq = d["seqId"].get_int64();
-        model.apply(d, false);
-        CHECK_EQ(model.checksum(), std::int32_t(std::int64_t(d["checksum"].get_int64())));
+        seq = i64(model.applyBooks(parser, c.read(), seq)["seqId"]);
     }
     auto isError = [](const std::string& m) { return contains(m, R"("event":"error")"); };
     c.send(R"({"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT"}]})");
@@ -1081,34 +1116,34 @@ TEST_CASE("mock exchange: Bybit protocol over TLS (ping/pong, subscribe response
     const TempFile ca(ex.caPem(), "mock_ca");
     WsClient c(ex.bybitPort(), "/v5/public/spot", ca.path());
     REQUIRE(c.open());
-    simdjson::dom::parser parser;
+    dom::parser parser;
     c.send(R"({"req_id":"p1","op":"ping"})");
     {
-        const simdjson::dom::element doc = parser.parse(c.read());
+        const dom::element doc = parser.parse(c.read());
         CHECK(bool(doc["success"].get_bool()));
-        CHECK_EQ(std::string_view(doc["ret_msg"].get_string()), std::string_view("pong"));
-        CHECK_EQ(std::string_view(doc["req_id"].get_string()), std::string_view("p1"));
-        CHECK_EQ(std::string_view(doc["op"].get_string()), std::string_view("ping"));
+        CHECK_EQ(str(doc["ret_msg"]), std::string_view("pong"));
+        CHECK_EQ(str(doc["req_id"]), std::string_view("p1"));
+        CHECK_EQ(str(doc["op"]), std::string_view("ping"));
     }
     c.send(R"({"req_id":"s1","op":"subscribe","args":["orderbook.50.BTCUSDT"]})");
     {
-        const simdjson::dom::element doc = parser.parse(c.read());
+        const dom::element doc = parser.parse(c.read());
         CHECK(bool(doc["success"].get_bool()));
-        CHECK_EQ(std::string_view(doc["op"].get_string()), std::string_view("subscribe"));
+        CHECK_EQ(str(doc["op"]), std::string_view("subscribe"));
     }
     std::uint64_t u = 0;
     {
-        const simdjson::dom::element doc = parser.parse(c.read());
-        CHECK_EQ(std::string_view(doc["type"].get_string()), std::string_view("snapshot"));
-        CHECK_EQ(std::string_view(doc["topic"].get_string()), std::string_view("orderbook.50.BTCUSDT"));
-        u = doc["data"]["u"].get_uint64();
+        const dom::element doc = parser.parse(c.read());
+        CHECK_EQ(str(doc["type"]), std::string_view("snapshot"));
+        CHECK_EQ(str(doc["topic"]), std::string_view("orderbook.50.BTCUSDT"));
+        u = u64(doc["data"]["u"]);
         CHECK_EQ(doc["data"]["b"].get_array().size(), std::size_t{50});
         CHECK_EQ(doc["data"]["a"].get_array().size(), std::size_t{50});
     }
     for (int i = 0; i < 20; ++i) {
-        const simdjson::dom::element doc = parser.parse(c.read());
-        REQUIRE_EQ(std::string_view(doc["type"].get_string()), std::string_view("delta"));
-        CHECK_EQ(std::uint64_t(doc["data"]["u"].get_uint64()), u + 1);
+        const dom::element doc = parser.parse(c.read());
+        REQUIRE_EQ(str(doc["type"]), std::string_view("delta"));
+        CHECK_EQ(u64(doc["data"]["u"]), u + 1);
         u += 1;
     }
     auto isResponse = [](const std::string& m) { return contains(m, R"("success":)"); };
@@ -1123,15 +1158,14 @@ TEST_CASE("mock exchange: Bybit protocol over TLS (ping/pong, subscribe response
     // 退订之后立即订阅 orderbook.1：下一条推送是它的快照（不再有 orderbook.50 的 delta）
     c.send(R"({"op":"subscribe","args":["orderbook.1.BTCUSDT"]})");
     CHECK(contains(c.readUntil(isResponse), R"("success":true)"));
-    const std::string first = c.read();
-    CHECK(contains(first, R"("topic":"orderbook.1.BTCUSDT","type":"snapshot")"));
+    CHECK(contains(c.read(), R"("topic":"orderbook.1.BTCUSDT","type":"snapshot")"));
     CHECK(ex.serverErrors().empty());
 }
 
 TEST_CASE("mock exchange: Binance protocol over TLS (methods, combined streams, partial depth, REST endpoints, 404s)") {
     MockExchange ex(testOptions(23));
     const TempFile ca(ex.caPem(), "mock_ca");
-    simdjson::dom::parser parser;
+    dom::parser parser;
     {
         WsClient c(ex.binancePort(), "/ws", ca.path());
         REQUIRE(c.open());
@@ -1139,11 +1173,11 @@ TEST_CASE("mock exchange: Binance protocol over TLS (methods, combined streams, 
         CHECK_EQ(c.read(), std::string(R"({"result":null,"id":1})"));
         std::uint64_t last_u = 0;
         for (int i = 0; i < 5; ++i) {
-            const simdjson::dom::element doc = parser.parse(c.read());
-            REQUIRE_EQ(std::string_view(doc["e"].get_string()), std::string_view("depthUpdate"));
-            const std::uint64_t U = doc["U"].get_uint64();
+            const dom::element doc = parser.parse(c.read());
+            REQUIRE_EQ(str(doc["e"]), std::string_view("depthUpdate"));
+            const std::uint64_t U = u64(doc["U"]);
             if (last_u != 0) CHECK_EQ(U, last_u + 1);
-            last_u = doc["u"].get_uint64();
+            last_u = u64(doc["u"]);
         }
         auto isReply = [](const std::string& m) { return contains(m, R"("id":)"); };
         c.send(R"({"method":"LIST_SUBSCRIPTIONS","id":"q2"})");
@@ -1164,15 +1198,15 @@ TEST_CASE("mock exchange: Binance protocol over TLS (methods, combined streams, 
         REQUIRE(c.open());
         bool partial = false, diff = false;
         for (int i = 0; i < 20 && !(partial && diff); ++i) {
-            const simdjson::dom::element doc = parser.parse(c.read());
-            const std::string_view stream = doc["stream"].get_string();
+            const dom::element doc = parser.parse(c.read());
+            const std::string_view stream = str(doc["stream"]);
             if (stream == "btcusdt@depth5@100ms") {
                 partial = true;
                 CHECK_EQ(doc["data"]["bids"].get_array().size(), std::size_t{5});
                 CHECK_EQ(doc["data"]["asks"].get_array().size(), std::size_t{5});
             } else {
                 CHECK_EQ(stream, std::string_view("btcusdt@depth@100ms"));
-                CHECK_EQ(std::string_view(doc["data"]["e"].get_string()), std::string_view("depthUpdate"));
+                CHECK_EQ(str(doc["data"]["e"]), std::string_view("depthUpdate"));
                 diff = true;
             }
         }
@@ -1192,10 +1226,10 @@ TEST_CASE("mock exchange: Binance protocol over TLS (methods, combined streams, 
     REQUIRE(snap.ok);
     CHECK_EQ(snap.status, 200);
     {
-        const simdjson::dom::element doc = parser.parse(snap.body);
+        const dom::element doc = parser.parse(snap.body);
         CHECK_EQ(doc["bids"].get_array().size(), std::size_t{5});
         CHECK_EQ(doc["asks"].get_array().size(), std::size_t{5});
-        CHECK_GT(std::uint64_t(doc["lastUpdateId"].get_uint64()), std::uint64_t{0});
+        CHECK_GT(u64(doc["lastUpdateId"]), std::uint64_t{0});
     }
     const hft::net::HttpResult deflt = restGet(ex.binancePort(), "/api/v3/depth?symbol=BTCUSDT", ca.path());
     CHECK_EQ(parser.parse(deflt.body)["bids"].get_array().size(), std::size_t{100});  // 默认 limit = 100
@@ -1221,63 +1255,22 @@ TEST_CASE("mock exchange: Binance protocol over TLS (methods, combined streams, 
 TEST_CASE("mock exchange e2e: three real MarketDataFeeds go LIVE over TLS and their books match the engines exactly") {
     MockExchange ex(testOptions(7));
     const TempFile ca(ex.caPem(), "mock_ca");
-    std::array<std::unique_ptr<FeedRunner>, 3> feeds;
-    const std::array<Exchange, 3> venues{Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT};
-    for (std::size_t i = 0; i < 3; ++i) feeds[i] = std::make_unique<FeedRunner>(feedConfig(venues[i], ex, ca.path()));
-    std::array<BookSnapshot, 3> last{};
-    std::array<std::uint64_t, 3> popped{};
-    auto pump = [&] {
-        for (std::size_t i = 0; i < 3; ++i) {
-            BookSnapshot s;
-            while (feeds[i]->feed.queue().tryPop(s)) {
-                last[i] = s;
-                ++popped[i];
-            }
-            feeds[i]->feed.checkHealth(hft::nowNs());
-        }
-    };
-    const std::int64_t t0 = hft::nowNs();
-    while (hft::nowNs() - t0 < 3'000'000'000LL) {  // 实时运行 3 s
-        pump();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
+    ThreeFeeds f(ex, ca.path());
+    f.runFor(3000);  // 实时运行 3 s
     for (std::size_t i = 0; i < 3; ++i) {
-        CHECK_EQ(feedStatusName(feeds[i]->feed.status()), std::string("LIVE"));
-        if (!feeds[i]->feed.lastError().empty()) {
-            std::printf("    %s lastError: %s\n", exchangeName(venues[i]), feeds[i]->feed.lastError().c_str());
-        }
+        CHECK_EQ(feedStatusName(f.feed(i).status()), std::string("LIVE"));
+        if (!f.feed(i).lastError().empty()) std::printf("    %s lastError: %s\n", f.name(i), f.feed(i).lastError().c_str());
     }
-    // 暂停并立即发布一次：各发布者的窗口 = 引擎此刻的深度。等 feed 消费完（快照的更新号追上发布者）再逐档比较。
-    ex.pause(true);
-    const std::array<std::uint64_t, 3> want{ex.binance().lastUpdateId(), static_cast<std::uint64_t>(ex.okx().lastSeqId()),
-                                            ex.bybit().lastUpdateId(1)};
-    const bool caught_up = waitFor(
-        [&] {
-            pump();
-            return last[0].update_id == want[0] && last[1].update_id == want[1] && last[2].update_id == want[2];
-        },
-        5000);
-    CHECK(caught_up);
-    ex.withMarket([&](const sim::Market& m) {
-        for (std::size_t i = 0; i < 3; ++i) {
-            std::string why;
-            const wire::Levels bids = m.venue(i).depth(Side::Buy, BookSnapshot::kMaxLevels);
-            const wire::Levels asks = m.venue(i).depth(Side::Sell, BookSnapshot::kMaxLevels);
-            if (!snapshotEquals(last[i], bids, asks, &why)) {
-                FAIL(std::string(exchangeName(venues[i])) + " published book differs from the engine: " + why);
-            }
-            CHECK_EQ(last[i].venue, static_cast<std::uint32_t>(venues[i]));
-        }
-    });
+    f.pauseAndCompare(ex, "published book differs from the engine");
     std::printf("    %-8s %6s %9s %6s %5s %8s %8s %9s %7s\n", "feed", "msgs", "published", "gaps", "csum", "resyncs",
                 "rest", "proc p50", "exch p50");
     for (std::size_t i = 0; i < 3; ++i) {
-        const FeedStats s = feeds[i]->feed.stats();
-        std::printf("    %-8s %6llu %9llu %6llu %5llu %8llu %8llu %7.2fus %5.2fms\n", exchangeName(venues[i]),
+        const FeedStats s = f.feed(i).stats();
+        std::printf("    %-8s %6llu %9llu %6llu %5llu %8llu %8llu %7.2fus %5.2fms\n", f.name(i),
                     static_cast<unsigned long long>(s.messages), static_cast<unsigned long long>(s.published),
                     static_cast<unsigned long long>(s.gaps), static_cast<unsigned long long>(s.checksum_failures),
                     static_cast<unsigned long long>(s.resyncs), static_cast<unsigned long long>(s.rest_snapshots),
-                    feeds[i]->feed.getLatencyTracker().getP50Us(), feeds[i]->feed.getExchangeLatency().getP50Us() / 1000.0);
+                    f.feed(i).getLatencyTracker().getP50Us(), f.feed(i).getExchangeLatency().getP50Us() / 1000.0);
         CHECK_GT(s.published, std::uint64_t{10});
         CHECK_EQ(s.gaps, std::uint64_t{0});
         CHECK_EQ(s.checksum_failures, std::uint64_t{0});
@@ -1286,12 +1279,12 @@ TEST_CASE("mock exchange e2e: three real MarketDataFeeds go LIVE over TLS and th
         CHECK_EQ(s.reconnects, std::uint64_t{0});
         CHECK_EQ(s.connect_failures, std::uint64_t{0});
         CHECK_EQ(s.dropped_snapshots, std::uint64_t{0});
-        CHECK_LT(feeds[i]->feed.getExchangeLatency().getP50Us(), 50000.0);  // 本机：交易所时间戳与接收相差几毫秒
+        CHECK_LT(f.feed(i).getExchangeLatency().getP50Us(), 50000.0);  // 本机：交易所时间戳与接收相差几毫秒
     }
-    CHECK_GT(feeds[2]->feed.stats().messages, feeds[1]->feed.stats().messages);  // Bybit 20 ms、OKX 100 ms
-    CHECK_EQ(feeds[0]->feed.stats().rest_snapshots, std::uint64_t{1});
+    CHECK_GT(f.feed(2).stats().messages, f.feed(1).stats().messages);  // Bybit 20 ms、OKX 100 ms
+    CHECK_EQ(f.feed(0).stats().rest_snapshots, std::uint64_t{1});
     CHECK_EQ(ex.binance().counters().rest_requests, std::uint64_t{1});
-    for (std::size_t i = 0; i < 3; ++i) feeds[i]->stop();
+    f.stop();
     ex.resume();
     CHECK(ex.serverErrors().empty());
 }
@@ -1303,32 +1296,18 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
     ex.setDropRate(0, 0.08);
     ex.setDropRate(1, 0.08);
     ex.setDropRate(2, 0.02);
-    std::array<std::unique_ptr<FeedRunner>, 3> feeds;
-    const std::array<Exchange, 3> venues{Exchange::BINANCE, Exchange::OKX, Exchange::BYBIT};
-    for (std::size_t i = 0; i < 3; ++i) {
-        FeedConfig cfg = feedConfig(venues[i], ex, ca.path());
-        // 持续丢包时 Binance 每个缺口都要拉一次 REST 快照，默认的每会话额度（rest_max_attempts = 5，簿连续同步
-        // healthy_session_ms 之后才恢复）用完就会按设计重连。本测试验证同一连接内的恢复，所以放开额度
-        cfg.rest_max_attempts = 1000;
-        feeds[i] = std::make_unique<FeedRunner>(cfg);
-    }
-    std::array<BookSnapshot, 3> last{};
-    auto pump = [&] {
-        for (std::size_t i = 0; i < 3; ++i) {
-            BookSnapshot s;
-            while (feeds[i]->feed.queue().tryPop(s)) last[i] = s;
-            feeds[i]->feed.checkHealth(hft::nowNs());
-        }
-    };
+    // 持续丢包时 Binance 每个缺口都要拉一次 REST 快照，默认的每会话额度（rest_max_attempts = 5，簿连续同步
+    // healthy_session_ms 之后才恢复）用完就会按设计重连。本测试验证同一连接内的恢复，所以放开额度
+    ThreeFeeds f(ex, ca.path(), 1000);
     // 每家攒够缺口就不再对它丢弃。Binance 攒 6 个：同一个会话要拉 7 次 REST 快照（首次同步 + 每个缺口一次），
     // 多于默认额度——不放开额度时这里必然重连
     const std::array<std::uint64_t, 3> want_gaps{6, 2, 2};
     const bool gaps_seen = waitFor(
         [&] {
-            pump();
+            f.pump();
             bool all = true;
             for (std::size_t i = 0; i < 3; ++i) {
-                if (feeds[i]->feed.stats().gaps >= want_gaps[i]) {
+                if (f.feed(i).stats().gaps >= want_gaps[i]) {
                     ex.setDropRate(i, 0.0);
                 } else {
                     all = false;
@@ -1340,40 +1319,19 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
     CHECK(gaps_seen);
     // 停止丢弃，让每个 feed 用干净的推送发现可能残留的缺口并完成重同步
     ex.setDropRate(0.0);
-    const std::int64_t t0 = hft::nowNs();
-    while (hft::nowNs() - t0 < 800'000'000LL) {
-        pump();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    ex.pause(true);
-    const std::array<std::uint64_t, 3> want{ex.binance().lastUpdateId(), static_cast<std::uint64_t>(ex.okx().lastSeqId()),
-                                            ex.bybit().lastUpdateId(1)};
-    CHECK(waitFor(
-        [&] {
-            pump();
-            return last[0].update_id == want[0] && last[1].update_id == want[1] && last[2].update_id == want[2];
-        },
-        5000));
-    ex.withMarket([&](const sim::Market& m) {
-        for (std::size_t i = 0; i < 3; ++i) {
-            std::string why;
-            if (!snapshotEquals(last[i], m.venue(i).depth(Side::Buy, BookSnapshot::kMaxLevels),
-                                m.venue(i).depth(Side::Sell, BookSnapshot::kMaxLevels), &why)) {
-                FAIL(std::string(exchangeName(venues[i])) + " did not converge after resyncs: " + why);
-            }
-        }
-    });
+    f.runFor(800);
+    f.pauseAndCompare(ex, "did not converge after resyncs");
+    const SessionHub* hubs[3] = {&ex.binance(), &ex.okx(), &ex.bybit()};
     for (std::size_t i = 0; i < 3; ++i) {
-        const FeedStats s = feeds[i]->feed.stats();
-        const SessionHub::Counters net =
-            i == 0 ? ex.binance().counters() : i == 1 ? ex.okx().counters() : ex.bybit().counters();
+        const FeedStats s = f.feed(i).stats();
+        const SessionHub::Counters net = hubs[i]->counters();
         std::printf("    %-8s dropped %3llu -> gaps %3llu, resyncs %3llu, REST snapshots %3llu, client frames %3llu, "
                     "reconnects %llu, status %s\n",
-                    exchangeName(venues[i]), static_cast<unsigned long long>(net.dropped),
-                    static_cast<unsigned long long>(s.gaps), static_cast<unsigned long long>(s.resyncs),
-                    static_cast<unsigned long long>(s.rest_snapshots), static_cast<unsigned long long>(net.requests),
-                    static_cast<unsigned long long>(s.reconnects), feedStatusName(feeds[i]->feed.status()));
-        CHECK_EQ(feeds[i]->feed.status(), FeedStatus::Live);
+                    f.name(i), static_cast<unsigned long long>(net.dropped), static_cast<unsigned long long>(s.gaps),
+                    static_cast<unsigned long long>(s.resyncs), static_cast<unsigned long long>(s.rest_snapshots),
+                    static_cast<unsigned long long>(net.requests), static_cast<unsigned long long>(s.reconnects),
+                    feedStatusName(f.feed(i).status()));
+        CHECK_EQ(f.feed(i).status(), FeedStatus::Live);
         CHECK_GE(s.gaps, want_gaps[i]);
         CHECK_GE(s.resyncs, s.gaps);
         CHECK_GE(net.dropped, want_gaps[i]);
@@ -1382,10 +1340,10 @@ TEST_CASE("mock exchange e2e: injected drops -> every feed detects gaps, resyncs
         CHECK_EQ(s.reconnects, std::uint64_t{0});          // 全部在同一连接内恢复
     }
     // Binance：每个缺口重新拉一次 REST 快照；OKX / Bybit：每个缺口一对 unsubscribe + subscribe
-    CHECK_GE(feeds[0]->feed.stats().rest_snapshots, std::uint64_t{1} + want_gaps[0]);
+    CHECK_GE(f.feed(0).stats().rest_snapshots, std::uint64_t{1} + want_gaps[0]);
     CHECK_GE(ex.okx().counters().requests, std::uint64_t{1 + 2 * 2});
     CHECK_GE(ex.bybit().counters().requests, std::uint64_t{1 + 2 * 2});
-    for (auto& f : feeds) f->stop();
+    f.stop();
     ex.resume();
     CHECK(ex.serverErrors().empty());
 }

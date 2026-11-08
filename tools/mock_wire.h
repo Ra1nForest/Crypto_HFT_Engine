@@ -28,12 +28,18 @@ using sim::Qty;
 using Level = sim::mt::LevelInfo;
 using Levels = std::vector<Level>;   // 最优在前：买盘价格降序、卖盘价格升序
 
+// 模拟交易所唯一的交易对在三家的写法
+inline constexpr std::string_view kBinanceSymbol = "BTCUSDT";        // REST 的 symbol 参数、推送里的 "s"
+inline constexpr std::string_view kBinanceStreamSymbol = "btcusdt";  // 流名中的小写形式
+inline constexpr std::string_view kOkxInstId = "BTC-USDT";
+inline constexpr std::string_view kBybitSymbol = "BTCUSDT";
+
 // ---------------------------------------------------------------------------
 // 数字格式
 // ---------------------------------------------------------------------------
 
 struct NumberFormat {
-    int price_decimals;  // 输出的小数位数（不少于 sim::kPriceDecimals，否则按 kPriceDecimals 输出，不丢精度）
+    int price_decimals;  // 输出的小数位数（少于 sim::kPriceDecimals 时按 kPriceDecimals 输出，不丢精度）
     bool price_strip;    // 去掉末尾的 0（全为 0 时连小数点一起去掉）
     int qty_decimals;
     bool qty_strip;
@@ -46,36 +52,21 @@ inline constexpr NumberFormat kOkxFormat{2, true, 6, true};
 // Bybit：价格固定 2 位、数量固定 6 位（"65000.10" / "0.012000"）
 inline constexpr NumberFormat kBybitFormat{2, false, 6, false};
 
-inline void appendUint(std::string& out, std::uint64_t v) {
+template <class Int>
+inline void appendInt(std::string& out, Int v) {
     char buf[24];
-    const auto r = std::to_chars(buf, buf + sizeof(buf), v);
-    out.append(buf, r.ptr);
+    out.append(buf, std::to_chars(buf, buf + sizeof(buf), v).ptr);
 }
 
-inline void appendInt(std::string& out, std::int64_t v) {
-    char buf[24];
-    const auto r = std::to_chars(buf, buf + sizeof(buf), v);
-    out.append(buf, r.ptr);
-}
-
-// 定点数 value × 10^-scale 的十进制表示：小数部分先补足到 decimals 位，strip 时再去掉末尾的 0
-inline void appendScaled(std::string& out, std::int64_t value, int scale, int decimals, bool strip) {
-    scale = std::clamp(scale, 0, 18);
-    decimals = std::clamp(decimals, scale, 30);
-    std::uint64_t v = static_cast<std::uint64_t>(value);
-    if (value < 0) {
-        out.push_back('-');
-        v = 0 - v;
-    }
+// 定点数 value × 10^-scale（value >= 0）的十进制表示：小数部分先补足到 decimals 位（至少 scale 位），
+// strip 时再去掉末尾的 0
+inline void appendScaled(std::string& out, std::uint64_t value, int scale, int decimals, bool strip) {
     std::uint64_t pow10 = 1;
     for (int i = 0; i < scale; ++i) pow10 *= 10;
-    appendUint(out, v / pow10);
+    appendInt(out, value / pow10);
     char frac[32];
-    std::uint64_t f = v % pow10;
-    for (int i = scale - 1; i >= 0; --i) {
-        frac[i] = static_cast<char>('0' + f % 10);
-        f /= 10;
-    }
+    std::uint64_t f = value % pow10;
+    for (int i = scale - 1; i >= 0; --i, f /= 10) frac[i] = static_cast<char>('0' + f % 10);
     int n = scale;
     while (n < decimals) frac[n++] = '0';
     if (strip) {
@@ -88,10 +79,10 @@ inline void appendScaled(std::string& out, std::int64_t value, int scale, int de
 }
 
 inline void appendPrice(std::string& out, Price p, const NumberFormat& f) {
-    appendScaled(out, p, sim::kPriceDecimals, f.price_decimals, f.price_strip);
+    appendScaled(out, static_cast<std::uint64_t>(p), sim::kPriceDecimals, f.price_decimals, f.price_strip);
 }
 inline void appendQty(std::string& out, Qty q, const NumberFormat& f) {
-    appendScaled(out, q, sim::kQtyDecimals, f.qty_decimals, f.qty_strip);
+    appendScaled(out, static_cast<std::uint64_t>(q), sim::kQtyDecimals, f.qty_decimals, f.qty_strip);
 }
 inline std::string formatPrice(Price p, const NumberFormat& f) {
     std::string s;
@@ -131,13 +122,8 @@ inline void appendJsonString(std::string& out, std::string_view s) {
 }
 
 // ---------------------------------------------------------------------------
-// 深度：窗口与差分
+// 深度差分
 // ---------------------------------------------------------------------------
-
-// src 的前 n 档
-inline void topLevels(const Levels& src, std::size_t n, Levels& out) {
-    out.assign(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(std::min(n, src.size())));
-}
 
 inline bool better(bool bids, Price a, Price b) noexcept { return bids ? a > b : a < b; }
 
@@ -163,10 +149,12 @@ inline void diffSide(const Levels& prev, const Levels& cur, bool bids, bool comp
     }
 }
 
-// 档位数组 [["px","qty"],...]；okx_style 时为 OKX 的 [px, sz, "0", 订单数]（删除档订单数为 "0"）
-inline void appendLevels(std::string& out, const Levels& levels, const NumberFormat& f, bool okx_style) {
+// 档位数组 [["px","qty"],...]（最多前 limit 档）；okx_style 时为 OKX 的 [px, sz, "0", 订单数]（删除档订单数为 "0"）
+inline void appendLevels(std::string& out, const Levels& levels, const NumberFormat& f, bool okx_style,
+                         std::size_t limit = SIZE_MAX) {
     out.push_back('[');
-    for (std::size_t i = 0; i < levels.size(); ++i) {
+    const std::size_t n = std::min(limit, levels.size());
+    for (std::size_t i = 0; i < n; ++i) {
         const Level& l = levels[i];
         if (i > 0) out.push_back(',');
         out += "[\"";
@@ -176,7 +164,7 @@ inline void appendLevels(std::string& out, const Levels& levels, const NumberFor
         out.push_back('"');
         if (okx_style) {
             out += ",\"0\",\"";
-            appendUint(out, l.qty > 0 ? l.orders : 0);
+            appendInt(out, l.qty > 0 ? l.orders : 0);
             out.push_back('"');
         }
         out.push_back(']');
@@ -227,9 +215,9 @@ inline std::string binanceDepthUpdate(std::string_view symbol, std::int64_t even
     s += R"(,"s":)";
     appendJsonString(s, symbol);
     s += R"(,"U":)";
-    appendUint(s, first_id);
+    appendInt(s, first_id);
     s += R"(,"u":)";
-    appendUint(s, final_id);
+    appendInt(s, final_id);
     s += R"(,"b":)";
     appendLevels(s, bids, kBinanceFormat, false);
     s += R"(,"a":)";
@@ -238,16 +226,17 @@ inline std::string binanceDepthUpdate(std::string_view symbol, std::int64_t even
     return s;
 }
 
-// REST GET /api/v3/depth 的响应体，以及部分深度推送 <symbol>@depth<N>[@100ms]（两者形状相同）
-inline std::string binanceDepth(std::uint64_t last_update_id, const Levels& bids, const Levels& asks) {
+// REST GET /api/v3/depth 的响应体，以及部分深度推送 <symbol>@depth<N>[@100ms]（两者形状相同）：每侧最多前 limit 档
+inline std::string binanceDepth(std::uint64_t last_update_id, const Levels& bids, const Levels& asks,
+                                std::size_t limit = SIZE_MAX) {
     std::string s;
-    s.reserve(64 + 44 * (bids.size() + asks.size()));
+    s.reserve(64 + 44 * (std::min(limit, bids.size()) + std::min(limit, asks.size())));
     s += R"({"lastUpdateId":)";
-    appendUint(s, last_update_id);
+    appendInt(s, last_update_id);
     s += R"(,"bids":)";
-    appendLevels(s, bids, kBinanceFormat, false);
+    appendLevels(s, bids, kBinanceFormat, false, limit);
     s += R"(,"asks":)";
-    appendLevels(s, asks, kBinanceFormat, false);
+    appendLevels(s, asks, kBinanceFormat, false, limit);
     s.push_back('}');
     return s;
 }
@@ -259,7 +248,7 @@ inline std::string binanceCombined(std::string_view stream, std::string_view pay
     s += R"({"stream":)";
     appendJsonString(s, stream);
     s += R"(,"data":)";
-    s.append(payload.data(), payload.size());
+    s += payload;
     s.push_back('}');
     return s;
 }
@@ -267,9 +256,9 @@ inline std::string binanceCombined(std::string_view stream, std::string_view pay
 // 方法请求的应答 {"result":<result_json>,"id":<id_json>}（id_json 为原样的 JSON 记号）
 inline std::string binanceResult(std::string_view result_json, std::string_view id_json) {
     std::string s = R"({"result":)";
-    s.append(result_json.data(), result_json.size());
+    s += result_json;
     s += R"(,"id":)";
-    s.append(id_json.data(), id_json.size());
+    s += id_json;
     s.push_back('}');
     return s;
 }
@@ -282,7 +271,7 @@ inline std::string binanceError(int code, std::string_view msg, std::string_view
     appendJsonString(s, msg);
     if (!id_json.empty()) {
         s += R"(,"id":)";
-        s.append(id_json.data(), id_json.size());
+        s += id_json;
     }
     s.push_back('}');
     return s;
@@ -343,15 +332,21 @@ inline std::string okxTopBook(std::string_view channel, std::string_view inst_id
     return s;
 }
 
-// 订阅 / 退订回执 {"id":..,"event":"subscribe","arg":{"channel":..,"instId":..},"connId":..}（id 为空时省略）
-inline std::string okxEvent(std::string_view event, std::string_view channel, std::string_view inst_id,
-                            std::string_view conn_id, std::string_view request_id) {
+// 回执的开头："{" 加上可选的 "id":"<request_id>",（request_id 为空时省略）
+inline std::string okxReplyHead(std::string_view request_id) {
     std::string s = "{";
     if (!request_id.empty()) {
         s += R"("id":)";
         appendJsonString(s, request_id);
         s.push_back(',');
     }
+    return s;
+}
+
+// 订阅 / 退订回执 {"id":..,"event":"subscribe","arg":{"channel":..,"instId":..},"connId":..}
+inline std::string okxEvent(std::string_view event, std::string_view channel, std::string_view inst_id,
+                            std::string_view conn_id, std::string_view request_id) {
+    std::string s = okxReplyHead(request_id);
     s += R"("event":)";
     appendJsonString(s, event);
     s += R"(,"arg":{"channel":)";
@@ -366,12 +361,7 @@ inline std::string okxEvent(std::string_view event, std::string_view channel, st
 
 inline std::string okxError(std::string_view code, std::string_view msg, std::string_view conn_id,
                             std::string_view request_id) {
-    std::string s = "{";
-    if (!request_id.empty()) {
-        s += R"("id":)";
-        appendJsonString(s, request_id);
-        s.push_back(',');
-    }
+    std::string s = okxReplyHead(request_id);
     s += R"("event":"error","code":)";
     appendJsonString(s, code);
     s += R"(,"msg":)";
@@ -405,9 +395,9 @@ inline std::string bybitBook(std::string_view topic, std::string_view type, std:
     s += R"(,"a":)";
     appendLevels(s, asks, kBybitFormat, false);
     s += R"(,"u":)";
-    appendUint(s, update_id);
+    appendInt(s, update_id);
     s += R"(,"seq":)";
-    appendUint(s, seq);
+    appendInt(s, seq);
     s += R"(},"cts":)";
     appendInt(s, cts_ms);
     s.push_back('}');
@@ -437,16 +427,16 @@ inline std::string bybitResponse(bool success, std::string_view ret_msg, std::st
 // 订阅名称与 HTTP 请求目标的解析
 // ---------------------------------------------------------------------------
 
-// Binance 流名：<symbol>@depth[@100ms|@1000ms]（增量）或 <symbol>@depth<5|10|20>[@100ms|@1000ms]（部分深度）
+// Binance 流名：btcusdt@depth[@100ms|@1000ms]（增量）或 btcusdt@depth<5|10|20>[@100ms|@1000ms]（部分深度）
 struct BinanceStream {
     int levels = 0;          // 0 = 增量深度；5 / 10 / 20 = 部分深度
     int period_ms = 1000;    // 100 或 1000
 };
 
-inline bool parseBinanceStream(std::string_view name, std::string_view symbol_lower, BinanceStream& out) {
-    if (name.size() <= symbol_lower.size() || name.substr(0, symbol_lower.size()) != symbol_lower) return false;
-    std::string_view rest = name.substr(symbol_lower.size());
+inline bool parseBinanceStream(std::string_view name, BinanceStream& out) {
     constexpr std::string_view kDepth = "@depth";
+    if (name.substr(0, kBinanceStreamSymbol.size()) != kBinanceStreamSymbol) return false;
+    std::string_view rest = name.substr(kBinanceStreamSymbol.size());
     if (rest.substr(0, kDepth.size()) != kDepth) return false;
     rest.remove_prefix(kDepth.size());
     BinanceStream s;
@@ -471,13 +461,13 @@ inline bool parseBinanceStream(std::string_view name, std::string_view symbol_lo
     return true;
 }
 
-// Bybit 主题 orderbook.<depth>.<symbol>，depth 取 1 / 50 / 200（现货公共频道支持的档数）
-inline bool parseBybitTopic(std::string_view topic, std::string_view symbol, int& depth) {
+// Bybit 主题 orderbook.<depth>.BTCUSDT，depth 取 1 / 50 / 200（现货公共频道支持的档数）
+inline bool parseBybitTopic(std::string_view topic, int& depth) {
     constexpr std::string_view kPrefix = "orderbook.";
     if (topic.substr(0, kPrefix.size()) != kPrefix) return false;
     topic.remove_prefix(kPrefix.size());
     const std::size_t dot = topic.find('.');
-    if (dot == std::string_view::npos || topic.substr(dot + 1) != symbol) return false;
+    if (dot == std::string_view::npos || topic.substr(dot + 1) != kBybitSymbol) return false;
     const std::string_view d = topic.substr(0, dot);
     if (d == "1") depth = 1;
     else if (d == "50") depth = 50;

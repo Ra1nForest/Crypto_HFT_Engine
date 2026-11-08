@@ -44,27 +44,45 @@ using wire::Levels;
 
 namespace detail {
 
-// 在最优在前的有序档位中查找价格；不存在返回 nullptr
-inline const Level* findLevel(const Levels& levels, Price price, bool bids) noexcept {
-    const auto it = std::lower_bound(levels.begin(), levels.end(), price,
-                                     [bids](const Level& l, Price p) { return bids ? l.price > p : l.price < p; });
-    return it != levels.end() && it->price == price ? &*it : nullptr;
-}
+// 已发布的深度窗口（每侧前 n 档，最优在前）及差分用的暂存区（稳态不分配）
+class DepthWindow {
+public:
+    explicit DepthWindow(std::size_t n) : n_(n) {}
 
-// 前 n 档的拷贝
-inline Levels prefix(const Levels& src, std::size_t n) {
-    return Levels(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(std::min(n, src.size())));
-}
-
-// 两个窗口逐档相等（价格、数量；compare_orders 时还比较订单数）
-inline bool sameLevels(const Levels& a, const Levels& b, bool compare_orders) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].price != b[i].price || a[i].qty != b[i].qty) return false;
-        if (compare_orders && a[i].orders != b[i].orders) return false;
+    void reset(const Levels& bids, const Levels& asks) {
+        top(bids, bids_);
+        top(asks, asks_);
     }
-    return true;
-}
+
+    // 与新深度的前 n 档差分：有变化时窗口更新为新深度、差分留在 diffBids() / diffAsks()，返回 true；
+    // 没有变化返回 false（差分为空，窗口不变）。compare_orders 见 wire::diffSide。
+    bool advance(const Levels& bids, const Levels& asks, bool compare_orders) {
+        top(bids, cur_bids_);
+        top(asks, cur_asks_);
+        diff_bids_.clear();
+        diff_asks_.clear();
+        wire::diffSide(bids_, cur_bids_, true, compare_orders, diff_bids_);
+        wire::diffSide(asks_, cur_asks_, false, compare_orders, diff_asks_);
+        if (diff_bids_.empty() && diff_asks_.empty()) return false;
+        bids_.swap(cur_bids_);
+        asks_.swap(cur_asks_);
+        return true;
+    }
+
+    std::size_t size() const noexcept { return n_; }
+    const Levels& bids() const noexcept { return bids_; }
+    const Levels& asks() const noexcept { return asks_; }
+    const Levels& diffBids() const noexcept { return diff_bids_; }
+    const Levels& diffAsks() const noexcept { return diff_asks_; }
+
+private:
+    void top(const Levels& src, Levels& out) const {
+        out.assign(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(std::min(n_, src.size())));
+    }
+
+    std::size_t n_;
+    Levels bids_, asks_, cur_bids_, cur_asks_, diff_bids_, diff_asks_;
+};
 
 }  // namespace detail
 
@@ -73,45 +91,32 @@ inline bool sameLevels(const Levels& a, const Levels& b, bool compare_orders) no
 // ---------------------------------------------------------------------------
 class BinanceDepthPublisher {
 public:
-    static constexpr std::size_t kDefaultWindow = 1000;     // 增量流覆盖的档位数（每侧）
+    static constexpr std::size_t kWindow = 1000;            // 增量流覆盖的档位数（每侧）
     static constexpr std::size_t kDefaultRestLimit = 100;   // REST 不带 limit 时（与真实接口一致）
     static constexpr std::size_t kMaxRestLimit = 5000;      // REST limit 上限（超过按 5000）
 
-    explicit BinanceDepthPublisher(std::string symbol = "BTCUSDT", std::size_t window = kDefaultWindow)
-        : symbol_(std::move(symbol)), window_(std::max<std::size_t>(1, window)) {}
-
     // 初始状态（不产生推送）：例如预热结束时的深度与簿事件计数
     void reset(const Levels& bids, const Levels& asks, std::uint64_t update_id) {
-        wire::topLevels(bids, window_, bids_);
-        wire::topLevels(asks, window_, asks_);
+        w_.reset(bids, asks);
         last_u_ = update_id;
         slow_last_u_ = update_id;
         touched_bids_.clear();
         touched_asks_.clear();
     }
 
-    // 快速流（<symbol>@depth@100ms）的一个推送周期：与已发布窗口差分。窗口无变化返回 false（不推送，u 不前进）。
+    // 快速流（btcusdt@depth@100ms）的一个推送周期：与已发布窗口差分。窗口无变化返回 false（不推送，u 不前进）。
     bool publish(const Levels& bids, const Levels& asks, std::uint64_t update_id, std::int64_t event_ms,
                  std::string& out) {
-        wire::topLevels(bids, window_, cur_bids_);
-        wire::topLevels(asks, window_, cur_asks_);
-        diff_bids_.clear();
-        diff_asks_.clear();
-        wire::diffSide(bids_, cur_bids_, true, false, diff_bids_);
-        wire::diffSide(asks_, cur_asks_, false, false, diff_asks_);
-        if (diff_bids_.empty() && diff_asks_.empty()) return false;
+        if (!w_.advance(bids, asks, false)) return false;
         const std::uint64_t first = last_u_ + 1;
-        const std::uint64_t final_id = std::max(update_id, first);
-        out = wire::binanceDepthUpdate(symbol_, event_ms, first, final_id, diff_bids_, diff_asks_);
-        for (const Level& l : diff_bids_) touched_bids_.push_back(l.price);
-        for (const Level& l : diff_asks_) touched_asks_.push_back(l.price);
-        bids_.swap(cur_bids_);
-        asks_.swap(cur_asks_);
-        last_u_ = final_id;
+        last_u_ = std::max(update_id, first);
+        out = wire::binanceDepthUpdate(wire::kBinanceSymbol, event_ms, first, last_u_, w_.diffBids(), w_.diffAsks());
+        for (const Level& l : w_.diffBids()) touched_bids_.push_back(l.price);
+        for (const Level& l : w_.diffAsks()) touched_asks_.push_back(l.price);
         return true;
     }
 
-    // 慢速流（<symbol>@depth，1000 ms）：汇总自上一条慢速事件以来快速流触及过的全部价位，给出它们的当前数量
+    // 慢速流（btcusdt@depth，1000 ms）：汇总自上一条慢速事件以来快速流触及过的全部价位，给出它们的当前数量
     // （已不在窗口内 → 0）。U = 上一条慢速事件的 u + 1，u = 快速流当前的 u。
     // 为什么要汇总"触及过的价位"而不是对 1 s 前的窗口再做一次差分：REST 快照取自快速流的状态（某个 100 ms 边界 L），
     // 可能落在慢速事件的 [U, u] 区间内。某档在 L 之前变过、到 u 时又变回原值，净差分里没有它，客户端就会留着
@@ -119,57 +124,44 @@ public:
     // 调用顺序：同一步先 publish 再 publishSlow。没有任何变化时返回 false。
     bool publishSlow(std::int64_t event_ms, std::string& out) {
         if (touched_bids_.empty() && touched_asks_.empty()) return false;
-        sortUnique(touched_bids_, true);
-        sortUnique(touched_asks_, false);
-        slow_bids_.clear();
-        slow_asks_.clear();
-        for (const Price p : touched_bids_) slow_bids_.push_back(currentLevel(bids_, p, true));
-        for (const Price p : touched_asks_) slow_asks_.push_back(currentLevel(asks_, p, false));
-        out = wire::binanceDepthUpdate(symbol_, event_ms, slow_last_u_ + 1, last_u_, slow_bids_, slow_asks_);
+        collectTouched(touched_bids_, w_.bids(), true, slow_bids_);
+        collectTouched(touched_asks_, w_.asks(), false, slow_asks_);
+        out = wire::binanceDepthUpdate(wire::kBinanceSymbol, event_ms, slow_last_u_ + 1, last_u_, slow_bids_,
+                                       slow_asks_);
         slow_last_u_ = last_u_;
-        touched_bids_.clear();
-        touched_asks_.clear();
         return true;
     }
 
-    // GET /api/v3/depth 的响应体：已发布窗口的前 limit 档（窗口只有 window() 档，limit 更大时按窗口返回）
-    std::string restSnapshot(std::size_t limit) const {
-        return wire::binanceDepth(last_u_, detail::prefix(bids_, limit), detail::prefix(asks_, limit));
-    }
+    // GET /api/v3/depth 的响应体：已发布窗口的前 limit 档（窗口只有 kWindow 档，limit 更大时按窗口返回）
+    std::string restSnapshot(std::size_t limit) const { return wire::binanceDepth(last_u_, w_.bids(), w_.asks(), limit); }
 
-    // 部分深度推送 <symbol>@depth<levels>[@100ms]（形状与 REST 响应相同）
+    // 部分深度推送 btcusdt@depth<levels>[@100ms]（形状与 REST 响应相同）
     std::string partialDepth(std::size_t levels) const { return restSnapshot(levels); }
 
     std::uint64_t lastUpdateId() const noexcept { return last_u_; }
-    const Levels& bids() const noexcept { return bids_; }
-    const Levels& asks() const noexcept { return asks_; }
-    std::size_t window() const noexcept { return window_; }
-    const std::string& symbol() const noexcept { return symbol_; }
+    std::size_t window() const noexcept { return w_.size(); }
 
 private:
-    static void sortUnique(std::vector<Price>& v, bool descending) {
-        if (descending) {
-            std::sort(v.begin(), v.end(), [](Price a, Price b) { return a > b; });
-        } else {
-            std::sort(v.begin(), v.end());
+    // 触及过的价位（排序去重，最优在前）在已发布窗口中的当前档位，放进 out；清空 touched
+    static void collectTouched(std::vector<Price>& touched, const Levels& window, bool bids, Levels& out) {
+        auto better = [bids](Price a, Price b) { return wire::better(bids, a, b); };
+        std::sort(touched.begin(), touched.end(), better);
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        out.clear();
+        for (const Price p : touched) {
+            const auto it = std::lower_bound(window.begin(), window.end(), p,
+                                             [&better](const Level& l, Price x) { return better(l.price, x); });
+            out.push_back(it != window.end() && it->price == p ? *it : Level{p, 0, 0});
         }
-        v.erase(std::unique(v.begin(), v.end()), v.end());
+        touched.clear();
     }
 
-    static Level currentLevel(const Levels& levels, Price price, bool bids) noexcept {
-        const Level* l = detail::findLevel(levels, price, bids);
-        return l != nullptr ? *l : Level{price, 0, 0};
-    }
-
-    std::string symbol_;
-    std::size_t window_;
-    Levels bids_, asks_;                 // 已发布窗口
+    detail::DepthWindow w_{kWindow};     // 已发布窗口
     std::uint64_t last_u_ = 0;           // 快速流最近一条事件的 u（REST lastUpdateId）
     std::uint64_t slow_last_u_ = 0;      // 慢速流最近一条事件的 u
     std::vector<Price> touched_bids_;    // 自上一条慢速事件以来快速流触及的价位
     std::vector<Price> touched_asks_;
-    // 复用的暂存区（稳态不分配）
-    Levels cur_bids_, cur_asks_, diff_bids_, diff_asks_, slow_bids_, slow_asks_;
+    Levels slow_bids_, slow_asks_;       // 慢速事件的暂存区
 };
 
 // ---------------------------------------------------------------------------
@@ -177,72 +169,51 @@ private:
 // ---------------------------------------------------------------------------
 class OkxBooksPublisher {
 public:
-    static constexpr std::size_t kDefaultWindow = 400;
+    static constexpr std::size_t kWindow = 400;
     // 窗口长时间不变时的心跳间隔（bids/asks 为空、prevSeqId == seqId）。真实 OKX 约 60 s；
-    // 仿真中盘口每 100 ms 都在变，实际几乎不会触发，测试里用短间隔验证。<= 0 关闭。
+    // 仿真中盘口每 100 ms 都在变，实际几乎不会触发，测试里用短间隔验证。
     static constexpr std::int64_t kDefaultHeartbeatMs = 30000;
 
-    explicit OkxBooksPublisher(std::string inst_id = "BTC-USDT", std::size_t window = kDefaultWindow,
-                               std::int64_t heartbeat_ms = kDefaultHeartbeatMs)
-        : inst_id_(std::move(inst_id)),
-          window_(std::max<std::size_t>(wire::kOkxChecksumLevels, window)),
-          heartbeat_ms_(heartbeat_ms) {}
+    explicit OkxBooksPublisher(std::int64_t heartbeat_ms = kDefaultHeartbeatMs) : heartbeat_ms_(heartbeat_ms) {}
 
     void reset(const Levels& bids, const Levels& asks, std::int64_t seq, std::int64_t now_ms) {
-        wire::topLevels(bids, window_, bids_);
-        wire::topLevels(asks, window_, asks_);
-        last_seq_ = std::max<std::int64_t>(0, seq);
+        w_.reset(bids, asks);
+        last_seq_ = seq;
         last_push_ms_ = now_ms;
-        checksum_ = wire::okxChecksum(bids_, asks_);
+        checksum_ = wire::okxChecksum(w_.bids(), w_.asks());
     }
 
     // 一个推送周期：有变化 → action "update"；无变化且距上次推送超过心跳间隔 → 心跳；否则返回 false
     bool publish(const Levels& bids, const Levels& asks, std::int64_t seq, std::int64_t ts_ms, std::string& out) {
-        wire::topLevels(bids, window_, cur_bids_);
-        wire::topLevels(asks, window_, cur_asks_);
-        diff_bids_.clear();
-        diff_asks_.clear();
-        wire::diffSide(bids_, cur_bids_, true, true, diff_bids_);
-        wire::diffSide(asks_, cur_asks_, false, true, diff_asks_);
-        if (diff_bids_.empty() && diff_asks_.empty()) {
-            if (heartbeat_ms_ <= 0 || ts_ms - last_push_ms_ < heartbeat_ms_) return false;
-            // 心跳：两侧都是空数组（此时 diff_bids_ / diff_asks_ 恰好都为空），checksum 仍是当前窗口的
-            out = wire::okxBooks("books", inst_id_, "update", diff_bids_, diff_asks_, ts_ms, checksum_, last_seq_,
-                                 last_seq_);
-            last_push_ms_ = ts_ms;
-            return true;
-        }
-        bids_.swap(cur_bids_);
-        asks_.swap(cur_asks_);
-        checksum_ = wire::okxChecksum(bids_, asks_);
         const std::int64_t prev = last_seq_;
-        last_seq_ = std::max(seq, prev + 1);
-        out = wire::okxBooks("books", inst_id_, "update", diff_bids_, diff_asks_, ts_ms, checksum_, prev, last_seq_);
+        if (w_.advance(bids, asks, true)) {
+            checksum_ = wire::okxChecksum(w_.bids(), w_.asks());
+            last_seq_ = std::max(seq, prev + 1);
+        } else if (ts_ms - last_push_ms_ < heartbeat_ms_) {
+            return false;
+        }
+        // 心跳时差分两侧都是空数组、prevSeqId == seqId，checksum 仍是当前窗口的
+        out = wire::okxBooks("books", wire::kOkxInstId, "update", w_.diffBids(), w_.diffAsks(), ts_ms, checksum_, prev,
+                             last_seq_);
         last_push_ms_ = ts_ms;
         return true;
     }
 
     // 新订阅的快照：已发布窗口（prevSeqId = -1，seqId = 最近一条推送的 seqId）
     std::string snapshot(std::int64_t ts_ms) const {
-        return wire::okxBooks("books", inst_id_, "snapshot", bids_, asks_, ts_ms, checksum_, -1, last_seq_);
+        return wire::okxBooks("books", wire::kOkxInstId, "snapshot", w_.bids(), w_.asks(), ts_ms, checksum_, -1,
+                              last_seq_);
     }
 
     std::int64_t lastSeqId() const noexcept { return last_seq_; }
-    std::int32_t checksum() const noexcept { return checksum_; }
-    const Levels& bids() const noexcept { return bids_; }
-    const Levels& asks() const noexcept { return asks_; }
-    std::size_t window() const noexcept { return window_; }
-    const std::string& instId() const noexcept { return inst_id_; }
+    std::size_t window() const noexcept { return w_.size(); }
 
 private:
-    std::string inst_id_;
-    std::size_t window_;
     std::int64_t heartbeat_ms_;
-    Levels bids_, asks_;
+    detail::DepthWindow w_{kWindow};
     std::int64_t last_seq_ = 0;
     std::int64_t last_push_ms_ = 0;
     std::int32_t checksum_ = 0;
-    Levels cur_bids_, cur_asks_, diff_bids_, diff_asks_;
 };
 
 // ---------------------------------------------------------------------------
@@ -250,102 +221,69 @@ private:
 // ---------------------------------------------------------------------------
 class OkxTopPublisher {
 public:
-    OkxTopPublisher(std::string channel, std::size_t levels, std::string inst_id = "BTC-USDT")
-        : channel_(std::move(channel)), inst_id_(std::move(inst_id)), levels_(std::max<std::size_t>(1, levels)) {}
+    OkxTopPublisher(std::string channel, std::size_t levels) : channel_(std::move(channel)), w_(levels) {}
 
     void reset(const Levels& bids, const Levels& asks, std::int64_t seq) {
-        wire::topLevels(bids, levels_, bids_);
-        wire::topLevels(asks, levels_, asks_);
-        seq_ = std::max<std::int64_t>(0, seq);
+        w_.reset(bids, asks);
+        seq_ = seq;
     }
 
     bool publish(const Levels& bids, const Levels& asks, std::int64_t seq, std::int64_t ts_ms, std::string& out) {
-        wire::topLevels(bids, levels_, cur_bids_);
-        wire::topLevels(asks, levels_, cur_asks_);
-        if (detail::sameLevels(bids_, cur_bids_, true) && detail::sameLevels(asks_, cur_asks_, true)) return false;
-        bids_.swap(cur_bids_);
-        asks_.swap(cur_asks_);
+        if (!w_.advance(bids, asks, true)) return false;
         seq_ = std::max(seq, seq_ + 1);
         out = current(ts_ms);
         return true;
     }
 
     std::string current(std::int64_t ts_ms) const {
-        return wire::okxTopBook(channel_, inst_id_, bids_, asks_, ts_ms, seq_);
+        return wire::okxTopBook(channel_, wire::kOkxInstId, w_.bids(), w_.asks(), ts_ms, seq_);
     }
-
-    const std::string& channel() const noexcept { return channel_; }
-    std::size_t levels() const noexcept { return levels_; }
-    const Levels& bids() const noexcept { return bids_; }
-    const Levels& asks() const noexcept { return asks_; }
-    std::int64_t seqId() const noexcept { return seq_; }
 
 private:
     std::string channel_;
-    std::string inst_id_;
-    std::size_t levels_;
-    Levels bids_, asks_;
+    detail::DepthWindow w_;
     std::int64_t seq_ = 0;
-    Levels cur_bids_, cur_asks_;
 };
 
 // ---------------------------------------------------------------------------
-// Bybit orderbook.{depth}.{symbol}：订阅时 snapshot，之后 delta（u 严格 +1）
+// Bybit orderbook.{depth}.BTCUSDT：订阅时 snapshot，之后 delta（u 严格 +1）
 // ---------------------------------------------------------------------------
 class BybitBookPublisher {
 public:
     // 起始更新号：足够大，第一条 delta 不可能是 u == 1（Bybit 用 u == 1 表示"服务重启后的快照"）
     static constexpr std::uint64_t kInitialUpdateId = 1000000;
 
-    explicit BybitBookPublisher(std::size_t depth = 50, std::string symbol = "BTCUSDT",
-                                std::uint64_t initial_update_id = kInitialUpdateId)
-        : depth_(std::max<std::size_t>(1, depth)),
-          symbol_(std::move(symbol)),
-          topic_("orderbook." + std::to_string(depth_) + "." + symbol_),
-          u_(std::max<std::uint64_t>(2, initial_update_id)) {}
+    explicit BybitBookPublisher(std::size_t depth = 50)
+        : topic_("orderbook." + std::to_string(depth) + "." + std::string(wire::kBybitSymbol)), w_(depth) {}
 
     void reset(const Levels& bids, const Levels& asks, std::uint64_t seq) {
-        wire::topLevels(bids, depth_, bids_);
-        wire::topLevels(asks, depth_, asks_);
+        w_.reset(bids, asks);
         seq_ = seq;
     }
 
     bool publish(const Levels& bids, const Levels& asks, std::uint64_t seq, std::int64_t ts_ms, std::int64_t cts_ms,
                  std::string& out) {
-        wire::topLevels(bids, depth_, cur_bids_);
-        wire::topLevels(asks, depth_, cur_asks_);
-        diff_bids_.clear();
-        diff_asks_.clear();
-        wire::diffSide(bids_, cur_bids_, true, false, diff_bids_);
-        wire::diffSide(asks_, cur_asks_, false, false, diff_asks_);
-        if (diff_bids_.empty() && diff_asks_.empty()) return false;
-        bids_.swap(cur_bids_);
-        asks_.swap(cur_asks_);
+        if (!w_.advance(bids, asks, false)) return false;
         ++u_;
         seq_ = std::max(seq, seq_ + 1);
-        out = wire::bybitBook(topic_, "delta", symbol_, diff_bids_, diff_asks_, u_, seq_, ts_ms, cts_ms);
+        out = wire::bybitBook(topic_, "delta", wire::kBybitSymbol, w_.diffBids(), w_.diffAsks(), u_, seq_, ts_ms,
+                              cts_ms);
         return true;
     }
 
     std::string snapshot(std::int64_t ts_ms, std::int64_t cts_ms) const {
-        return wire::bybitBook(topic_, "snapshot", symbol_, bids_, asks_, u_, seq_, ts_ms, cts_ms);
+        return wire::bybitBook(topic_, "snapshot", wire::kBybitSymbol, w_.bids(), w_.asks(), u_, seq_, ts_ms, cts_ms);
     }
 
     const std::string& topic() const noexcept { return topic_; }
-    std::size_t depth() const noexcept { return depth_; }
     std::uint64_t lastUpdateId() const noexcept { return u_; }
     std::uint64_t seq() const noexcept { return seq_; }
-    const Levels& bids() const noexcept { return bids_; }
-    const Levels& asks() const noexcept { return asks_; }
 
 private:
-    std::size_t depth_;
-    std::string symbol_;
     std::string topic_;
-    Levels bids_, asks_;
-    std::uint64_t u_;
+    detail::DepthWindow w_;
+    std::uint64_t u_ = kInitialUpdateId;
     std::uint64_t seq_ = 0;
-    Levels cur_bids_, cur_asks_, diff_bids_, diff_asks_;
 };
 
 }  // namespace mock_exchange::pub

@@ -29,6 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -36,8 +37,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -56,7 +57,7 @@
 // - 订阅的原子性：会话在 Hub 锁内同时取得"由已发布窗口生成的快照"与该流日志的当前序号作为游标，
 //   之后只转发游标之后的报文——快照与后续增量严格衔接（OKX prevSeqId、Bybit u、Binance REST lastUpdateId）。
 // - 所有连接看到同一条报文序列（与真实交易所一样，序列号是每个交易对全局的），慢的连接只影响它自己的线程；
-//   落后超过日志保留范围（retention_ms）的连接被断开（真实交易所也会断开慢消费者），重连后重新同步。
+//   落后超过日志保留范围（kRetentionMs）的连接被断开（真实交易所也会断开慢消费者），重连后重新同步。
 // - 推送后发布者通过 SessionWaker 立即唤醒各会话线程（不必等待 WsSession 的 10 ms 轮询片），
 //   所以报文的 E / ts 时间戳与客户端收到的时刻只差网络与调度延迟。
 // - 仿真按仿真时间调度推送（每 N 步一次），整条报文序列只由种子决定；墙钟只决定"何时"发生。
@@ -72,35 +73,31 @@ using LogFn = std::function<void(const std::string&)>;
 inline MessagePtr makeMessage(std::string s) { return std::make_shared<const std::string>(std::move(s)); }
 
 // 推送周期（毫秒，均为仿真步长 5 ms 的整数倍）
-inline constexpr int kBinanceFastMs = 100;    // <symbol>@depth@100ms、depth<N>@100ms
-inline constexpr int kBinanceSlowMs = 1000;   // <symbol>@depth、depth<N>
+inline constexpr int kBinanceFastMs = 100;    // btcusdt@depth@100ms、depth<N>@100ms
+inline constexpr int kBinanceSlowMs = 1000;   // btcusdt@depth、depth<N>
 inline constexpr int kOkxBooksMs = 100;       // books（400 档增量）、books5
 inline constexpr int kOkxBboMs = 10;          // bbo-tbt
 inline constexpr std::size_t kBybitDepthCount = 3;
 inline constexpr std::array<std::size_t, kBybitDepthCount> kBybitDepths{1, 50, 200};
 inline constexpr std::array<int, kBybitDepthCount> kBybitPeriodsMs{10, 20, 200};   // 现货：1 档 10 ms、50 档 20 ms、200 档 200 ms
+// 每个推送流保留的报文时长（至少 64 条）：落后超过它的慢连接被断开
+inline constexpr int kRetentionMs = 30000;
 
 // ---------------------------------------------------------------------------
 // 单个推送流的报文日志：按序号（1, 2, ...）保存最近 capacity 条
 // ---------------------------------------------------------------------------
 class StreamLog {
 public:
-    explicit StreamLog(std::size_t capacity = 256) : capacity_(std::max<std::size_t>(1, capacity)) {}
-
-    void setCapacity(std::size_t capacity) {
-        capacity_ = std::max<std::size_t>(1, capacity);
-        while (entries_.size() > capacity_) entries_.pop_front();
-    }
+    explicit StreamLog(std::size_t capacity) : capacity_(capacity) {}
 
     void append(std::string message) {
         entries_.push_back(makeMessage(std::move(message)));
         ++last_seq_;
-        while (entries_.size() > capacity_) entries_.pop_front();
+        if (entries_.size() > capacity_) entries_.pop_front();
     }
 
     std::uint64_t lastSeq() const noexcept { return last_seq_; }
     std::size_t size() const noexcept { return entries_.size(); }
-    std::size_t capacity() const noexcept { return capacity_; }
 
     // 把序号 > cursor 的报文追加到 out，cursor 前进到最新序号。cursor 之后的报文已有被淘汰的（客户端落后太多）
     // 时返回 false，out 与 cursor 都不变。
@@ -125,7 +122,7 @@ namespace detail {
 
 inline std::mt19937_64& threadRng() {
     thread_local std::mt19937_64 rng([] {
-        std::uint64_t seed = static_cast<std::uint64_t>(nowNs()) ^ 0x6D6F636B65786368ULL;
+        std::uint64_t seed = static_cast<std::uint64_t>(hft::nowNs()) ^ 0x6D6F636B65786368ULL;
         try {
             std::random_device rd;
             seed ^= (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
@@ -148,7 +145,7 @@ inline std::string makeUuid() {
     return randomHex(8) + "-" + randomHex(4) + "-" + randomHex(4) + "-" + randomHex(4) + "-" + randomHex(12);
 }
 
-// 段数：period_ms / 步长，至少 1
+// 步数：period_ms / 步长，至少 1
 inline std::uint64_t periodSteps(int period_ms, double step_s) {
     const double steps = static_cast<double>(period_ms) / (step_s * 1000.0);
     return static_cast<std::uint64_t>(std::max<long long>(1, std::llround(steps)));
@@ -163,14 +160,6 @@ inline std::vector<std::string> splitStreams(std::string_view s) {
         if (!part.empty()) out.emplace_back(part);
         if (slash == std::string_view::npos) break;
         s.remove_prefix(slash + 1);
-    }
-    return out;
-}
-
-inline std::string lower(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
     return out;
 }
@@ -193,7 +182,7 @@ inline void writeFileAtomic(const std::string& path, const std::string& contents
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
-// Hub 基类：互斥锁、会话唤醒表、计数与通用的会话主循环
+// Hub 基类：互斥锁、推送流日志、会话唤醒表、计数与通用的会话主循环
 // ---------------------------------------------------------------------------
 class SessionHub {
 public:
@@ -205,17 +194,17 @@ public:
         std::uint64_t requests = 0;          // 收到的客户端文本帧
         std::uint64_t bad_requests = 0;      // 其中被拒绝 / 报错的
         std::uint64_t rest_requests = 0;     // HTTP 请求（Binance REST）
-        std::uint64_t slow_disconnects = 0;  // 落后超过日志保留范围而被断开的会话
         std::uint64_t dropped = 0;           // 故障注入丢弃的推送报文
     };
 
-    explicit SessionHub(std::string name) : name_(std::move(name)) {}
-    virtual ~SessionHub() = default;
+    // 每个推送流一个日志：periods_ms[i] 是第 i 个流的推送周期，日志保留 kRetentionMs 内的报文（至少 64 条）
+    SessionHub(std::string name, std::initializer_list<int> periods_ms) : name_(std::move(name)) {
+        for (const int period : periods_ms) {
+            logs_.emplace_back(static_cast<std::size_t>(std::max(64, kRetentionMs / period)));
+        }
+    }
     SessionHub(const SessionHub&) = delete;
     SessionHub& operator=(const SessionHub&) = delete;
-
-    virtual bool acceptUpgrade(const std::string& target) const = 0;
-    virtual void serve(WsSession& ws) = 0;
 
     const std::string& name() const noexcept { return name_; }
 
@@ -229,7 +218,6 @@ public:
         c.requests = requests_.load(r);
         c.bad_requests = bad_requests_.load(r);
         c.rest_requests = rest_requests_.load(r);
-        c.slow_disconnects = slow_disconnects_.load(r);
         c.dropped = dropped_.load(r);
         return c;
     }
@@ -239,9 +227,7 @@ public:
 
     // 故障注入（测试 / 演示）：每条推送报文以概率 p 不发给某个会话（各会话独立抽签；订阅应答与快照照常发送），
     // 客户端于是看到序列号缺口并按各自的协议重同步。任意线程可随时修改。
-    void setDropRate(double p) noexcept {
-        drop_rate_.store(std::isfinite(p) ? std::clamp(p, 0.0, 1.0) : 0.0, std::memory_order_relaxed);
-    }
+    void setDropRate(double p) noexcept { drop_rate_.store(p, std::memory_order_relaxed); }
 
 protected:
     // 会话登记（RAII）：唤醒句柄 + 打开会话计数
@@ -289,7 +275,6 @@ protected:
                 sendAll(ws, out);
             }
             if (!collect(out)) {
-                slow_disconnects_.fetch_add(1, std::memory_order_relaxed);
                 log("session " + std::to_string(ws.sessionIndex()) +
                     ": client fell behind the message log, disconnecting (slow consumer)");
                 ws.close(1008, "slow consumer");
@@ -308,6 +293,36 @@ protected:
         }
     }
 
+    // 按流编号订阅（OKX 频道、Bybit 深度）的会话取新报文：按编号顺序收集；任一流落后超过保留范围返回 false
+    template <std::size_t N>
+    bool collectSubscribed(const bool (&subscribed)[N], std::uint64_t (&cursor)[N], std::vector<MessagePtr>& out) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t i = 0; i < N; ++i) {
+            if (subscribed[i] && !logs_[i].collect(cursor[i], out)) return false;
+        }
+        return true;
+    }
+
+    // 发布了新报文之后调用（mutex_ 已持有）：推进 tick 并唤醒全部会话
+    void notifyLocked() noexcept {
+        ticks_.fetch_add(1, std::memory_order_acq_rel);
+        for (const auto& w : wakers_) w.second.wake();
+    }
+
+    void log(const std::string& line) const noexcept {
+        if (!log_) return;
+        try {
+            log_("[" + name_ + "] " + line);
+        } catch (...) {
+        }
+    }
+
+    mutable std::mutex mutex_;     // 保护 logs_、派生类的发布者状态，以及 wakers_
+    std::vector<StreamLog> logs_;  // 每个推送流一个（编号由派生类定义）
+    std::atomic<std::uint64_t> rest_requests_{0};
+    std::atomic<std::uint64_t> bad_requests_{0};
+
+private:
     // 按 drop_rate_ 随机去掉 out 中的推送报文
     void dropSome(std::vector<MessagePtr>& out, std::mt19937_64& rng) {
         const double p = drop_rate_.load(std::memory_order_relaxed);
@@ -327,32 +342,13 @@ protected:
         out.clear();
     }
 
-    // 发布了新报文之后调用（mutex_ 已持有）：推进 tick 并唤醒全部会话
-    void notifyLocked() noexcept {
-        ticks_.fetch_add(1, std::memory_order_acq_rel);
-        for (const auto& w : wakers_) w.second.wake();
-    }
-
-    void log(const std::string& line) const noexcept {
-        if (!log_) return;
-        try {
-            log_("[" + name_ + "] " + line);
-        } catch (...) {
-        }
-    }
-
-    mutable std::mutex mutex_;   // 保护派生类的发布者状态与日志，以及 wakers_
-    std::atomic<std::uint64_t> rest_requests_{0};
-    std::atomic<std::uint64_t> bad_requests_{0};
-
-private:
     std::string name_;
     LogFn log_;
     std::atomic<std::uint64_t> ticks_{0};
     std::vector<std::pair<std::uint64_t, SessionWaker>> wakers_;
     std::uint64_t next_waker_id_ = 1;
     std::atomic<std::uint64_t> sessions_total_{0}, sessions_open_{0}, messages_sent_{0}, bytes_sent_{0}, requests_{0},
-        slow_disconnects_{0}, dropped_{0};
+        dropped_{0};
     std::atomic<double> drop_rate_{0.0};
 };
 
@@ -362,28 +358,9 @@ private:
 // ---------------------------------------------------------------------------
 class BinanceHub final : public SessionHub {
 public:
-    enum Stream : std::size_t {
-        kDiffFast,       // <symbol>@depth@100ms
-        kDiffSlow,       // <symbol>@depth（1000 ms）
-        kPartial5Fast,   // <symbol>@depth5@100ms
-        kPartial10Fast,
-        kPartial20Fast,
-        kPartial5Slow,   // <symbol>@depth5（1000 ms）
-        kPartial10Slow,
-        kPartial20Slow,
-        kStreamCount
-    };
-
-    BinanceHub(std::string symbol, std::size_t window, int retention_ms)
-        : SessionHub("Binance"),
-          pub_(symbol, window),
-          symbol_(std::move(symbol)),
-          symbol_lower_(detail::lower(symbol_)) {
-        for (std::size_t i = 0; i < kStreamCount; ++i) {
-            const int period = isFast(static_cast<Stream>(i)) ? kBinanceFastMs : kBinanceSlowMs;
-            logs_[i].setCapacity(static_cast<std::size_t>(std::max(64, retention_ms / period)));
-        }
-    }
+    BinanceHub()
+        : SessionHub("Binance", {kBinanceFastMs, kBinanceFastMs, kBinanceFastMs, kBinanceFastMs, kBinanceSlowMs,
+                                 kBinanceSlowMs, kBinanceSlowMs, kBinanceSlowMs}) {}
 
     // ---- 仿真线程 ----
     void reset(const pub::Levels& bids, const pub::Levels& asks, std::uint64_t update_id) {
@@ -394,21 +371,15 @@ public:
     // 100 ms：增量快速流 + 三个 100 ms 部分深度流
     void tickFast(const pub::Levels& bids, const pub::Levels& asks, std::uint64_t update_id, std::int64_t now_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (pub_.publish(bids, asks, update_id, now_ms, scratch_)) logs_[kDiffFast].append(std::move(scratch_));
-        logs_[kPartial5Fast].append(pub_.partialDepth(5));
-        logs_[kPartial10Fast].append(pub_.partialDepth(10));
-        logs_[kPartial20Fast].append(pub_.partialDepth(20));
-        notifyLocked();
+        if (pub_.publish(bids, asks, update_id, now_ms, scratch_)) logs_[kFast].append(std::move(scratch_));
+        publishPartialsLocked(kFast);
     }
 
     // 1000 ms：增量慢速流 + 三个 1000 ms 部分深度流（同一步先 tickFast）
     void tickSlow(std::int64_t now_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (pub_.publishSlow(now_ms, scratch_)) logs_[kDiffSlow].append(std::move(scratch_));
-        logs_[kPartial5Slow].append(pub_.partialDepth(5));
-        logs_[kPartial10Slow].append(pub_.partialDepth(10));
-        logs_[kPartial20Slow].append(pub_.partialDepth(20));
-        notifyLocked();
+        if (pub_.publishSlow(now_ms, scratch_)) logs_[kSlow].append(std::move(scratch_));
+        publishPartialsLocked(kSlow);
     }
 
     // ---- 观测（测试用）----
@@ -416,16 +387,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return pub_.lastUpdateId();
     }
-    template <class F>
-    void withPublisher(F&& f) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        f(pub_);
-    }
 
     // ---- 服务器回调（连接线程）----
-    bool acceptUpgrade(const std::string& target) const override { return parseEndpoint(target).ok; }
+    bool acceptUpgrade(const std::string& target) const { return parseEndpoint(target).ok; }
 
-    void serve(WsSession& ws) override {
+    void serve(WsSession& ws) {
         State st;
         const Endpoint ep = parseEndpoint(ws.target());
         st.combined = ep.combined;
@@ -439,7 +405,7 @@ public:
             [&](std::vector<MessagePtr>& out) { return collect(st, out); });
     }
 
-    mock_exchange::HttpReply handleHttp(const HttpRequestInfo& req) {
+    HttpReply handleHttp(const HttpRequestInfo& req) {
         rest_requests_.fetch_add(1, std::memory_order_relaxed);
         HttpReply reply = restReply(req);
         if (reply.status != 200) bad_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -448,11 +414,12 @@ public:
         return reply;
     }
 
-    static bool isFast(Stream s) noexcept {
-        return s == kDiffFast || s == kPartial5Fast || s == kPartial10Fast || s == kPartial20Fast;
-    }
-
 private:
+    // 流编号：快速流（100 ms）kFast + k、慢速流（1000 ms）kSlow + k；k = 0 为增量深度，1..3 为 depth5/10/20
+    static constexpr std::size_t kFast = 0;
+    static constexpr std::size_t kSlow = 4;
+    static constexpr std::size_t kPartialLevels[] = {5, 10, 20};
+
     struct Sub {
         std::string name;      // 客户端使用的流名（combined 包装里原样返回）
         std::size_t stream;
@@ -470,21 +437,22 @@ private:
         std::vector<std::string> streams;
     };
 
-    // 流名 → 流编号；不是本交易对的深度流返回 false
-    bool streamFor(std::string_view name, std::size_t& index) const {
+    // 三个部分深度流各追加一条（mutex_ 已持有），然后唤醒会话
+    void publishPartialsLocked(std::size_t group) {
+        for (std::size_t k = 0; k < 3; ++k) logs_[group + 1 + k].append(pub_.partialDepth(kPartialLevels[k]));
+        notifyLocked();
+    }
+
+    // 流名 → 流编号；不是 btcusdt 的深度流返回 false
+    static bool streamFor(std::string_view name, std::size_t& index) {
         wire::BinanceStream s;
-        if (!wire::parseBinanceStream(name, symbol_lower_, s)) return false;
-        const bool fast = s.period_ms == 100;
-        switch (s.levels) {
-            case 0: index = fast ? kDiffFast : kDiffSlow; break;
-            case 5: index = fast ? kPartial5Fast : kPartial5Slow; break;
-            case 10: index = fast ? kPartial10Fast : kPartial10Slow; break;
-            default: index = fast ? kPartial20Fast : kPartial20Slow; break;
-        }
+        if (!wire::parseBinanceStream(name, s)) return false;
+        index = (s.period_ms == kBinanceFastMs ? kFast : kSlow) +
+                (s.levels == 0 ? 0 : s.levels == 5 ? 1 : s.levels == 10 ? 2 : 3);
         return true;
     }
 
-    Endpoint parseEndpoint(const std::string& target) const {
+    static Endpoint parseEndpoint(const std::string& target) {
         const wire::HttpTarget t = wire::parseHttpTarget(target);
         Endpoint e;
         if (t.path == "/ws" || t.path == "/ws/") {
@@ -563,92 +531,75 @@ private:
 
     bool handleRequest(State& st, const std::string& frame, std::vector<MessagePtr>& out) {
         namespace dom = simdjson::dom;
-        auto error = [&out](int code, const std::string& msg, std::string_view id_json = std::string_view()) {
-            out.push_back(makeMessage(wire::binanceError(code, msg, id_json)));
+        constexpr auto kOk = simdjson::SUCCESS;
+        std::string id;  // 原样的 JSON 记号；解析出 id 之前为空（错误应答不带 id）
+        auto reply = [&](std::string message) {
+            out.push_back(makeMessage(std::move(message)));
+            return true;
+        };
+        auto error = [&](int code, const std::string& msg) {
+            out.push_back(makeMessage(wire::binanceError(code, msg, id)));
             return false;
         };
         dom::element doc;
-        if (st.parser.parse(frame).get(doc) != simdjson::SUCCESS) {
-            return error(3, "Invalid JSON: expected a JSON request object");
-        }
         dom::object obj;
-        if (doc.get_object().get(obj) != simdjson::SUCCESS) return error(2, "Invalid request: expected a JSON object");
-        std::string id;
+        if (st.parser.parse(frame).get(doc) != kOk) return error(3, "Invalid JSON: expected a JSON request object");
+        if (doc.get_object().get(obj) != kOk) return error(2, "Invalid request: expected a JSON object");
         if (!requestId(obj, id)) return error(2, "Invalid request: request ID must be an unsigned integer");
         std::string_view method;
-        if (obj["method"].get_string().get(method) != simdjson::SUCCESS) {
-            return error(2, "Invalid request: missing field `method`", id);
-        }
+        if (obj["method"].get_string().get(method) != kOk) return error(2, "Invalid request: missing field `method`");
         dom::array params;
-        const bool has_params = obj["params"].get_array().get(params) == simdjson::SUCCESS;
+        const bool has_params = obj["params"].get_array().get(params) == kOk;
         if (method == "SUBSCRIBE" || method == "UNSUBSCRIBE") {
-            if (!has_params) return error(2, "Invalid request: missing field `params`", id);
+            if (!has_params) return error(2, "Invalid request: missing field `params`");
             std::vector<std::string> names;
             for (dom::element p : params) {
                 std::string_view name;
                 std::size_t index = 0;
-                if (p.get_string().get(name) != simdjson::SUCCESS) {
-                    return error(2, "Invalid request: stream names must be strings", id);
-                }
-                if (!streamFor(name, index)) {
-                    return error(2, "Invalid request: unknown stream '" + std::string(name) + "'", id);
-                }
+                if (p.get_string().get(name) != kOk) return error(2, "Invalid request: stream names must be strings");
+                if (!streamFor(name, index)) return error(2, "Invalid request: unknown stream '" + std::string(name) + "'");
                 names.emplace_back(name);
             }
-            {
+            if (method == "SUBSCRIBE") {
                 std::lock_guard<std::mutex> lock(mutex_);
+                for (const std::string& name : names) subscribeLocked(st, name);
+            } else {
                 for (const std::string& name : names) {
-                    if (method == "SUBSCRIBE") {
-                        subscribeLocked(st, name);
-                    } else {
-                        st.subs.erase(std::remove_if(st.subs.begin(), st.subs.end(),
-                                                     [&name](const Sub& s) { return s.name == name; }),
-                                      st.subs.end());
-                    }
+                    st.subs.erase(std::remove_if(st.subs.begin(), st.subs.end(),
+                                                 [&name](const Sub& s) { return s.name == name; }),
+                                  st.subs.end());
                 }
             }
-            out.push_back(makeMessage(wire::binanceResult("null", id)));
             std::string joined;
             for (const std::string& n : names) joined += (joined.empty() ? "" : ",") + n;
             log(std::string(method) + " " + joined);
-            return true;
+            return reply(wire::binanceResult("null", id));
         }
         if (method == "LIST_SUBSCRIPTIONS") {
             std::string list = "[";
-            for (std::size_t i = 0; i < st.subs.size(); ++i) {
-                if (i > 0) list.push_back(',');
-                wire::appendJsonString(list, st.subs[i].name);
+            for (const Sub& s : st.subs) {
+                if (list.size() > 1) list.push_back(',');
+                wire::appendJsonString(list, s.name);
             }
             list.push_back(']');
-            out.push_back(makeMessage(wire::binanceResult(list, id)));
-            return true;
+            return reply(wire::binanceResult(list, id));
         }
         if (method == "SET_PROPERTY" || method == "GET_PROPERTY") {
-            std::vector<dom::element> p;
-            if (has_params) {
-                for (dom::element e : params) p.push_back(e);
-            }
             std::string_view prop;
-            if (p.empty() || p[0].get_string().get(prop) != simdjson::SUCCESS || prop != "combined") {
-                return error(0, "Unknown property", id);
+            if (!has_params || params.at(0).get_string().get(prop) != kOk || prop != "combined") {
+                return error(0, "Unknown property");
             }
-            if (method == "GET_PROPERTY") {
-                out.push_back(makeMessage(wire::binanceResult(st.combined ? "true" : "false", id)));
-                return true;
-            }
+            if (method == "GET_PROPERTY") return reply(wire::binanceResult(st.combined ? "true" : "false", id));
             bool value = false;
-            if (p.size() != 2 || p[1].get_bool().get(value) != simdjson::SUCCESS) {
-                return error(1, "Invalid value type: expected Boolean", id);
+            if (params.size() != 2 || params.at(1).get_bool().get(value) != kOk) {
+                return error(1, "Invalid value type: expected Boolean");
             }
             st.combined = value;
-            out.push_back(makeMessage(wire::binanceResult("null", id)));
-            return true;
+            return reply(wire::binanceResult("null", id));
         }
-        return error(2,
-                     "Invalid request: unknown variant `" + std::string(method) +
-                         "`, expected one of `SUBSCRIBE`, `UNSUBSCRIBE`, `LIST_SUBSCRIPTIONS`, `SET_PROPERTY`, "
-                         "`GET_PROPERTY`",
-                     id);
+        return error(2, "Invalid request: unknown variant `" + std::string(method) +
+                            "`, expected one of `SUBSCRIBE`, `UNSUBSCRIBE`, `LIST_SUBSCRIPTIONS`, `SET_PROPERTY`, "
+                            "`GET_PROPERTY`");
     }
 
     HttpReply restReply(const HttpRequestInfo& req) const {
@@ -675,7 +626,7 @@ private:
             return reply(400, wire::binanceError(-1100, "Illegal characters found in parameter 'symbol'; legal range "
                                                         "is '^[A-Z0-9-_.]{1,20}$'."));
         }
-        if (*symbol != symbol_) return reply(400, wire::binanceError(-1121, "Invalid symbol."));
+        if (*symbol != wire::kBinanceSymbol) return reply(400, wire::binanceError(-1121, "Invalid symbol."));
         std::size_t limit = pub::BinanceDepthPublisher::kDefaultRestLimit;
         if (const std::string* l = t.param("limit")) {
             std::uint64_t v = 0;
@@ -693,9 +644,6 @@ private:
     }
 
     pub::BinanceDepthPublisher pub_;
-    std::string symbol_;
-    std::string symbol_lower_;
-    StreamLog logs_[kStreamCount];
     std::string scratch_;
 };
 
@@ -707,16 +655,7 @@ class OkxHub final : public SessionHub {
 public:
     enum Channel : std::size_t { kBooks, kBooks5, kBbo, kChannelCount };
 
-    OkxHub(std::string inst_id, std::size_t window, std::int64_t heartbeat_ms, int retention_ms)
-        : SessionHub("OKX"),
-          inst_id_(inst_id),
-          books_(inst_id, window, heartbeat_ms),
-          books5_("books5", 5, inst_id),
-          bbo_("bbo-tbt", 1, inst_id) {
-        logs_[kBooks].setCapacity(static_cast<std::size_t>(std::max(64, retention_ms / kOkxBooksMs)));
-        logs_[kBooks5].setCapacity(static_cast<std::size_t>(std::max(64, retention_ms / kOkxBooksMs)));
-        logs_[kBbo].setCapacity(static_cast<std::size_t>(std::max(64, retention_ms / kOkxBboMs)));
-    }
+    OkxHub() : SessionHub("OKX", {kOkxBooksMs, kOkxBooksMs, kOkxBboMs}) {}
 
     void reset(const pub::Levels& bids, const pub::Levels& asks, std::int64_t seq, std::int64_t now_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -728,16 +667,11 @@ public:
     // 100 ms：books + books5
     void tickBooks(const pub::Levels& bids, const pub::Levels& asks, std::int64_t seq, std::int64_t now_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
-        bool any = false;
-        if (books_.publish(bids, asks, seq, now_ms, scratch_)) {
-            logs_[kBooks].append(std::move(scratch_));
-            any = true;
-        }
-        if (books5_.publish(bids, asks, seq, now_ms, scratch_)) {
-            logs_[kBooks5].append(std::move(scratch_));
-            any = true;
-        }
-        if (any) notifyLocked();
+        const bool books = books_.publish(bids, asks, seq, now_ms, scratch_);
+        if (books) logs_[kBooks].append(std::move(scratch_));
+        const bool books5 = books5_.publish(bids, asks, seq, now_ms, scratch_);
+        if (books5) logs_[kBooks5].append(std::move(scratch_));
+        if (books || books5) notifyLocked();
     }
 
     // 10 ms：bbo-tbt
@@ -753,29 +687,18 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return books_.lastSeqId();
     }
-    template <class F>
-    void withPublisher(F&& f) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        f(books_);
-    }
 
-    bool acceptUpgrade(const std::string& target) const override {
+    bool acceptUpgrade(const std::string& target) const {
         return wire::parseHttpTarget(target).path == "/ws/v5/public";
     }
 
-    void serve(WsSession& ws) override {
+    void serve(WsSession& ws) {
         State st;
         st.conn_id = detail::randomHex(8);
         log("session " + std::to_string(ws.sessionIndex()) + " opened (connId " + st.conn_id + ")");
         runSession(
             ws, [&](const std::string& frame, std::vector<MessagePtr>& out) { return handleRequest(st, frame, out); },
-            [&](std::vector<MessagePtr>& out) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                for (std::size_t c = 0; c < kChannelCount; ++c) {
-                    if (st.subscribed[c] && !logs_[c].collect(st.cursor[c], out)) return false;
-                }
-                return true;
-            });
+            [&](std::vector<MessagePtr>& out) { return collectSubscribed(st.subscribed, st.cursor, out); });
     }
 
 private:
@@ -839,7 +762,7 @@ private:
             }
             if (arg["instId"].get_string().get(inst) != simdjson::SUCCESS) inst = std::string_view();
             const int c = channelIndex(channel);
-            if (c < 0 || inst != inst_id_) {
+            if (c < 0 || inst != wire::kOkxInstId) {
                 out.push_back(makeMessage(wire::okxError("60018",
                                                          "Wrong URL or channel:" + std::string(channel) + ",instId:" +
                                                              std::string(inst) + " doesn't exist",
@@ -864,29 +787,19 @@ private:
         return ok;
     }
 
-    std::string inst_id_;
     pub::OkxBooksPublisher books_;
-    pub::OkxTopPublisher books5_;
-    pub::OkxTopPublisher bbo_;
-    StreamLog logs_[kChannelCount];
+    pub::OkxTopPublisher books5_{"books5", 5};
+    pub::OkxTopPublisher bbo_{"bbo-tbt", 1};
     std::string scratch_;
 };
 
 // ---------------------------------------------------------------------------
-// Bybit：/v5/public/spot；op subscribe / unsubscribe（args ["orderbook.{1,50,200}.<symbol>"]，可带 req_id）、
+// Bybit：/v5/public/spot；op subscribe / unsubscribe（args ["orderbook.{1,50,200}.BTCUSDT"]，可带 req_id）、
 // op ping → pong 应答
 // ---------------------------------------------------------------------------
 class BybitHub final : public SessionHub {
 public:
-    BybitHub(const std::string& symbol, int retention_ms)
-        : SessionHub("Bybit"),
-          symbol_(symbol),
-          books_{pub::BybitBookPublisher(kBybitDepths[0], symbol), pub::BybitBookPublisher(kBybitDepths[1], symbol),
-                 pub::BybitBookPublisher(kBybitDepths[2], symbol)} {
-        for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
-            logs_[i].setCapacity(static_cast<std::size_t>(std::max(64, retention_ms / kBybitPeriodsMs[i])));
-        }
-    }
+    BybitHub() : SessionHub("Bybit", {kBybitPeriodsMs[0], kBybitPeriodsMs[1], kBybitPeriodsMs[2]}) {}
 
     void reset(const pub::Levels& bids, const pub::Levels& asks, std::uint64_t seq) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -906,36 +819,18 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return books_.at(depth_index).lastUpdateId();
     }
-    template <class F>
-    void withPublisher(std::size_t depth_index, F&& f) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        f(books_.at(depth_index));
-    }
 
-    static int depthIndex(int depth) noexcept {
-        for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
-            if (static_cast<int>(kBybitDepths[i]) == depth) return static_cast<int>(i);
-        }
-        return -1;
-    }
-
-    bool acceptUpgrade(const std::string& target) const override {
+    bool acceptUpgrade(const std::string& target) const {
         return wire::parseHttpTarget(target).path == "/v5/public/spot";
     }
 
-    void serve(WsSession& ws) override {
+    void serve(WsSession& ws) {
         State st;
         st.conn_id = detail::makeUuid();
         log("session " + std::to_string(ws.sessionIndex()) + " opened (conn_id " + st.conn_id + ")");
         runSession(
             ws, [&](const std::string& frame, std::vector<MessagePtr>& out) { return handleRequest(st, frame, out); },
-            [&](std::vector<MessagePtr>& out) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
-                    if (st.subscribed[i] && !logs_[i].collect(st.cursor[i], out)) return false;
-                }
-                return true;
-            });
+            [&](std::vector<MessagePtr>& out) { return collectSubscribed(st.subscribed, st.cursor, out); });
     }
 
 private:
@@ -945,6 +840,13 @@ private:
         std::uint64_t cursor[kBybitDepthCount] = {};
         simdjson::dom::parser parser;
     };
+
+    static int depthIndex(int depth) noexcept {
+        for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
+            if (static_cast<int>(kBybitDepths[i]) == depth) return static_cast<int>(i);
+        }
+        return -1;
+    }
 
     bool handleRequest(State& st, const std::string& frame, std::vector<MessagePtr>& out) {
         namespace dom = simdjson::dom;
@@ -973,23 +875,24 @@ private:
         }
         std::string failures;
         std::vector<std::size_t> accepted;
+        auto fail = [&failures](const char* what, std::string_view topic) {
+            failures += (failures.empty() ? "" : ";") + std::string(what) + std::string(topic);
+        };
         for (dom::element a : args) {
             std::string_view topic;
             int depth = 0;
             int index = -1;
-            if (a.get_string().get(topic) == simdjson::SUCCESS && wire::parseBybitTopic(topic, symbol_, depth)) {
+            if (a.get_string().get(topic) == simdjson::SUCCESS && wire::parseBybitTopic(topic, depth)) {
                 index = depthIndex(depth);
             }
             if (index < 0) {
-                failures += (failures.empty() ? "" : ";") + std::string("error:handler not found,topic:") +
-                            std::string(topic);
+                fail("error:handler not found,topic:", topic);
                 continue;
             }
             const auto i = static_cast<std::size_t>(index);
             const bool duplicate = st.subscribed[i] || std::find(accepted.begin(), accepted.end(), i) != accepted.end();
             if (op == "subscribe" && duplicate) {
-                failures += (failures.empty() ? "" : ";") + std::string("error:already subscribed,topic:") +
-                            std::string(topic);
+                fail("error:already subscribed,topic:", topic);
                 continue;
             }
             accepted.push_back(i);
@@ -1006,15 +909,14 @@ private:
             } else {
                 st.subscribed[i] = false;
             }
-            log(std::string(op) + " orderbook." + std::to_string(kBybitDepths[i]) + "." + symbol_ + " (conn_id " +
-                st.conn_id + ")");
+            log(std::string(op) + " " + books_[i].topic() + " (conn_id " + st.conn_id + ")");
         }
         return success;
     }
 
-    std::string symbol_;
-    std::array<pub::BybitBookPublisher, kBybitDepthCount> books_;
-    StreamLog logs_[kBybitDepthCount];
+    std::array<pub::BybitBookPublisher, kBybitDepthCount> books_{pub::BybitBookPublisher(kBybitDepths[0]),
+                                                                 pub::BybitBookPublisher(kBybitDepths[1]),
+                                                                 pub::BybitBookPublisher(kBybitDepths[2])};
     std::string scratch_;
 };
 
@@ -1028,14 +930,6 @@ struct MockExchangeOptions {
     unsigned short bybit_port = 18444;
     std::uint64_t seed = 1;
     double warmup_s = 5.0;                 // 开始监听之前先仿真这么久（簿已建好、价格已有走势）
-    sim::MarketParams market = sim::defaultMarketParams();   // 三家交易所，顺序 Binance、OKX、Bybit
-    std::string binance_symbol = "BTCUSDT";
-    std::string okx_inst_id = "BTC-USDT";
-    std::string bybit_symbol = "BTCUSDT";
-    std::size_t binance_window = pub::BinanceDepthPublisher::kDefaultWindow;
-    std::size_t okx_window = pub::OkxBooksPublisher::kDefaultWindow;
-    std::int64_t okx_heartbeat_ms = pub::OkxBooksPublisher::kDefaultHeartbeatMs;
-    int retention_ms = 30000;              // 每个推送流保留的报文时长（慢连接落后超过它即被断开）
     double drop_rate = 0.0;                // 故障注入：推送报文不发给某个会话的概率（见 SessionHub::setDropRate）
     LogFn log;                             // 连接 / 订阅 / REST 事件（在连接线程上调用，须线程安全）；空 = 不记录
 };
@@ -1047,9 +941,8 @@ public:
 
     struct VenueStatus {
         std::string name;
-        double fair = 0.0;                 // 本地公允价（USDT）
         double best_bid = 0.0, best_ask = 0.0;   // 空簿为 0
-        std::size_t bid_levels = 0, ask_levels = 0, orders = 0;
+        std::size_t orders = 0;
         std::uint64_t trades = 0;
         std::uint64_t large_dislocations = 0;
         SessionHub::Counters net;
@@ -1066,10 +959,11 @@ public:
         std::uint64_t lag_resets = 0;      // 跟不上实时而丢弃积压的次数
     };
 
+    // 三家交易所，顺序 Binance、OKX、Bybit（sim::defaultMarketParams()）
     explicit MockExchange(MockExchangeOptions opt = MockExchangeOptions())
-        : opt_(std::move(opt)), market_(checkedParams(opt_.market), opt_.seed) {
+        : opt_(std::move(opt)), market_(sim::defaultMarketParams(), opt_.seed) {
         const double step_s = market_.stepSeconds();
-        step_ = std::chrono::nanoseconds(std::max<long long>(1, std::llround(step_s * 1e9)));
+        step_ = std::chrono::nanoseconds(std::llround(step_s * 1e9));
         binance_fast_ = detail::periodSteps(kBinanceFastMs, step_s);
         binance_slow_ = binance_fast_ * static_cast<std::uint64_t>(kBinanceSlowMs / kBinanceFastMs);
         okx_books_ = detail::periodSteps(kOkxBooksMs, step_s);
@@ -1077,22 +971,18 @@ public:
         for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
             bybit_period_[i] = detail::periodSteps(kBybitPeriodsMs[i], step_s);
         }
+        for (SessionHub* h : hubs_) {
+            h->setLog(opt_.log);
+            h->setDropRate(opt_.drop_rate);
+        }
 
-        binance_ = std::make_unique<BinanceHub>(opt_.binance_symbol, opt_.binance_window, opt_.retention_ms);
-        okx_ = std::make_unique<OkxHub>(opt_.okx_inst_id, opt_.okx_window, opt_.okx_heartbeat_ms, opt_.retention_ms);
-        bybit_ = std::make_unique<BybitHub>(opt_.bybit_symbol, opt_.retention_ms);
-        binance_->setLog(opt_.log);
-        okx_->setLog(opt_.log);
-        bybit_->setLog(opt_.log);
-        setDropRate(opt_.drop_rate);
-
-        market_.advance(std::max(0.0, opt_.warmup_s));
+        market_.advance(opt_.warmup_s);
         resetHubs();
 
         identity_ = generateSelfSigned();  // CN/SAN = localhost、127.0.0.1；三个端口共用
-        servers_[0] = makeServer(opt_.binance_port, *binance_, true);
-        servers_[1] = makeServer(opt_.okx_port, *okx_, false);
-        servers_[2] = makeServer(opt_.bybit_port, *bybit_, false);
+        servers_[0] = makeServer(opt_.binance_port, binance_);
+        servers_[1] = makeServer(opt_.okx_port, okx_);
+        servers_[2] = makeServer(opt_.bybit_port, bybit_);
         sim_thread_ = std::thread([this] { simLoop(); });
     }
 
@@ -1117,35 +1007,30 @@ public:
     unsigned short binancePort() const noexcept { return servers_[0]->port(); }
     unsigned short okxPort() const noexcept { return servers_[1]->port(); }
     unsigned short bybitPort() const noexcept { return servers_[2]->port(); }
-    const TlsIdentity& identity() const noexcept { return identity_; }
     const std::string& caPem() const noexcept { return identity_.cert_pem; }
-    const MockExchangeOptions& options() const noexcept { return opt_; }
 
     // 把 CA 证书（即服务器的自签名证书）写到 path（原子替换）；失败抛 std::runtime_error
     void writeCaFile(const std::string& path) const { detail::writeFileAtomic(path, identity_.cert_pem); }
 
-    const BinanceHub& binance() const noexcept { return *binance_; }
-    const OkxHub& okx() const noexcept { return *okx_; }
-    const BybitHub& bybit() const noexcept { return *bybit_; }
+    const BinanceHub& binance() const noexcept { return binance_; }
+    const OkxHub& okx() const noexcept { return okx_; }
+    const BybitHub& bybit() const noexcept { return bybit_; }
 
     // 故障注入：三家交易所的推送报文丢弃概率（0 = 关闭）
     void setDropRate(double p) noexcept {
-        binance_->setDropRate(p);
-        okx_->setDropRate(p);
-        bybit_->setDropRate(p);
+        for (SessionHub* h : hubs_) h->setDropRate(p);
     }
     // 单独设置一家（0 = Binance，1 = OKX，2 = Bybit；其他编号忽略）
     void setDropRate(std::size_t venue, double p) noexcept {
-        SessionHub* hubs[3] = {binance_.get(), okx_.get(), bybit_.get()};
-        if (venue < 3) hubs[venue]->setDropRate(p);
+        if (venue < hubs_.size()) hubs_[venue]->setDropRate(p);
     }
 
     // ---- 仿真控制（测试用）----
-    // 暂停仿真；flush 时立即对全部推送流做一次发布（计划外），使各发布者的窗口等于引擎此刻的深度
-    void pause(bool flush = true) {
+    // 暂停仿真，并立即对全部推送流做一次发布（计划外），使各发布者的窗口等于引擎此刻的深度
+    void pause() {
         std::lock_guard<std::mutex> lock(sim_mutex_);
         paused_ = true;
-        if (flush) publishLocked(steps_, true);
+        publishLocked(steps_, true);
     }
     void resume() {
         {
@@ -1159,12 +1044,7 @@ public:
     template <class F>
     auto withMarket(F&& f) const -> decltype(f(std::declval<const sim::Market&>())) {
         std::lock_guard<std::mutex> lock(sim_mutex_);
-        return f(static_cast<const sim::Market&>(market_));
-    }
-
-    std::uint64_t steps() const {
-        std::lock_guard<std::mutex> lock(sim_mutex_);
-        return steps_;
+        return f(market_);
     }
 
     // 三个服务器记录的脚本错误（正常运行应为空）
@@ -1178,7 +1058,6 @@ public:
 
     Status status() const {
         Status st;
-        const SessionHub* hubs[3] = {binance_.get(), okx_.get(), bybit_.get()};
         std::lock_guard<std::mutex> lock(sim_mutex_);
         st.sim_seconds = market_.simSeconds();
         st.market_fair = market_.fair();
@@ -1186,15 +1065,12 @@ public:
             const sim::Venue& v = market_.venue(i);
             VenueStatus vs;
             vs.name = v.name();
-            vs.fair = v.fairPrice();
             if (const auto b = v.book().bestBid()) vs.best_bid = toPrice(*b);
             if (const auto a = v.book().bestAsk()) vs.best_ask = toPrice(*a);
-            vs.bid_levels = v.book().levelCount(sim::Side::Buy);
-            vs.ask_levels = v.book().levelCount(sim::Side::Sell);
             vs.orders = v.book().orderCount();
             vs.trades = v.stats().trades;
             vs.large_dislocations = v.largeDislocations();
-            vs.net = hubs[i]->counters();
+            vs.net = hubs_[i]->counters();
             st.venues.push_back(std::move(vs));
         }
         st.arb_samples = arb_samples_;
@@ -1213,24 +1089,16 @@ private:
         return static_cast<double>(ticks) / static_cast<double>(sim::kTicksPerUnit);
     }
 
-    static const sim::MarketParams& checkedParams(const sim::MarketParams& p) {
-        if (p.venues.size() != 3) {
-            throw std::invalid_argument("mock exchange: the market must have exactly 3 venues (Binance, OKX, Bybit)");
-        }
-        return p;
-    }
-
-    std::unique_ptr<MockExchangeServer> makeServer(unsigned short port, SessionHub& hub, bool rest) {
+    template <class Hub>
+    std::unique_ptr<MockExchangeServer> makeServer(unsigned short port, Hub& hub) {
         ServerOptions so;
         so.bind_address = opt_.bind_address;
         so.port = port;
         so.identity = identity_;
-        SessionHub* h = &hub;
-        so.upgrade_filter = [h](const std::string& target) { return h->acceptUpgrade(target); };
-        so.script = [h](WsSession& ws) { h->serve(ws); };
-        if (rest) {
-            BinanceHub* b = binance_.get();
-            so.http_handler = [b](const HttpRequestInfo& req) { return b->handleHttp(req); };
+        so.upgrade_filter = [&hub](const std::string& target) { return hub.acceptUpgrade(target); };
+        so.script = [&hub](WsSession& ws) { hub.serve(ws); };
+        if constexpr (std::is_same_v<Hub, BinanceHub>) {
+            so.http_handler = [&hub](const HttpRequestInfo& req) { return hub.handleHttp(req); };
         } else {
             so.http_handler = [](const HttpRequestInfo&) {
                 return HttpReply{404, R"({"code":"404","msg":"no REST endpoints on this port"})", "application/json",
@@ -1248,12 +1116,12 @@ private:
     // 预热结束：以当前深度初始化全部发布者（不产生推送）
     void resetHubs() {
         const std::int64_t now_ms = hft::wallClockMs();
-        capture(0, opt_.binance_window);
-        binance_->reset(bids_, asks_, market_.venue(0).bookEvents());
-        capture(1, opt_.okx_window);
-        okx_->reset(bids_, asks_, static_cast<std::int64_t>(market_.venue(1).bookEvents()), now_ms);
+        capture(0, pub::BinanceDepthPublisher::kWindow);
+        binance_.reset(bids_, asks_, market_.venue(0).bookEvents());
+        capture(1, pub::OkxBooksPublisher::kWindow);
+        okx_.reset(bids_, asks_, static_cast<std::int64_t>(market_.venue(1).bookEvents()), now_ms);
         capture(2, kBybitDepths[kBybitDepthCount - 1]);
-        bybit_->reset(bids_, asks_, market_.venue(2).bookEvents());
+        bybit_.reset(bids_, asks_, market_.venue(2).bookEvents());
     }
 
     void capture(std::size_t venue, std::size_t levels) {
@@ -1294,28 +1162,29 @@ private:
     // 到期的推送流发布一次（force：全部发布）。sim_mutex_ 已持有。
     void publishLocked(std::uint64_t k, bool force) {
         const std::int64_t now_ms = hft::wallClockMs();
-        if (force || k % binance_fast_ == 0) {
-            capture(0, opt_.binance_window);
-            binance_->tickFast(bids_, asks_, market_.venue(0).bookEvents(), now_ms);
+        auto due = [k, force](std::uint64_t period) { return force || k % period == 0; };
+        if (due(binance_fast_)) {
+            capture(0, pub::BinanceDepthPublisher::kWindow);
+            binance_.tickFast(bids_, asks_, market_.venue(0).bookEvents(), now_ms);
             sampleArbitrageLocked();
         }
-        if (force || k % binance_slow_ == 0) binance_->tickSlow(now_ms);
-        const bool okx_books = force || k % okx_books_ == 0;
-        const bool okx_bbo = force || k % okx_bbo_ == 0;
+        if (due(binance_slow_)) binance_.tickSlow(now_ms);
+        const bool okx_books = due(okx_books_);
+        const bool okx_bbo = due(okx_bbo_);
         if (okx_books || okx_bbo) {
-            capture(1, opt_.okx_window);
+            capture(1, pub::OkxBooksPublisher::kWindow);
             const auto seq = static_cast<std::int64_t>(market_.venue(1).bookEvents());
-            if (okx_books) okx_->tickBooks(bids_, asks_, seq, now_ms);
-            if (okx_bbo) okx_->tickBbo(bids_, asks_, seq, now_ms);
+            if (okx_books) okx_.tickBooks(bids_, asks_, seq, now_ms);
+            if (okx_bbo) okx_.tickBbo(bids_, asks_, seq, now_ms);
         }
         bool captured = false;
         for (std::size_t i = 0; i < kBybitDepthCount; ++i) {
-            if (!force && k % bybit_period_[i] != 0) continue;
+            if (!due(bybit_period_[i])) continue;
             if (!captured) {
                 capture(2, kBybitDepths[kBybitDepthCount - 1]);
                 captured = true;
             }
-            bybit_->tick(i, bids_, asks_, market_.venue(2).bookEvents(), now_ms);
+            bybit_.tick(i, bids_, asks_, market_.venue(2).bookEvents(), now_ms);
         }
     }
 
@@ -1350,15 +1219,16 @@ private:
     }
 
     MockExchangeOptions opt_;
-    sim::Market market_;   // 必须在 opt_ 之后声明（用 opt_.market 构造）
+    sim::Market market_;   // 必须在 opt_ 之后声明（用 opt_.seed 构造）
     Clock::duration step_{};
     std::uint64_t binance_fast_ = 1, binance_slow_ = 1, okx_books_ = 1, okx_bbo_ = 1;
     std::array<std::uint64_t, kBybitDepthCount> bybit_period_{};
 
-    // Hub 必须先于服务器构造、晚于服务器销毁（服务器的回调持有 Hub 指针）
-    std::unique_ptr<BinanceHub> binance_;
-    std::unique_ptr<OkxHub> okx_;
-    std::unique_ptr<BybitHub> bybit_;
+    // Hub 必须先于服务器构造、晚于服务器销毁（服务器的回调持有 Hub 的引用）
+    BinanceHub binance_;
+    OkxHub okx_;
+    BybitHub bybit_;
+    const std::array<SessionHub*, 3> hubs_{&binance_, &okx_, &bybit_};   // 按交易所编号
     TlsIdentity identity_;
     std::unique_ptr<MockExchangeServer> servers_[3];
 
