@@ -19,6 +19,7 @@
 #include <ctime>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // 程序名与版本（标题栏、启动横幅与日志共用）
@@ -48,6 +49,28 @@ struct FrameOptions {
     std::string footer = "Press Ctrl+C to exit";
 };
 
+// FeedStats 的计数器：最终报告的行情源统计表与日志的 FEED 行都按这个顺序列出（log_label 是日志里的名字）
+struct FeedCounter {
+    const char* label;
+    const char* log_label;
+    std::uint64_t FeedStats::*field;
+};
+inline constexpr FeedCounter kFeedCounters[] = {
+    {"Messages", "Msgs", &FeedStats::messages},
+    {"Bytes", "Bytes", &FeedStats::bytes},
+    {"Book updates", "Book updates", &FeedStats::book_updates},
+    {"Published", "Published", &FeedStats::published},
+    {"Dropped snapshots", "Dropped", &FeedStats::dropped_snapshots},
+    {"Reconnects", "Reconnects", &FeedStats::reconnects},
+    {"Connect failures", "Connect failures", &FeedStats::connect_failures},
+    {"Stalls", "Stalls", &FeedStats::stalls},
+    {"Gaps", "Gaps", &FeedStats::gaps},
+    {"Checksum failures", "Checksum failures", &FeedStats::checksum_failures},
+    {"Resyncs", "Resyncs", &FeedStats::resyncs},
+    {"REST snapshots", "REST snapshots", &FeedStats::rest_snapshots},
+    {"Parse errors", "Parse errors", &FeedStats::parse_errors},
+};
+
 namespace display_detail {
 
 // 颜色（color = false 时全部为空串）
@@ -55,28 +78,18 @@ struct Palette {
     const char* green = "";
     const char* red = "";
     const char* yellow = "";
-    const char* cyan = "";
     const char* bold = "";
     const char* dim = "";
     const char* reset = "";
 
     static Palette make(bool color) {
-        Palette p;
-        if (color) {
-            p.green = "\033[32m";
-            p.red = "\033[31m";
-            p.yellow = "\033[33m";
-            p.cyan = "\033[36m";
-            p.bold = "\033[1m";
-            p.dim = "\033[2m";
-            p.reset = "\033[0m";
-        }
-        return p;
+        if (!color) return Palette{};
+        return Palette{"\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[2m", "\033[0m"};
     }
 
     // 给 text 加颜色（code 为空时原样返回）
     std::string paint(const std::string& text, const char* code) const {
-        if (code == nullptr || code[0] == '\0') return text;
+        if (code[0] == '\0') return text;
         return std::string(code) + text + reset;
     }
 };
@@ -171,28 +184,13 @@ public:
     // 延迟表（每行两个）、行情源统计表、套利汇总
     static std::string renderFinalReport(const std::vector<VenueView>& venues, const ArbitrageDetector& detector,
                                          bool color) {
-        using namespace text_util;
-        const display_detail::Palette pal = display_detail::Palette::make(color);
-        std::string out;
-        out += "\n" + pal.paint("═══ Final Report ═══", pal.bold) + "\n\n";
+        const Palette pal = Palette::make(color);
+        std::string out = "\n" + pal.paint("═══ Final Report ═══", pal.bold) + "\n\n";
 
-        // 延迟表：两个一行
-        for (std::size_t i = 0; i < venues.size(); i += 2) {
-            std::vector<std::string> left = latencyTable(venues[i], pal);
-            std::vector<std::string> right;
-            if (i + 1 < venues.size()) right = latencyTable(venues[i + 1], pal);
-            const std::size_t rows = std::max(left.size(), right.size());
-            for (std::size_t r = 0; r < rows; ++r) {
-                std::string line(kIndent, ' ');
-                line += r < left.size() ? left[r] : std::string(kLatencyInner + 2, ' ');
-                if (!right.empty()) {
-                    line += "   ";
-                    line += r < right.size() ? right[r] : std::string(kLatencyInner + 2, ' ');
-                }
-                out += line + "\n";
-            }
-            out += "\n";
-        }
+        // 延迟表：两个一行，每行之后空一行
+        std::vector<std::string> lines;
+        sideBySide(lines, venues, "   ", true, [&pal](const VenueView& v) { return latencyTable(v, pal); });
+        for (const std::string& line : lines) (out += line) += '\n';
         if (venues.empty()) out += "  (no venues)\n\n";
 
         out += feedStatsTable(venues, pal);
@@ -209,15 +207,16 @@ public:
         using text_util::padLeft;
         if (!std::isfinite(v)) return padLeft("--", width);
         char buf[64];
+        auto fits = [&](bool fixed, int digits) {  // "%.*f" / "%.*g"（show_plus 时带 '+'）是否放得下
+            const char* format = fixed ? (show_plus ? "%+.*f" : "%.*f") : (show_plus ? "%+.*g" : "%.*g");
+            const int n = std::snprintf(buf, sizeof(buf), format, digits, v);
+            return n > 0 && static_cast<std::size_t>(n) <= width;
+        };
         for (int p = std::clamp(precision, 0, 12); p >= 0; --p) {
-            const int n = show_plus ? std::snprintf(buf, sizeof(buf), "%+.*f", p, v)
-                                    : std::snprintf(buf, sizeof(buf), "%.*f", p, v);
-            if (n > 0 && static_cast<std::size_t>(n) <= width) return padLeft(buf, width);
+            if (fits(true, p)) return padLeft(buf, width);
         }
         for (int sig = 6; sig >= 1; --sig) {
-            const int n = show_plus ? std::snprintf(buf, sizeof(buf), "%+.*g", sig, v)
-                                    : std::snprintf(buf, sizeof(buf), "%.*g", sig, v);
-            if (n > 0 && static_cast<std::size_t>(n) <= width) return padLeft(buf, width);
+            if (fits(false, sig)) return padLeft(buf, width);
         }
         return std::string(width, '#');
     }
@@ -342,13 +341,56 @@ private:
         return i < venues.size() ? venues[i].name : fallback;
     }
 
-    static bool hasData(const OrderBook* book) { return book != nullptr && !book->empty(); }
+    // 两个一行地并排放置等高的框（2 列缩进，两框之间隔 gap）：box(venue) 生成一个框的各行；
+    // blank_after：每行框之后加一个空行
+    template <class Box>
+    static void sideBySide(std::vector<std::string>& lines, const std::vector<VenueView>& venues, const char* gap,
+                           bool blank_after, const Box& box) {
+        for (std::size_t i = 0; i < venues.size(); i += 2) {
+            const std::vector<std::string> left = box(venues[i]);
+            const std::vector<std::string> right = i + 1 < venues.size() ? box(venues[i + 1]) : std::vector<std::string>();
+            for (std::size_t r = 0; r < left.size(); ++r) {
+                std::string line(kIndent, ' ');
+                line += left[r];
+                if (r < right.size()) (line += gap) += right[r];
+                lines.push_back(std::move(line));
+            }
+            if (blank_after) lines.push_back("");
+        }
+    }
+
+    // 延迟的 p50 与 p99："<p50><sep><p99>"。us = true：微秒一位小数，否则毫秒取整。无样本时 "--"
+    static std::string p50p99(const LatencyTracker* t, bool us, const char* sep) {
+        if (t == nullptr || t->count() == 0) return "--";
+        auto fmt = [us](std::uint64_t ns) {
+            return us ? formatUs(static_cast<double>(ns)) : plainNumber(static_cast<double>(ns) / 1e6, 0);
+        };
+        return fmt(t->percentileNs(0.50)) + sep + fmt(t->percentileNs(0.99));
+    }
+
+    // 最终报告的表格：首列左对齐（前面空一格），其余各列右对齐（后面空一格）；widths 是各列的内宽
+    struct Table {
+        std::vector<std::size_t> widths;
+
+        // 横线：left + 各列的 "─" 以 mid 分隔 + right
+        std::string border(const char* left, const char* mid, const char* right) const {
+            std::string s = std::string(kIndent, ' ') + left;
+            for (std::size_t i = 0; i < widths.size(); ++i) s += (i > 0 ? mid : "") + text_util::repeat("─", widths[i]);
+            return s + right + "\n";
+        }
+
+        // 一行：cells 与 widths 一一对应
+        std::string line(const std::vector<std::string>& cells) const {
+            std::string s = std::string(kIndent, ' ') + "│" + text_util::fit(" " + cells[0], widths[0]);
+            for (std::size_t i = 1; i < widths.size(); ++i) s += "│" + cell(cells[i], widths[i] - 1) + " ";
+            return s + "│\n";
+        }
+    };
 
     // ---------------- 帧 ----------------
 
     static std::string buildFrame(const std::vector<VenueView>& venues, const ArbitrageDetector& detector,
                                   const FrameOptions& opt, const Layout& lay) {
-        const int levels = lay.levels;
         const Palette pal = Palette::make(opt.color);
         std::vector<std::string> lines;
         lines.reserve(64);
@@ -369,16 +411,7 @@ private:
         }
 
         // 订单簿：两个一行
-        for (std::size_t i = 0; i < venues.size(); i += 2) {
-            const std::vector<std::string> left = bookBox(venues[i], levels, pal);
-            std::vector<std::string> right;
-            if (i + 1 < venues.size()) right = bookBox(venues[i + 1], levels, pal);
-            for (std::size_t r = 0; r < left.size(); ++r) {
-                std::string line = indent + left[r];
-                if (r < right.size()) line += " " + right[r];
-                lines.push_back(line);
-            }
-        }
+        sideBySide(lines, venues, " ", false, [&](const VenueView& v) { return bookBox(v, lay.levels, pal); });
         if (!venues.empty() && lay.details) lines.push_back("");
 
         arbitragePanel(lines, venues, detector, lay.recent, pal);
@@ -430,7 +463,7 @@ private:
                           kBookInner));
         out.push_back(rule("├", "┤", kBookInner));
 
-        const bool data = hasData(book);
+        const bool data = book != nullptr && !book->empty();
         int prec = 2;
         if (data) prec = pricePrecision(!book->getBids().empty() ? book->getBids()[0].price : book->getAsks()[0].price);
         for (int i = 0; i < levels; ++i) {
@@ -578,20 +611,11 @@ private:
                                      kWideInner));
         if (venues.empty()) lines.push_back(indent + row(pal.paint("  no venues", pal.dim), kWideInner));
         for (const VenueView& v : venues) {
-            std::string proc = "--";
-            if (v.processing != nullptr && v.processing->count() > 0) {
-                proc = formatUs(static_cast<double>(v.processing->percentileNs(0.50))) + "/" +
-                       formatUs(static_cast<double>(v.processing->percentileNs(0.99)));
-            }
-            std::string exch = "--";
-            if (v.exchange != nullptr && v.exchange->count() > 0) {
-                exch = plainNumber(static_cast<double>(v.exchange->percentileNs(0.50)) / 1e6, 0) + "/" +
-                       plainNumber(static_cast<double>(v.exchange->percentileNs(0.99)) / 1e6, 0);
-            }
             const FeedStats& st = v.stats;
             const std::string integrity = fmtCount(st.gaps) + "/" + fmtCount(st.checksum_failures) + "/" + fmtCount(st.resyncs);
             lines.push_back(indent + row("  " + fit(text_util::sanitize(v.name), 8) + fit(statusText(v.status, pal), 13) +
-                                             cell(fmtCount(st.messages), 9) + cell(proc, 14) + cell(exch, 14) +
+                                             cell(fmtCount(st.messages), 9) + cell(p50p99(v.processing, true, "/"), 14) +
+                                             cell(p50p99(v.exchange, false, "/"), 14) +
                                              cell(fmtCount(st.reconnects), 7) + cell(integrity, 13) +
                                              cell(fmtCount(st.dropped_snapshots), 7),
                                          kWideInner));
@@ -611,40 +635,29 @@ private:
 
     // 一个交易所的延迟表（每行 kLatencyInner + 2 列）
     static std::vector<std::string> latencyTable(const VenueView& v, const Palette& pal) {
-        using namespace text_util;
-        std::vector<std::string> out;
-        out.push_back(rule("┌", "┐", kLatencyInner));
-        out.push_back(row(center(pal.paint(v.name + " Latency", pal.bold), kLatencyInner), kLatencyInner));
-        out.push_back(rule("├", "┤", kLatencyInner));
         const LatencyTracker* t = v.processing;
         const std::uint64_t n = t != nullptr ? t->count() : 0;
-        out.push_back(row(statRow("Processed:", fmtCount(n), ""), kLatencyInner));
-        auto us = [&](double ns) { return n > 0 ? formatUs(ns) : std::string("--"); };
-        out.push_back(row(statRow("Avg:", us(n > 0 ? t->meanNs() : 0.0), "µs"), kLatencyInner));
-        out.push_back(row(statRow("Min:", us(n > 0 ? static_cast<double>(t->minNs()) : 0.0), "µs"), kLatencyInner));
-        out.push_back(row(statRow("P50:", us(n > 0 ? static_cast<double>(t->percentileNs(0.50)) : 0.0), "µs"),
-                          kLatencyInner));
-        out.push_back(row(statRow("P95:", us(n > 0 ? static_cast<double>(t->percentileNs(0.95)) : 0.0), "µs"),
-                          kLatencyInner));
-        out.push_back(row(statRow("P99:", us(n > 0 ? static_cast<double>(t->percentileNs(0.99)) : 0.0), "µs"),
-                          kLatencyInner));
-        out.push_back(row(statRow("Max:", us(n > 0 ? static_cast<double>(t->maxNs()) : 0.0), "µs"), kLatencyInner));
-        out.push_back(row(std::string(kLatencyInner, '-'), kLatencyInner));
-        for (const std::string& h : buildHistogramRows(t)) out.push_back(row(h, kLatencyInner));
-        out.push_back(row(std::string(kLatencyInner, '-'), kLatencyInner));
-
-        std::string queue = "--";
-        if (v.queue != nullptr && v.queue->count() > 0) {
-            queue = formatUs(static_cast<double>(v.queue->percentileNs(0.50))) + " / " +
-                    formatUs(static_cast<double>(v.queue->percentileNs(0.99)));
-        }
-        out.push_back(row(statRow("Queue p50/p99:", queue, "µs"), kLatencyInner));
-        std::string exch = "--";
-        if (v.exchange != nullptr && v.exchange->count() > 0) {
-            exch = plainNumber(static_cast<double>(v.exchange->percentileNs(0.50)) / 1e6, 0) + " / " +
-                   plainNumber(static_cast<double>(v.exchange->percentileNs(0.99)) / 1e6, 0);
-        }
-        out.push_back(row(statRow("Exchange p50/p99:", exch, "ms"), kLatencyInner));
+        std::vector<std::string> out;
+        out.push_back(rule("┌", "┐", kLatencyInner));
+        auto add = [&out](const std::string& content) { out.push_back(row(content, kLatencyInner)); };
+        add(text_util::center(pal.paint(v.name + " Latency", pal.bold), kLatencyInner));
+        out.push_back(rule("├", "┤", kLatencyInner));
+        add(statRow("Processed:", fmtCount(n), ""));
+        // 处理延迟统计（微秒）；get 只在有样本时调用
+        auto us = [n](const char* label, auto get) {
+            return statRow(label, n > 0 ? formatUs(static_cast<double>(get())) : std::string("--"), "µs");
+        };
+        add(us("Avg:", [t] { return t->meanNs(); }));
+        add(us("Min:", [t] { return t->minNs(); }));
+        add(us("P50:", [t] { return t->percentileNs(0.50); }));
+        add(us("P95:", [t] { return t->percentileNs(0.95); }));
+        add(us("P99:", [t] { return t->percentileNs(0.99); }));
+        add(us("Max:", [t] { return t->maxNs(); }));
+        add(std::string(kLatencyInner, '-'));
+        for (const std::string& h : buildHistogramRows(t)) add(h);
+        add(std::string(kLatencyInner, '-'));
+        add(statRow("Queue p50/p99:", p50p99(v.queue, true, " / "), "µs"));
+        add(statRow("Exchange p50/p99:", p50p99(v.exchange, false, " / "), "ms"));
         out.push_back(rule("└", "┘", kLatencyInner));
         return out;
     }
@@ -686,48 +699,26 @@ private:
 
     // 行情源统计表：每行一个指标，每列一个交易所
     static std::string feedStatsTable(const std::vector<VenueView>& venues, const Palette& pal) {
-        using namespace text_util;
-        constexpr std::size_t kLabelW = 20, kColW = 14;
-        const std::string indent(kIndent, ' ');
-        auto border = [&](const char* l, const char* m, const char* r) {
-            std::string s = indent + l + repeat("─", kLabelW);
-            for (std::size_t i = 0; i < venues.size(); ++i) s += m + repeat("─", kColW);
-            return s + r + "\n";
-        };
-        auto line = [&](const std::string& label, const std::vector<std::string>& cells) {
-            std::string s = indent + "│" + fit(" " + label, kLabelW);
-            for (const std::string& c : cells) s += "│" + cell(c, kColW - 1) + " ";
-            return s + "│\n";
-        };
-        std::string out;
-        out += border("┌", "┬", "┐");
-        std::vector<std::string> names;
-        for (const VenueView& v : venues) names.push_back(pal.paint(v.name, pal.bold));
-        out += line("Feed statistics", names);
-        out += border("├", "┼", "┤");
-        auto metric = [&](const std::string& label, auto get) {
-            std::vector<std::string> cells;
+        Table t{{20}};
+        t.widths.resize(venues.size() + 1, 14);
+        std::string out = t.border("┌", "┬", "┐");
+        auto metric = [&](const char* label, const auto& get) {
+            std::vector<std::string> cells = {label};
             for (const VenueView& v : venues) cells.push_back(get(v));
-            out += line(label, cells);
+            out += t.line(cells);
         };
+        metric("Feed statistics", [&](const VenueView& v) { return pal.paint(v.name, pal.bold); });
+        out += t.border("├", "┼", "┤");
         metric("Status", [&](const VenueView& v) { return statusText(v.status, pal); });
-        metric("Messages", [](const VenueView& v) { return fmtCount(v.stats.messages); });
-        metric("Bytes", [](const VenueView& v) { return fmtCount(v.stats.bytes); });
-        metric("Book updates", [](const VenueView& v) { return fmtCount(v.stats.book_updates); });
-        metric("Published", [](const VenueView& v) { return fmtCount(v.stats.published); });
-        metric("Dropped snapshots", [](const VenueView& v) { return fmtCount(v.stats.dropped_snapshots); });
-        metric("Reconnects", [](const VenueView& v) { return fmtCount(v.stats.reconnects); });
-        metric("Connect failures", [](const VenueView& v) { return fmtCount(v.stats.connect_failures); });
-        metric("Stalls", [](const VenueView& v) { return fmtCount(v.stats.stalls); });
-        metric("Gaps", [](const VenueView& v) { return fmtCount(v.stats.gaps); });
-        metric("Checksum failures", [](const VenueView& v) { return fmtCount(v.stats.checksum_failures); });
-        metric("Resyncs", [](const VenueView& v) { return fmtCount(v.stats.resyncs); });
-        metric("REST snapshots", [](const VenueView& v) { return fmtCount(v.stats.rest_snapshots); });
-        metric("Parse errors", [](const VenueView& v) { return fmtCount(v.stats.parse_errors); });
+        for (const FeedCounter& c : kFeedCounters) {
+            metric(c.label, [&c](const VenueView& v) { return fmtCount(v.stats.*c.field); });
+        }
         metric("Fee rate", [](const VenueView& v) { return plainNumber(v.fee_rate * 100.0, 3) + "%"; });
-        out += border("└", "┴", "┘");
+        out += t.border("└", "┴", "┘");
         for (const VenueView& v : venues) {
-            if (!v.last_error.empty()) out += indent + v.name + " last error: " + text_util::sanitize(v.last_error) + "\n";
+            if (!v.last_error.empty()) {
+                out += std::string(kIndent, ' ') + v.name + " last error: " + text_util::sanitize(v.last_error) + "\n";
+            }
         }
         return out;
     }
@@ -735,23 +726,10 @@ private:
     // 套利汇总：每个有序交易所对一行 + 合计
     static std::string arbitrageSummary(const std::vector<VenueView>& venues, const ArbitrageDetector& det,
                                         const Palette& pal) {
-        using namespace text_util;
-        static const std::size_t kW[] = {20, 10, 14, 12, 12};
-        const std::string indent(kIndent, ' ');
-        auto border = [&](const char* l, const char* m, const char* r) {
-            std::string s = indent + l;
-            for (std::size_t i = 0; i < 5; ++i) s += (i > 0 ? m : "") + repeat("─", kW[i]);
-            return s + r + "\n";
-        };
-        auto line = [&](const std::string& c0, const std::string& c1, const std::string& c2, const std::string& c3,
-                        const std::string& c4) {
-            return indent + "│" + fit(" " + c0, kW[0]) + "│" + cell(c1, kW[1] - 1) + " │" + cell(c2, kW[2] - 1) +
-                   " │" + cell(c3, kW[3] - 1) + " │" + cell(c4, kW[4] - 1) + " │\n";
-        };
-        std::string out;
-        out += border("┌", "┬", "┐");
-        out += line(pal.paint("Arbitrage summary", pal.bold), "Signals", "Net profit", "Fees", "Best net");
-        out += border("├", "┼", "┤");
+        const Table t{{20, 10, 14, 12, 12}};
+        std::string out = t.border("┌", "┬", "┐");
+        out += t.line({pal.paint("Arbitrage summary", pal.bold), "Signals", "Net profit", "Fees", "Best net"});
+        out += t.border("├", "┼", "┤");
         const std::size_t n = std::min(venues.size(), det.venueCount());
         double best = 0.0;
         for (std::size_t buy = 0; buy < n; ++buy) {
@@ -759,16 +737,16 @@ private:
                 if (buy == sell) continue;
                 const ArbitrageDetector::PairState& st = det.pairState(buy, sell);
                 best = std::max(best, st.best_net);
-                out += line(venues[buy].name + " -> " + venues[sell].name, fmtCount(st.signals),
-                            plainNumber(st.net_total, 2), plainNumber(st.fees_total, 2), plainNumber(st.best_net, 2));
+                out += t.line({venues[buy].name + " -> " + venues[sell].name, fmtCount(st.signals),
+                               plainNumber(st.net_total, 2), plainNumber(st.fees_total, 2), plainNumber(st.best_net, 2)});
             }
         }
-        if (n < 2) out += line(pal.paint("needs two venues", pal.dim), "", "", "", "");
-        out += border("├", "┼", "┤");
-        out += line(pal.paint("Total", pal.bold), fmtCount(det.getTotalSignals()), plainNumber(det.getTotalNetProfit(), 2),
-                    plainNumber(det.getTotalFees(), 2), plainNumber(best, 2));
-        out += border("└", "┴", "┘");
-        out += indent + "Min profit " + trimmed(det.minProfit()) + "  |  Max qty " +
+        if (n < 2) out += t.line({pal.paint("needs two venues", pal.dim), "", "", "", ""});
+        out += t.border("├", "┼", "┤");
+        out += t.line({pal.paint("Total", pal.bold), fmtCount(det.getTotalSignals()),
+                       plainNumber(det.getTotalNetProfit(), 2), plainNumber(det.getTotalFees(), 2), plainNumber(best, 2)});
+        out += t.border("└", "┴", "┘");
+        out += std::string(kIndent, ' ') + "Min profit " + trimmed(det.minProfit()) + "  |  Max qty " +
                (det.maxQty() > 0.0 ? trimmed(det.maxQty()) : std::string("unlimited")) + "  |  Max levels " +
                (det.maxLevels() > 0 ? std::to_string(det.maxLevels()) : std::string("all")) + "  |  Volume " +
                plainNumber(det.getTotalQty(), 4) + "\n";

@@ -43,6 +43,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
@@ -107,16 +108,14 @@ std::string repoPath(const std::string& rel) {
     return (fs::path(__FILE__).parent_path().parent_path() / rel).string();
 }
 
-std::string uniqueName(const std::string& prefix) {
-    static std::atomic<int> counter{0};
-    return prefix + "_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-}
-
-// 临时路径：析构时连同内容一起删除
+// 临时路径（名称在进程内唯一）：析构时连同内容一起删除
 struct TempPath {
     fs::path path;
-    explicit TempPath(const std::string& prefix, const std::string& suffix = "")
-        : path(fs::temp_directory_path() / (uniqueName(prefix) + suffix)) {}
+    explicit TempPath(const std::string& prefix, const std::string& suffix = "") {
+        static std::atomic<int> counter{0};
+        path = fs::temp_directory_path() /
+               (prefix + "_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1)) + suffix);
+    }
     ~TempPath() {
         std::error_code ec;
         fs::remove_all(path, ec);
@@ -143,6 +142,9 @@ std::string joinLines(const std::vector<std::string>& v) {
     return s;
 }
 
+constexpr const char* kOkxBooksSub = R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
+constexpr const char* kBybitSub = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
+
 // ============================================================================
 // 配置
 // ============================================================================
@@ -156,43 +158,18 @@ std::string jsonString(const std::string& s) {
     return out + "\"";
 }
 
-// 以随仓库发布的完整 config.json 为基础，按块 / 键覆盖原始 JSON 值，生成配置文本
+// 配置文本：以随仓库发布的 config.json 为基础（块与键保持文件中的顺序），按块 / 键覆盖原始 JSON 值
 class ConfigText {
 public:
     ConfigText() {
-        blocks_ = {
-            {"binance",
-             {{"enabled", "true"},
-              {"host", "\"stream.binance.com\""},
-              {"port", "\"9443\""},
-              {"path", "\"/ws/btcusdt@depth@100ms\""},
-              {"symbol", "\"BTCUSDT\""},
-              {"rest_host", "\"api.binance.com\""},
-              {"rest_port", "\"443\""},
-              {"snapshot_path", "\"/api/v3/depth?symbol=BTCUSDT&limit=1000\""}}},
-            {"okx",
-             {{"enabled", "true"},
-              {"host", "\"ws.okx.com\""},
-              {"port", "\"8443\""},
-              {"path", "\"/ws/v5/public\""},
-              {"symbol", "\"BTCUSDT\""},
-              {"subscribe", jsonString(R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})")}}},
-            {"bybit",
-             {{"enabled", "true"},
-              {"host", "\"stream.bybit.com\""},
-              {"port", "\"443\""},
-              {"path", "\"/v5/public/spot\""},
-              {"symbol", "\"BTCUSDT\""},
-              {"subscribe", jsonString(R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})")}}},
-            {"arbitrage", {{"fee_rate", "0.0"}, {"min_profit", "0.01"}, {"max_qty", "0.0"}, {"max_levels", "20"}}},
-            {"display", {{"refresh_ms", "200"}, {"levels", "5"}, {"spread_log_interval", "50"}}},
-            {"connection",
-             {{"tls_verify", "true"},
-              {"ca_file", "\"\""},
-              {"stall_timeout_ms", "15000"},
-              {"reconnect_initial_ms", "500"},
-              {"reconnect_max_ms", "30000"}}},
-        };
+        simdjson::dom::parser parser;
+        const simdjson::padded_string json(readFile(repoPath("config.json")));
+        for (auto [name, block] : simdjson::dom::object(parser.parse(json))) {
+            blocks_.push_back(Block{std::string(name), {}, {}});
+            for (auto [key, value] : simdjson::dom::object(block)) {
+                blocks_.back().fields.emplace_back(std::string(key), simdjson::minify(value));
+            }
+        }
     }
 
     // 设置（或新增）一个键的原始 JSON 值
@@ -217,8 +194,7 @@ public:
 
     // 用原始 JSON 替换整个块（如 "null"、"[]"、"{\"enabled\": false}"）；块不存在时新增
     ConfigText& setBlock(const std::string& block, const std::string& raw) {
-        Block& b = find(block);
-        b.raw = raw;
+        find(block).raw = raw;
         return *this;
     }
 
@@ -233,14 +209,14 @@ public:
         for (std::size_t i = 0; i < blocks_.size(); ++i) {
             const Block& b = blocks_[i];
             s += "  " + jsonString(b.name) + ": ";
-            if (!b.raw.empty()) {
-                s += b.raw;
-            } else {
+            if (b.raw.empty()) {
                 s += "{";
                 for (std::size_t k = 0; k < b.fields.size(); ++k) {
                     s += (k > 0 ? ", " : "") + jsonString(b.fields[k].first) + ": " + b.fields[k].second;
                 }
                 s += "}";
+            } else {
+                s += b.raw;
             }
             s += i + 1 < blocks_.size() ? ",\n" : "\n";
         }
@@ -249,8 +225,6 @@ public:
 
 private:
     struct Block {
-        Block(std::string n, std::vector<std::pair<std::string, std::string>> f, std::string r = std::string())
-            : name(std::move(n)), fields(std::move(f)), raw(std::move(r)) {}
         std::string name;
         std::vector<std::pair<std::string, std::string>> fields;
         std::string raw;  // 非空时整块用这段原始 JSON
@@ -260,7 +234,7 @@ private:
         for (Block& b : blocks_) {
             if (b.name == name) return b;
         }
-        blocks_.emplace_back(name, std::vector<std::pair<std::string, std::string>>{});
+        blocks_.push_back(Block{name, {}, {}});
         return blocks_.back();
     }
 
@@ -270,451 +244,407 @@ private:
 // 写入临时文件并加载（不打印）
 AppConfig loadText(const std::string& json) {
     TempPath file("test_app_config", ".json");
-    {
-        std::ofstream out(file.path, std::ios::binary);
-        out << json;
-    }
+    std::ofstream(file.path, std::ios::binary) << json;
     return ConfigReader::load(file.str(), false);
 }
 
 AppConfig loadText(const ConfigText& t) { return loadText(t.str()); }
 
-bool hasWarning(const AppConfig& c, const std::string& part) {
-    for (const std::string& w : c.warnings) {
-        if (contains(w, part)) return true;
+// 随仓库发布的 config.json 的取值：内置默认值，只是全局 fee_rate = 0.0
+AppConfig shipped() {
+    AppConfig c = ConfigReader::getDefaults();
+    c.arbitrage.fee_rate = 0.0;
+    return c;
+}
+
+// 配置的全部取值（不含 warnings / source），用于整体比较
+std::string describe(const AppConfig& c) {
+    std::ostringstream s;
+    s.precision(17);
+    for (const VenueConfig& v : c.venues) {
+        s << v.key << ": exchange " << static_cast<int>(v.exchange) << " name " << v.name << " enabled " << v.enabled
+          << " host " << v.host << " port " << v.port << " path " << v.path << " symbol " << v.symbol << " subscribe "
+          << v.subscribe_msg << " rest " << v.rest_host << ":" << v.rest_port << v.snapshot_path << " fee ";
+        if (v.fee_rate) {
+            s << *v.fee_rate << "\n";
+        } else {
+            s << "global\n";
+        }
     }
-    std::cerr << "    no warning contains \"" << part << "\"; warnings were:\n" << joinLines(c.warnings);
-    return false;
+    const ArbitrageConfig& a = c.arbitrage;
+    s << "arbitrage: " << a.fee_rate << " " << a.min_profit << " " << a.max_qty << " " << a.max_levels << "\n";
+    const DisplayConfig& d = c.display;
+    s << "display: " << d.refresh_ms << " " << d.levels << " " << d.spread_log_interval << "\n";
+    const ConnectionConfig& k = c.connection;
+    s << "connection: " << k.tls_verify << " " << k.ca_file << " " << k.stall_timeout_ms << " "
+      << k.reconnect_initial_ms << " " << k.reconnect_max_ms << "\n";
+    return s.str();
 }
 
-const VenueConfig& venueOf(const AppConfig& c, Exchange e) {
-    const VenueConfig* v = c.venue(e);
-    if (v == nullptr) throw std::runtime_error("venue missing from config");
-    return *v;
+// 告警列表完整且按顺序等于 want，取值等于 values（不一致时打印用例名与两边）
+void checkConfig(const std::string& what, const AppConfig& c, const std::vector<std::string>& want,
+                 const AppConfig& values) {
+    if (c.warnings != want) {
+        std::cerr << "    " << what << ": warnings were:\n" << joinLines(c.warnings) << "    expected:\n" << joinLines(want);
+    }
+    CHECK(c.warnings == want);
+    if (describe(c) != describe(values)) std::cerr << "    " << what << ": values differ" << std::endl;
+    CHECK_EQ(describe(c), describe(values));
 }
 
-void checkSameVenue(const VenueConfig& a, const VenueConfig& b) {
-    CHECK(a.exchange == b.exchange);
-    CHECK_EQ(a.key, b.key);
-    CHECK_EQ(a.name, b.name);
-    CHECK_EQ(a.enabled, b.enabled);
-    CHECK_EQ(a.host, b.host);
-    CHECK_EQ(a.port, b.port);
-    CHECK_EQ(a.path, b.path);
-    CHECK_EQ(a.symbol, b.symbol);
-    CHECK_EQ(a.subscribe_msg, b.subscribe_msg);
-    CHECK_EQ(a.rest_host, b.rest_host);
-    CHECK_EQ(a.rest_port, b.rest_port);
-    CHECK_EQ(a.snapshot_path, b.snapshot_path);
-    CHECK_EQ(a.fee_rate.has_value(), b.fee_rate.has_value());
+// 一个配置用例：对随仓库发布的 config.json 做 edit，期望恰好得到 warnings（读取顺序），
+// 取值等于 shipped() 再做 expect 的修改；also 是额外的检查（可为空）
+struct ConfigCase {
+    std::string name;
+    std::function<void(ConfigText&)> edit;
+    std::vector<std::string> warnings;
+    std::function<void(AppConfig&)> expect;
+    std::function<void(const AppConfig&)> also;
+};
+
+void runConfigCases(const std::vector<ConfigCase>& cases) {
+    for (const ConfigCase& k : cases) {
+        ConfigText t;
+        k.edit(t);
+        const AppConfig c = loadText(t);
+        AppConfig values = shipped();
+        if (k.expect) k.expect(values);
+        CHECK(!c.source.empty());
+        checkConfig(k.name, c, k.warnings, values);
+        if (k.also) k.also(c);
+    }
+}
+
+// 主机名不合法的告警："[Config] <field>: \"<value>\" is not a host name ..., using default \"<def>\""
+std::string notHost(const std::string& field, const std::string& value, const std::string& def) {
+    return "[Config] " + field + ": \"" + value +
+           "\" is not a host name (no scheme, path or spaces, e.g. \"ws.okx.com\"), using default \"" + def + "\"";
 }
 
 TEST_CASE("config: the shipped config.json loads without warnings and equals the defaults except the global fee_rate") {
     const std::string path = repoPath("config.json");
     const AppConfig c = ConfigReader::load(path, false);
-    if (!c.warnings.empty()) std::cerr << joinLines(c.warnings);
-    CHECK(c.warnings.empty());
+    checkConfig("shipped config.json", c, {}, shipped());
     CHECK_EQ(c.source, path);
-    const AppConfig d = ConfigReader::getDefaults();
     REQUIRE_EQ(c.venues.size(), 3u);
-    REQUIRE_EQ(d.venues.size(), 3u);
     CHECK(c.venues[0].exchange == Exchange::BINANCE);
     CHECK(c.venues[1].exchange == Exchange::OKX);
     CHECK(c.venues[2].exchange == Exchange::BYBIT);
-    for (std::size_t i = 0; i < 3; ++i) checkSameVenue(c.venues[i], d.venues[i]);
-    CHECK_EQ(c.arbitrage.fee_rate, 0.0);
+    CHECK_EQ(c.enabledVenues().size(), 3u);
+    // 默认值即随仓库发布的 config.json 的取值；全局 fee_rate 的默认值是 0.001
+    const AppConfig d = ConfigReader::getDefaults();
     CHECK_EQ(d.arbitrage.fee_rate, 0.001);
-    CHECK_EQ(c.arbitrage.min_profit, d.arbitrage.min_profit);
-    CHECK_EQ(c.arbitrage.max_qty, d.arbitrage.max_qty);
-    CHECK_EQ(c.arbitrage.max_levels, d.arbitrage.max_levels);
-    CHECK_EQ(c.display.refresh_ms, d.display.refresh_ms);
-    CHECK_EQ(c.display.levels, d.display.levels);
-    CHECK_EQ(c.display.spread_log_interval, d.display.spread_log_interval);
-    CHECK_EQ(c.connection.tls_verify, d.connection.tls_verify);
-    CHECK_EQ(c.connection.ca_file, d.connection.ca_file);
-    CHECK_EQ(c.connection.stall_timeout_ms, d.connection.stall_timeout_ms);
-    CHECK_EQ(c.connection.reconnect_initial_ms, d.connection.reconnect_initial_ms);
-    CHECK_EQ(c.connection.reconnect_max_ms, d.connection.reconnect_max_ms);
-    // 默认值即随仓库发布的 config.json 的取值
     CHECK_EQ(d.venues[0].path, std::string("/ws/btcusdt@depth@100ms"));
     CHECK_EQ(d.venues[0].snapshot_path, std::string("/api/v3/depth?symbol=BTCUSDT&limit=1000"));
+    CHECK_EQ(d.venues[1].subscribe_msg, std::string(kOkxBooksSub));
     CHECK_EQ(d.venues[2].port, std::string("443"));
     CHECK_EQ(d.arbitrage.max_levels, 20);
     CHECK_EQ(d.connection.stall_timeout_ms, 15000);
-    CHECK_EQ(c.enabledVenues().size(), 3u);
-    // 测试自己的生成器与仓库文件等价
-    const AppConfig g = loadText(ConfigText());
-    if (!g.warnings.empty()) std::cerr << joinLines(g.warnings);
-    CHECK(g.warnings.empty());
+    // 测试的配置文本生成器原样写回仓库文件的内容
+    checkConfig("ConfigText()", loadText(ConfigText()), {}, shipped());
 }
 
 TEST_CASE("config: unreadable file, invalid JSON or a non-object document -> full defaults and one warning") {
-    {
-        const AppConfig c = ConfigReader::load("/nonexistent-dir/config.json", false);
+    const std::string defaults = describe(ConfigReader::getDefaults());
+    const AppConfig missing = ConfigReader::load("/nonexistent-dir/config.json", false);
+    CHECK(missing.source.empty());
+    REQUIRE_EQ(missing.warnings.size(), 1u);
+    CHECK(contains(missing.warnings[0], "[Config] Cannot open: /nonexistent-dir/config.json ("));
+    CHECK(contains(missing.warnings[0], "), using defaults"));
+    CHECK_EQ(describe(missing), defaults);
+    for (const char* bad : {"{\"binance\": ", "", "not json", "{\"a\": 1} trailing", "{oops}"}) {
+        const AppConfig c = ConfigReader::parse(bad, "<src>");
         CHECK(c.source.empty());
         REQUIRE_EQ(c.warnings.size(), 1u);
-        CHECK(contains(c.warnings[0], "[Config] Cannot open: /nonexistent-dir/config.json"));
-        CHECK(contains(c.warnings[0], "using defaults"));
-        CHECK_EQ(c.arbitrage.fee_rate, 0.001);
-        CHECK_EQ(c.enabledVenues().size(), 3u);
+        CHECK_EQ(c.warnings[0].rfind("[Config] <src>: invalid JSON (", 0), 0u);
+        CHECK(contains(c.warnings[0], "), using defaults"));
+        CHECK_EQ(describe(c), defaults);
     }
-    for (const char* bad : {"{\"binance\": ", "[1, 2, 3]", "", "not json", "42", "{\"a\": 1} trailing"}) {
+    for (const char* bad : {"[1, 2, 3]", "[1]", "42"}) {
         const AppConfig c = loadText(std::string(bad));
         CHECK(c.source.empty());
-        CHECK_EQ(c.warnings.size(), 1u);
-        CHECK(hasWarning(c, "using defaults"));
-        CHECK_EQ(c.arbitrage.fee_rate, 0.001);
-        CHECK_EQ(c.display.refresh_ms, 200);
+        REQUIRE_EQ(c.warnings.size(), 1u);
+        CHECK(contains(c.warnings[0], ": top-level value is not a JSON object, using defaults"));
+        CHECK_EQ(describe(c), defaults);
     }
-    const AppConfig arr = loadText(std::string("[1]"));
-    CHECK(hasWarning(arr, "top-level value is not a JSON object"));
-    const AppConfig inv = loadText(std::string("{oops}"));
-    CHECK(hasWarning(inv, "invalid JSON"));
 }
 
-TEST_CASE("config: a mistyped field falls back to its own default with a warning naming it; other fields are kept") {
-    ConfigText t;
-    t.set("binance", "port", "9443")
-        .set("binance", "path", "\"/ws/btcusdt@depth20@100ms\"")
-        .set("binance", "rest_host", "\"\"")
-        .set("binance", "snapshot_path", "\"\"")
-        .set("okx", "host", "\"okx.example.com\"")
-        .set("okx", "port", "true")
-        .setBlock("bybit", "{\"enabled\": false}")
-        .set("arbitrage", "fee_rate", "0.0005")
-        .set("arbitrage", "min_profit", "\"lots\"")
-        .set("arbitrage", "max_qty", "0.5")
-        .set("arbitrage", "max_levels", "10")
-        .set("display", "refresh_ms", "100")
-        .set("display", "levels", "3")
-        .set("display", "spread_log_interval", "10")
-        .set("connection", "tls_verify", "false")
-        .set("connection", "ca_file", "\"/tmp/mock_ca.pem\"")
-        .set("connection", "stall_timeout_ms", "5000")
-        .set("connection", "reconnect_initial_ms", "100")
-        .set("connection", "reconnect_max_ms", "1000");
-    const AppConfig c = loadText(t);
-    CHECK_EQ(c.warnings.size(), 3u);
-    CHECK(hasWarning(c, "[Config] connection.ca_file: cannot read \"/tmp/mock_ca.pem\", every TLS connection will fail"));
-    CHECK(hasWarning(c, "[Config] okx.port: expected string or integer, using default \"8443\""));
-    CHECK(hasWarning(c, "[Config] arbitrage.min_profit: expected a number, using default 0.01"));
-    const VenueConfig& b = venueOf(c, Exchange::BINANCE);
-    CHECK_EQ(b.port, std::string("9443"));
-    CHECK_EQ(b.path, std::string("/ws/btcusdt@depth20@100ms"));
-    CHECK(b.rest_host.empty());
-    CHECK(b.snapshot_path.empty());
-    const VenueConfig& o = venueOf(c, Exchange::OKX);
-    CHECK_EQ(o.host, std::string("okx.example.com"));
-    CHECK_EQ(o.port, std::string("8443"));
-    CHECK(!venueOf(c, Exchange::BYBIT).enabled);
-    CHECK_EQ(c.enabledVenues().size(), 2u);
-    CHECK_EQ(c.arbitrage.fee_rate, 0.0005);
-    CHECK_EQ(c.arbitrage.min_profit, 0.01);
-    CHECK_EQ(c.arbitrage.max_qty, 0.5);
-    CHECK_EQ(c.arbitrage.max_levels, 10);
-    CHECK_EQ(c.display.refresh_ms, 100);
-    CHECK_EQ(c.display.levels, 3);
-    CHECK_EQ(c.display.spread_log_interval, 10);
-    CHECK(!c.connection.tls_verify);
-    CHECK_EQ(c.connection.ca_file, std::string("/tmp/mock_ca.pem"));  // 文件不存在：值保留，另有告警（见下一行的计数）
-    CHECK_EQ(c.connection.stall_timeout_ms, 5000);
-    CHECK_EQ(c.connection.reconnect_initial_ms, 100);
-    CHECK_EQ(c.connection.reconnect_max_ms, 1000);
+TEST_CASE("config: mistyped, missing and out-of-range fields fall back or clamp with one warning each, in reading order") {
+    std::vector<ConfigCase> cases = {
+        {"mistyped fields fall back to their own defaults; other fields are kept",
+         [](ConfigText& t) {
+             t.set("binance", "port", "9443")
+                 .set("binance", "path", "\"/ws/btcusdt@depth20@100ms\"")
+                 .set("binance", "rest_host", "\"\"")
+                 .set("binance", "snapshot_path", "\"\"")
+                 .set("okx", "host", "\"okx.example.com\"")
+                 .set("okx", "port", "true")
+                 .setBlock("bybit", "{\"enabled\": false}")
+                 .set("arbitrage", "fee_rate", "0.0005")
+                 .set("arbitrage", "min_profit", "\"lots\"")
+                 .set("arbitrage", "max_qty", "0.5")
+                 .set("arbitrage", "max_levels", "10")
+                 .set("display", "refresh_ms", "100")
+                 .set("display", "levels", "3")
+                 .set("display", "spread_log_interval", "10")
+                 .set("connection", "tls_verify", "false")
+                 .set("connection", "ca_file", "\"/tmp/mock_ca.pem\"")
+                 .set("connection", "stall_timeout_ms", "5000")
+                 .set("connection", "reconnect_initial_ms", "100")
+                 .set("connection", "reconnect_max_ms", "1000");
+         },
+         {"[Config] okx.port: expected string or integer, using default \"8443\"",
+          "[Config] arbitrage.min_profit: expected a number, using default 0.01",
+          // 文件不存在：值保留，只告警
+          "[Config] connection.ca_file: cannot read \"/tmp/mock_ca.pem\", every TLS connection will fail"},
+         [](AppConfig& c) {
+             c.venues[0].path = "/ws/btcusdt@depth20@100ms";
+             c.venues[0].rest_host.clear();
+             c.venues[0].snapshot_path.clear();
+             c.venues[1].host = "okx.example.com";
+             c.venues[2].enabled = false;
+             c.arbitrage = {0.0005, 0.01, 0.5, 10};
+             c.display = {100, 3, 10};
+             c.connection = {false, "/tmp/mock_ca.pem", 5000, 100, 1000};
+         },
+         [](const AppConfig& c) { CHECK_EQ(c.enabledVenues().size(), 2u); }},
+        {"out-of-range values are clamped and name the clamped value",
+         [](ConfigText& t) {
+             t.set("display", "refresh_ms", "5")
+                 .set("display", "levels", "50")
+                 .set("display", "spread_log_interval", "0")
+                 .set("arbitrage", "max_levels", "0")
+                 .set("arbitrage", "min_profit", "-1")
+                 .set("arbitrage", "max_qty", "-2.5")
+                 .set("arbitrage", "fee_rate", "-0.001")
+                 .set("connection", "stall_timeout_ms", "10")
+                 .set("connection", "reconnect_initial_ms", "2000")
+                 .set("connection", "reconnect_max_ms", "100")
+                 .set("okx", "fee_rate", "0.5");
+         },
+         {"[Config] okx.fee_rate: 0.5 must be below 0.1 (fee rates are fractions: 0.001 = 0.1%), using the global "
+          "fee_rate",
+          "[Config] arbitrage.fee_rate: -0.001 is negative, clamped to 0",
+          "[Config] arbitrage.min_profit: -1 is out of range [0, inf], clamped to 0",
+          "[Config] arbitrage.max_qty: -2.5 is out of range [0, inf], clamped to 0",
+          "[Config] arbitrage.max_levels: 0 is out of range [1, 20], clamped to 1",
+          "[Config] display.refresh_ms: 5 is out of range [10, 10000], clamped to 10",
+          "[Config] display.levels: 50 is out of range [1, 20], clamped to 20",
+          // 边界用最短往返表示（std::to_chars 选更短的一种：1000000 → "1e+06"）
+          "[Config] display.spread_log_interval: 0 is out of range [1, 1e+06], clamped to 1",
+          "[Config] connection.stall_timeout_ms: 10 is out of range [1000, 3600000], clamped to 1000",
+          "[Config] connection.reconnect_max_ms: 100 is out of range [2000, 6e+05], clamped to 2000"},
+         [](AppConfig& c) {
+             c.arbitrage = {0.0, 0.0, 0.0, 1};
+             c.display = {10, 20, 1};
+             c.connection.stall_timeout_ms = 1000;
+             c.connection.reconnect_initial_ms = 2000;
+             c.connection.reconnect_max_ms = 2000;
+         },
+         nullptr},
+        {"reconnect_max_ms missing while its default is below the given reconnect_initial_ms",
+         [](ConfigText& t) { t.set("connection", "reconnect_initial_ms", "60000").erase("connection", "reconnect_max_ms"); },
+         {"[Config] connection.reconnect_max_ms: missing, using default 30000",
+          "[Config] connection.reconnect_max_ms: 30000 is below connection.reconnect_initial_ms, using 60000"},
+         [](AppConfig& c) { c.connection.reconnect_initial_ms = c.connection.reconnect_max_ms = 60000; }, nullptr},
+        {"huge integers (int64 / uint64 range) are clamped without overflow",
+         [](ConfigText& t) {
+             t.set("display", "spread_log_interval", "99999999999").set("display", "refresh_ms", "18446744073709551615");
+         },
+         {"[Config] display.refresh_ms: 18446744073709551616 is out of range [10, 10000], clamped to 10000",
+          "[Config] display.spread_log_interval: 99999999999 is out of range [1, 1e+06], clamped to 1e+06"},
+         [](AppConfig& c) { c.display = {10000, 5, ConfigReader::kMaxSpreadLogInterval}; }, nullptr},
+        {"a global fee_rate >= 0.1 uses the default 0.001",
+         [](ConfigText& t) { t.set("arbitrage", "fee_rate", "0.1"); },
+         {"[Config] arbitrage.fee_rate: 0.1 must be below 0.1 (fee rates are fractions: 0.001 = 0.1%), using default "
+          "0.001"},
+         [](AppConfig& c) { c.arbitrage.fee_rate = 0.001; }, nullptr},
+        {"integer fields reject fractions and strings but accept integral doubles",
+         [](ConfigText& t) {
+             t.set("display", "levels", "2.5").set("display", "refresh_ms", "200.0").set("display", "spread_log_interval", "\"7\"");
+         },
+         {"[Config] display.levels: expected an integer, using default 5",
+          "[Config] display.spread_log_interval: expected an integer, using default 50"},
+         nullptr, nullptr},
+        {"an integer written as 1e3", [](ConfigText& t) { t.set("display", "refresh_ms", "1e3"); }, {},
+         [](AppConfig& c) { c.display.refresh_ms = 1000; }, nullptr},
+        {"missing fields and blocks warn once each; wrong block types too",
+         [](ConfigText& t) {
+             t.erase("okx", "host")
+                 .erase("arbitrage", "fee_rate")
+                 .eraseBlock("display")
+                 .setBlock("connection", "[]")
+                 .set("bybit", "enabled", "\"yes\"");
+         },
+         {"[Config] okx.host: missing, using default \"ws.okx.com\"",
+          "[Config] bybit.enabled: expected true or false, using default true",
+          "[Config] arbitrage.fee_rate: missing, using default 0.001", "[Config] display: missing, using defaults",
+          "[Config] connection: expected an object, using defaults"},
+         [](AppConfig& c) { c.arbitrage.fee_rate = 0.001; }, nullptr},
+        {"blocks missing from an older config file",
+         [](ConfigText& t) { t.eraseBlock("bybit").eraseBlock("connection"); },
+         {"[Config] bybit: missing, using defaults", "[Config] connection: missing, using defaults"}, nullptr, nullptr},
+        {"a venue block that is not an object", [](ConfigText& t) { t.setBlock("okx", "null"); },
+         {"[Config] okx: expected an object, using defaults"}, nullptr, nullptr},
+        {"unknown keys are ignored silently",
+         [](ConfigText& t) {
+             t.set("binance", "extra", "123")
+                 .set("arbitrage", "comment", "\"hello\"")
+                 .setBlock("future_feature", "{\"x\": [1, 2, {\"y\": null}]}")
+                 .set("connection", "connect_timeout_ms", "5");
+         },
+         {}, nullptr, nullptr},
+    };
+    runConfigCases(cases);
 }
 
-TEST_CASE("config: port and rest_port accept a JSON string or integer in 1..65535") {
-    ConfigText t;
-    t.set("binance", "port", "9443").set("binance", "rest_port", "8443").set("okx", "port", "\"0\"").set("bybit", "port", "70000");
-    const AppConfig c = loadText(t);
-    CHECK_EQ(venueOf(c, Exchange::BINANCE).port, std::string("9443"));
-    CHECK_EQ(venueOf(c, Exchange::BINANCE).rest_port, std::string("8443"));
-    CHECK_EQ(venueOf(c, Exchange::OKX).port, std::string("8443"));
-    CHECK_EQ(venueOf(c, Exchange::BYBIT).port, std::string("443"));
-    CHECK(hasWarning(c, "[Config] okx.port: \"0\" is not a valid port (1-65535), using default \"8443\""));
-    CHECK(hasWarning(c, "[Config] bybit.port: \"70000\" is not a valid port"));
-    CHECK_EQ(c.warnings.size(), 2u);
-
-    for (const char* raw : {"-1", "\"abc\"", "\" 443\"", "\"443x\"", "1.5", "null", "[443]"}) {
-        ConfigText u;
-        u.set("bybit", "port", raw);
-        const AppConfig d = loadText(u);
-        CHECK_EQ(venueOf(d, Exchange::BYBIT).port, std::string("443"));
-        CHECK_EQ(d.warnings.size(), 1u);
-        CHECK(hasWarning(d, "[Config] bybit.port: "));
-    }
-    ConfigText edge;
-    edge.set("okx", "port", "1").set("bybit", "port", "\"65535\"");
-    const AppConfig e = loadText(edge);
-    CHECK(e.warnings.empty());
-    CHECK_EQ(venueOf(e, Exchange::OKX).port, std::string("1"));
-    CHECK_EQ(venueOf(e, Exchange::BYBIT).port, std::string("65535"));
-}
-
-TEST_CASE("config: out-of-range values are clamped with a warning naming the field and the clamped value") {
-    ConfigText t;
-    t.set("display", "refresh_ms", "5")
-        .set("display", "levels", "50")
-        .set("display", "spread_log_interval", "0")
-        .set("arbitrage", "max_levels", "0")
-        .set("arbitrage", "min_profit", "-1")
-        .set("arbitrage", "max_qty", "-2.5")
-        .set("arbitrage", "fee_rate", "-0.001")
-        .set("connection", "stall_timeout_ms", "10")
-        .set("connection", "reconnect_initial_ms", "2000")
-        .set("connection", "reconnect_max_ms", "100")
-        .set("okx", "fee_rate", "0.5");
-    const AppConfig c = loadText(t);
-    CHECK_EQ(c.display.refresh_ms, 10);
-    CHECK_EQ(c.display.levels, 20);
-    CHECK_EQ(c.display.spread_log_interval, 1);
-    CHECK_EQ(c.arbitrage.max_levels, 1);
-    CHECK_EQ(c.arbitrage.min_profit, 0.0);
-    CHECK_EQ(c.arbitrage.max_qty, 0.0);
-    CHECK_EQ(c.arbitrage.fee_rate, 0.0);
-    CHECK_EQ(c.connection.stall_timeout_ms, 1000);
-    CHECK_EQ(c.connection.reconnect_initial_ms, 2000);
-    CHECK_EQ(c.connection.reconnect_max_ms, 2000);
-    CHECK(!venueOf(c, Exchange::OKX).fee_rate.has_value());
-    CHECK(hasWarning(c, "[Config] display.refresh_ms: 5 is out of range [10, 10000], clamped to 10"));
-    CHECK(hasWarning(c, "[Config] display.levels: 50 is out of range [1, 20], clamped to 20"));
-    CHECK(hasWarning(c, "[Config] display.spread_log_interval: 0 is out of range [1, "));
-    CHECK(hasWarning(c, "[Config] arbitrage.max_levels: 0 is out of range [1, 20], clamped to 1"));
-    CHECK(hasWarning(c, "[Config] arbitrage.min_profit: -1 is out of range [0, inf], clamped to 0"));
-    CHECK(hasWarning(c, "[Config] arbitrage.max_qty: -2.5 is out of range [0, inf], clamped to 0"));
-    CHECK(hasWarning(c, "[Config] arbitrage.fee_rate: -0.001 is negative, clamped to 0"));
-    CHECK(hasWarning(c, "[Config] connection.stall_timeout_ms: 10 is out of range [1000, "));
-    CHECK(hasWarning(c, "[Config] connection.reconnect_max_ms: 100 is out of range [2000, "));
-    CHECK(hasWarning(c, "[Config] okx.fee_rate: 0.5 must be below 0.1"));
-    CHECK(hasWarning(c, "using the global fee_rate"));
-    CHECK_EQ(c.warnings.size(), 10u);
-
-    // reconnect_max_ms 缺失、默认值 30000 小于给出的初始值：同样钳制
-    ConfigText rc;
-    rc.set("connection", "reconnect_initial_ms", "60000").erase("connection", "reconnect_max_ms");
-    const AppConfig r = loadText(rc);
-    CHECK_EQ(r.connection.reconnect_max_ms, 60000);
-    CHECK(hasWarning(r, "[Config] connection.reconnect_max_ms: missing, using default 30000"));
-    CHECK(hasWarning(r, "[Config] connection.reconnect_max_ms: 30000 is below connection.reconnect_initial_ms, using 60000"));
-
-    // 数值很大（int64 / uint64 范围）也只钳制，不溢出
-    ConfigText big;
-    big.set("display", "spread_log_interval", "99999999999").set("display", "refresh_ms", "18446744073709551615");
-    const AppConfig b = loadText(big);
-    CHECK_EQ(b.display.spread_log_interval, ConfigReader::kMaxSpreadLogInterval);
-    CHECK_EQ(b.display.refresh_ms, 10000);
-    CHECK_EQ(b.warnings.size(), 2u);
-
-    // 全局 fee_rate >= 0.1：用默认值 0.001
-    ConfigText fee;
-    fee.set("arbitrage", "fee_rate", "0.1");
-    const AppConfig f = loadText(fee);
-    CHECK_EQ(f.arbitrage.fee_rate, 0.001);
-    CHECK(hasWarning(f, "[Config] arbitrage.fee_rate: 0.1 must be below 0.1"));
-    CHECK(hasWarning(f, "using default 0.001"));
-}
-
-TEST_CASE("config: integer fields reject fractions and strings but accept integral doubles") {
-    ConfigText t;
-    t.set("display", "levels", "2.5").set("display", "refresh_ms", "200.0").set("display", "spread_log_interval", "\"7\"");
-    const AppConfig c = loadText(t);
-    CHECK_EQ(c.display.levels, 5);
-    CHECK_EQ(c.display.refresh_ms, 200);
-    CHECK_EQ(c.display.spread_log_interval, 50);
-    CHECK(hasWarning(c, "[Config] display.levels: expected an integer, using default 5"));
-    CHECK(hasWarning(c, "[Config] display.spread_log_interval: expected an integer, using default 50"));
-    CHECK_EQ(c.warnings.size(), 2u);
-    ConfigText e;
-    e.set("display", "refresh_ms", "1e3");
-    const AppConfig d = loadText(e);
-    CHECK_EQ(d.display.refresh_ms, 1000);
-    CHECK(d.warnings.empty());
-}
-
-TEST_CASE("config: missing fields and blocks fall back with one warning each; wrong block types too") {
-    ConfigText t;
-    t.erase("okx", "host")
-        .erase("arbitrage", "fee_rate")
-        .eraseBlock("display")
-        .setBlock("connection", "[]")
-        .set("bybit", "enabled", "\"yes\"");
-    const AppConfig c = loadText(t);
-    CHECK(hasWarning(c, "[Config] okx.host: missing, using default \"ws.okx.com\""));
-    CHECK(hasWarning(c, "[Config] arbitrage.fee_rate: missing, using default 0.001"));
-    CHECK(hasWarning(c, "[Config] display: missing, using defaults"));
-    CHECK(hasWarning(c, "[Config] connection: expected an object, using defaults"));
-    CHECK(hasWarning(c, "[Config] bybit.enabled: expected true or false, using default true"));
-    CHECK_EQ(c.warnings.size(), 5u);
-    CHECK_EQ(venueOf(c, Exchange::OKX).host, std::string("ws.okx.com"));
-    CHECK_EQ(c.arbitrage.fee_rate, 0.001);
-    CHECK_EQ(c.display.refresh_ms, 200);
-    CHECK(c.connection.tls_verify);
-    CHECK(venueOf(c, Exchange::BYBIT).enabled);
-
-    // 新的块缺失（旧版配置文件）：只告警一次，使用默认值
-    ConfigText old;
-    old.eraseBlock("bybit").eraseBlock("connection");
-    const AppConfig o = loadText(old);
-    CHECK(hasWarning(o, "[Config] bybit: missing, using defaults"));
-    CHECK(hasWarning(o, "[Config] connection: missing, using defaults"));
-    CHECK_EQ(o.warnings.size(), 2u);
-    CHECK(venueOf(o, Exchange::BYBIT).enabled);
-    CHECK_EQ(venueOf(o, Exchange::BYBIT).host, std::string("stream.bybit.com"));
-
-    ConfigText nul;
-    nul.setBlock("okx", "null");
-    const AppConfig n = loadText(nul);
-    CHECK(hasWarning(n, "[Config] okx: expected an object, using defaults"));
-}
-
-TEST_CASE("config: per-venue enabled is honoured and a disabled venue's other fields are not validated") {
-    ConfigText t;
-    t.setBlock("bybit", "{\"enabled\": false}").setBlock("okx", "{\"enabled\": false, \"port\": true, \"host\": 7}");
-    const AppConfig c = loadText(t);
-    if (!c.warnings.empty()) std::cerr << joinLines(c.warnings);
-    CHECK(c.warnings.empty());
-    const std::vector<const VenueConfig*> en = c.enabledVenues();
-    REQUIRE_EQ(en.size(), 1u);
-    CHECK(en[0]->exchange == Exchange::BINANCE);
-    CHECK(!venueOf(c, Exchange::OKX).enabled);
-    CHECK(contains(ConfigReader::summary(c), "OKX (disabled)"));
-    CHECK(contains(ConfigReader::summary(c), "Bybit (disabled)"));
-
-    ConfigText none;
-    none.set("binance", "enabled", "false").set("okx", "enabled", "false").set("bybit", "enabled", "false");
-    CHECK(loadText(none).enabledVenues().empty());
-}
-
-TEST_CASE("config: per-venue fee_rate overrides the global one; invalid overrides fall back to it") {
-    ConfigText t;
-    t.set("arbitrage", "fee_rate", "0.001").set("okx", "fee_rate", "0.0008").set("bybit", "fee_rate", "0");
-    const AppConfig c = loadText(t);
-    CHECK(c.warnings.empty());
-    CHECK_EQ(c.feeRate(venueOf(c, Exchange::BINANCE)), 0.001);
-    CHECK_EQ(c.feeRate(venueOf(c, Exchange::OKX)), 0.0008);
-    CHECK_EQ(c.feeRate(venueOf(c, Exchange::BYBIT)), 0.0);
-    CHECK(contains(ConfigReader::summary(c), "Fee: 0.100% (OKX 0.080%, Bybit 0.000%)"));
-
-    ConfigText bad;
-    bad.set("okx", "fee_rate", "\"x\"").set("bybit", "fee_rate", "-0.5");
-    const AppConfig d = loadText(bad);
-    CHECK(hasWarning(d, "[Config] okx.fee_rate: expected a number, using the global fee_rate"));
-    CHECK(hasWarning(d, "[Config] bybit.fee_rate: -0.5 is negative, clamped to 0"));
-    CHECK(!venueOf(d, Exchange::OKX).fee_rate.has_value());
-    CHECK_EQ(d.feeRate(venueOf(d, Exchange::BYBIT)), 0.0);
-}
-
-TEST_CASE("config: a readable connection.ca_file is accepted without warnings") {
+TEST_CASE("config: venues - enabled, per-venue fee_rate, ports, hosts, paths, subscribe and consistency checks") {
+    std::vector<ConfigCase> cases = {
+        {"a disabled venue's other fields are not validated",
+         [](ConfigText& t) {
+             t.setBlock("bybit", "{\"enabled\": false}").setBlock("okx", "{\"enabled\": false, \"port\": true, \"host\": 7}");
+         },
+         {}, [](AppConfig& c) { c.venues[1].enabled = c.venues[2].enabled = false; },
+         [](const AppConfig& c) {
+             const std::vector<const VenueConfig*> en = c.enabledVenues();
+             REQUIRE_EQ(en.size(), 1u);
+             CHECK(en[0]->exchange == Exchange::BINANCE);
+             CHECK(contains(ConfigReader::summary(c), "Venues: Binance, OKX (disabled), Bybit (disabled)  Fee: "));
+         }},
+        {"every venue disabled",
+         [](ConfigText& t) {
+             t.set("binance", "enabled", "false").set("okx", "enabled", "false").set("bybit", "enabled", "false");
+         },
+         {}, [](AppConfig& c) { c.venues[0].enabled = c.venues[1].enabled = c.venues[2].enabled = false; },
+         [](const AppConfig& c) { CHECK(c.enabledVenues().empty()); }},
+        {"per-venue fee_rate overrides the global one",
+         [](ConfigText& t) {
+             t.set("arbitrage", "fee_rate", "0.001").set("okx", "fee_rate", "0.0008").set("bybit", "fee_rate", "0");
+         },
+         {},
+         [](AppConfig& c) {
+             c.arbitrage.fee_rate = 0.001;
+             c.venues[1].fee_rate = 0.0008;
+             c.venues[2].fee_rate = 0.0;
+         },
+         [](const AppConfig& c) {
+             CHECK_EQ(c.feeRate(c.venues[0]), 0.001);
+             CHECK_EQ(c.feeRate(c.venues[1]), 0.0008);
+             CHECK_EQ(c.feeRate(c.venues[2]), 0.0);
+             CHECK(contains(ConfigReader::summary(c), "Fee: 0.100% (OKX 0.080%, Bybit 0.000%)"));
+         }},
+        {"invalid per-venue fee_rate overrides fall back to the global one or clamp",
+         [](ConfigText& t) { t.set("okx", "fee_rate", "\"x\"").set("bybit", "fee_rate", "-0.5"); },
+         {"[Config] okx.fee_rate: expected a number, using the global fee_rate",
+          "[Config] bybit.fee_rate: -0.5 is negative, clamped to 0"},
+         [](AppConfig& c) { c.venues[2].fee_rate = 0.0; },
+         [](const AppConfig& c) { CHECK_EQ(c.feeRate(c.venues[2]), 0.0); }},
+        {"port and rest_port accept a JSON string or integer in 1..65535",
+         [](ConfigText& t) {
+             t.set("binance", "port", "9443").set("binance", "rest_port", "8443").set("okx", "port", "\"0\"").set("bybit", "port", "70000");
+         },
+         {"[Config] okx.port: \"0\" is not a valid port (1-65535), using default \"8443\"",
+          "[Config] bybit.port: \"70000\" is not a valid port (1-65535), using default \"443\""},
+         [](AppConfig& c) { c.venues[0].rest_port = "8443"; }, nullptr},
+        {"the port range edges", [](ConfigText& t) { t.set("okx", "port", "1").set("bybit", "port", "\"65535\""); }, {},
+         [](AppConfig& c) {
+             c.venues[1].port = "1";
+             c.venues[2].port = "65535";
+         },
+         nullptr},
+        {"host, path, subscribe and snapshot_path are validated",
+         [](ConfigText& t) {
+             t.set("okx", "host", "\"wss://ws.okx.com\"")
+                 .set("bybit", "path", "\"v5/public/spot\"")
+                 .set("okx", "subscribe", "\"{not json\"")
+                 .set("binance", "host", "\"\"")
+                 .set("binance", "rest_host", "\"api binance com\"")
+                 .set("binance", "snapshot_path", "\"api/v3/depth\"");
+         },
+         {"[Config] binance.host: must not be empty, using default \"stream.binance.com\"",
+          notHost("binance.rest_host", "api binance com", "api.binance.com"),
+          "[Config] binance.snapshot_path: \"api/v3/depth\" must start with '/', using \"\"",
+          notHost("okx.host", "wss://ws.okx.com", "ws.okx.com"),
+          "[Config] okx.subscribe: is not valid JSON, using default \"" + std::string(kOkxBooksSub) + "\"",
+          "[Config] bybit.path: \"v5/public/spot\" must start with '/', using default \"/v5/public/spot\"",
+          // snapshot_path 被清空后，增量深度流缺少 REST 快照配置：一致性检查再告警一次
+          "[Config] binance.snapshot_path: required by the diff-depth stream in binance.path "
+          "\"/ws/btcusdt@depth@100ms\" (REST snapshot); the feed cannot sync without it"},
+         [](AppConfig& c) { c.venues[0].snapshot_path.clear(); }, nullptr},
+        {"a symbol label that the subscription does not stream", [](ConfigText& t) { t.set("okx", "symbol", "\"ETHUSDT\""); },
+         {"[Config] okx.symbol: \"ETHUSDT\" does not appear in okx.subscribe (symbol is only a label; the streamed "
+          "instrument comes from okx.subscribe)",
+          "[Config] symbol: enabled venues use different symbols (Binance BTCUSDT, OKX ETHUSDT, Bybit BTCUSDT): "
+          "arbitrage signals would compare different instruments"},
+         [](AppConfig& c) { c.venues[1].symbol = "ETHUSDT"; }, nullptr},
+        {"a disabled venue is not part of the consistency checks",
+         [](ConfigText& t) { t.set("okx", "symbol", "\"ETHUSDT\"").set("okx", "enabled", "false"); }, {},
+         [](AppConfig& c) { c.venues[1].enabled = false; }, nullptr},
+        {"the Binance diff-depth stream without rest_host", [](ConfigText& t) { t.set("binance", "rest_host", "\"\""); },
+         {"[Config] binance.rest_host: required by the diff-depth stream in binance.path \"/ws/btcusdt@depth@100ms\" "
+          "(REST snapshot); the feed cannot sync without it"},
+         [](AppConfig& c) { c.venues[0].rest_host.clear(); }, nullptr},
+        {"a partial-depth Binance stream needs no REST settings",
+         [](ConfigText& t) {
+             t.set("binance", "path", "\"/ws/btcusdt@depth20@100ms\"").set("binance", "rest_host", "\"\"").set("binance", "snapshot_path", "\"\"");
+         },
+         {},
+         [](AppConfig& c) {
+             c.venues[0].path = "/ws/btcusdt@depth20@100ms";
+             c.venues[0].rest_host.clear();
+             c.venues[0].snapshot_path.clear();
+         },
+         nullptr},
+    };
     TempPath ca("test_app_ca", ".pem");
-    {
-        std::ofstream out(ca.path);
-        out << "-----BEGIN CERTIFICATE-----\n";
+    std::ofstream(ca.path) << "-----BEGIN CERTIFICATE-----\n";
+    cases.push_back({"a readable connection.ca_file is accepted without warnings",
+                     [&](ConfigText& t) { t.set("connection", "ca_file", jsonString(ca.str())); }, {},
+                     [&](AppConfig& c) { c.connection.ca_file = ca.str(); }, nullptr});
+    // bybit.port 的各种非法写法：每种一条告警，值保持默认
+    const std::pair<const char*, const char*> bad_ports[] = {
+        {"-1", "\"-1\" is not a valid port (1-65535)"},   {"\"abc\"", "\"abc\" is not a valid port (1-65535)"},
+        {"\" 443\"", "\" 443\" is not a valid port (1-65535)"}, {"\"443x\"", "\"443x\" is not a valid port (1-65535)"},
+        {"1.5", "expected string or integer"},             {"null", "expected string or integer"},
+        {"[443]", "expected string or integer"}};
+    for (const auto& port : bad_ports) {
+        const std::string raw = port.first;
+        cases.push_back({"bybit.port = " + raw, [raw](ConfigText& t) { t.set("bybit", "port", raw); },
+                         {std::string("[Config] bybit.port: ") + port.second + ", using default \"443\""}, nullptr,
+                         nullptr});
     }
-    ConfigText t;
-    t.set("connection", "ca_file", jsonString(ca.str()));
-    const AppConfig c = loadText(t);
-    if (!c.warnings.empty()) std::cerr << joinLines(c.warnings);
-    CHECK(c.warnings.empty());
-    CHECK_EQ(c.connection.ca_file, ca.str());
-}
+    runConfigCases(cases);
 
-TEST_CASE("config: unknown keys are ignored silently") {
-    ConfigText t;
-    t.set("binance", "extra", "123")
-        .set("arbitrage", "comment", "\"hello\"")
-        .setBlock("future_feature", "{\"x\": [1, 2, {\"y\": null}]}")
-        .set("connection", "connect_timeout_ms", "5");
-    const AppConfig c = loadText(t);
-    if (!c.warnings.empty()) std::cerr << joinLines(c.warnings);
-    CHECK(c.warnings.empty());
-}
-
-TEST_CASE("config: host, path, subscribe and snapshot_path are validated") {
-    ConfigText t;
-    t.set("okx", "host", "\"wss://ws.okx.com\"")
-        .set("bybit", "path", "\"v5/public/spot\"")
-        .set("okx", "subscribe", "\"{not json\"")
-        .set("binance", "host", "\"\"")
-        .set("binance", "rest_host", "\"api binance com\"")
-        .set("binance", "snapshot_path", "\"api/v3/depth\"");
-    const AppConfig c = loadText(t);
-    CHECK_EQ(venueOf(c, Exchange::OKX).host, std::string("ws.okx.com"));
-    CHECK_EQ(venueOf(c, Exchange::BYBIT).path, std::string("/v5/public/spot"));
-    CHECK_EQ(venueOf(c, Exchange::OKX).subscribe_msg,
-             std::string(R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})"));
-    CHECK_EQ(venueOf(c, Exchange::BINANCE).host, std::string("stream.binance.com"));
-    CHECK_EQ(venueOf(c, Exchange::BINANCE).rest_host, std::string("api.binance.com"));
-    CHECK(venueOf(c, Exchange::BINANCE).snapshot_path.empty());
-    CHECK(hasWarning(c, "[Config] okx.host: \"wss://ws.okx.com\" is not a host name"));
-    CHECK(hasWarning(c, "[Config] bybit.path: \"v5/public/spot\" must start with '/', using default \"/v5/public/spot\""));
-    CHECK(hasWarning(c, "[Config] okx.subscribe: is not valid JSON"));
-    CHECK(hasWarning(c, "[Config] binance.host: must not be empty, using default \"stream.binance.com\""));
-    CHECK(hasWarning(c, "[Config] binance.rest_host: \"api binance com\" is not a host name"));
-    CHECK(hasWarning(c, "[Config] binance.snapshot_path: \"api/v3/depth\" must start with '/'"));
-    // snapshot_path 被清空后，增量深度流缺少 REST 快照配置：一致性检查再告警一次
-    CHECK(hasWarning(c, "[Config] binance.snapshot_path: required by the diff-depth stream"));
-    CHECK_EQ(c.warnings.size(), 7u);
-}
-
-TEST_CASE("config: consistency warnings for symbol labels and the Binance diff stream without REST settings") {
-    ConfigText t;
-    t.set("okx", "symbol", "\"ETHUSDT\"");
-    const AppConfig c = loadText(t);
-    CHECK(hasWarning(c, "[Config] okx.symbol: \"ETHUSDT\" does not appear in okx.subscribe"));
-    CHECK(hasWarning(c, "[Config] symbol: enabled venues use different symbols"));
-    CHECK_EQ(c.warnings.size(), 2u);
-
-    ConfigText rest;
-    rest.set("binance", "rest_host", "\"\"");
-    const AppConfig r = loadText(rest);
-    CHECK(hasWarning(r, "[Config] binance.rest_host: required by the diff-depth stream in binance.path"));
-    CHECK_EQ(r.warnings.size(), 1u);
-
-    // 部分深度流不需要 REST
-    ConfigText partial;
-    partial.set("binance", "path", "\"/ws/btcusdt@depth20@100ms\"").set("binance", "rest_host", "\"\"").set("binance", "snapshot_path", "\"\"");
-    const AppConfig p = loadText(partial);
-    if (!p.warnings.empty()) std::cerr << joinLines(p.warnings);
-    CHECK(p.warnings.empty());
     CHECK(config_detail::isBinanceDiffDepthPath("/ws/btcusdt@depth"));
     CHECK(config_detail::isBinanceDiffDepthPath("/ws/btcusdt@depth@100ms"));
     CHECK(!config_detail::isBinanceDiffDepthPath("/ws/btcusdt@depth20@100ms"));
     CHECK(!config_detail::isBinanceDiffDepthPath("/ws/btcusdt@bookTicker"));
     CHECK(config_detail::isBinanceDiffDepthPath("/stream?streams=btcusdt@depth5/ethusdt@depth@100ms"));
-
-    // 关闭的交易所不参与一致性检查
-    ConfigText dis;
-    dis.set("okx", "symbol", "\"ETHUSDT\"").set("okx", "enabled", "false");
-    CHECK(loadText(dis).warnings.empty());
 }
 
 TEST_CASE("config: load() prints the Loaded line and summary on stdout and the warnings on stderr") {
     TempPath file("test_app_config", ".json");
-    {
-        ConfigText t;
-        t.set("okx", "port", "true");
-        std::ofstream out(file.path);
-        out << t.str();
-    }
-    std::ostringstream out, err;
-    std::streambuf* old_out = std::cout.rdbuf(out.rdbuf());
-    std::streambuf* old_err = std::cerr.rdbuf(err.rdbuf());
-    const AppConfig c = ConfigReader::load(file.str());
-    std::cout.rdbuf(old_out);
-    std::cerr.rdbuf(old_err);
-    CHECK(contains(out.str(), "[Config] Loaded: " + file.str() + "\n"));
-    CHECK(contains(out.str(), "[Config] Venues: Binance, OKX, Bybit  Fee: 0.000%  Min profit: 0.01  Refresh: 200ms"));
-    CHECK(contains(err.str(), "[Config] okx.port: expected string or integer, using default \"8443\"\n"));
-    CHECK(!contains(out.str(), "okx.port"));
+    std::ofstream(file.path) << ConfigText().set("okx", "port", "true").str();
+    auto capture = [](const std::string& path, std::string& out, std::string& err) {
+        std::ostringstream o, e;
+        std::streambuf* old_out = std::cout.rdbuf(o.rdbuf());
+        std::streambuf* old_err = std::cerr.rdbuf(e.rdbuf());
+        const AppConfig c = ConfigReader::load(path);
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        out = o.str();
+        err = e.str();
+        return c;
+    };
+    std::string out, err;
+    const AppConfig c = capture(file.str(), out, err);
+    CHECK_EQ(out, "[Config] Loaded: " + file.str() +
+                      "\n[Config] Venues: Binance, OKX, Bybit  Fee: 0.000%  Min profit: 0.01  Refresh: 200ms\n");
+    CHECK_EQ(err, std::string("[Config] okx.port: expected string or integer, using default \"8443\"\n"));
     CHECK_EQ(c.warnings.size(), 1u);
-
-    std::ostringstream out2, err2;
-    old_out = std::cout.rdbuf(out2.rdbuf());
-    old_err = std::cerr.rdbuf(err2.rdbuf());
-    ConfigReader::load("/nonexistent-dir/x.json");
-    std::cout.rdbuf(old_out);
-    std::cerr.rdbuf(old_err);
-    CHECK(!contains(out2.str(), "Loaded"));
-    CHECK(contains(err2.str(), "[Config] Cannot open: /nonexistent-dir/x.json"));
+    capture("/nonexistent-dir/x.json", out, err);
+    CHECK(!contains(out, "Loaded"));
+    CHECK(contains(err, "[Config] Cannot open: /nonexistent-dir/x.json"));
 }
 
 // ============================================================================
@@ -733,6 +663,22 @@ OrderBook makeBook(const std::string& label, const std::vector<PriceLevel>& bids
     for (const PriceLevel& l : bids) b.updateBid(l.price, l.quantity);
     for (const PriceLevel& l : asks) b.updateAsk(l.price, l.quantity);
     return b;
+}
+
+// ArbitrageDetector::detectVenue 的 book_of：交易所 i 的簿是 books[i]
+auto bookAt(const std::vector<OrderBook>& books) {
+    return [&books](std::size_t i) -> const OrderBook& { return books[i]; };
+}
+
+// 评估所有有序交易所对（按买方、再按卖方的顺序）；返回新信号数
+std::size_t detectAll(ArbitrageDetector& det, const std::vector<OrderBook>& books) {
+    std::size_t found = 0;
+    for (std::size_t buy = 0; buy < books.size(); ++buy) {
+        for (std::size_t sell = 0; sell < books.size(); ++sell) {
+            if (buy != sell && det.detectPair(buy, sell, books[buy], books[sell]) != nullptr) ++found;
+        }
+    }
+    return found;
 }
 
 TEST_CASE("sweep: walks several levels on both sides while the marginal unit is profitable (no fees)") {
@@ -839,11 +785,6 @@ TEST_CASE("sweep: unprofitable, crossed-equal, empty and malformed books") {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     CHECK_EQ(sweepOf(L({{nan, 1.0}}), L({{102.0, 2.0}}), 0.0, 0.0).qty, 0.0);
     CHECK_EQ(sweepOf(L({{100.0, 1.0}, {-1.0, 1.0}}), L({{102.0, 5.0}}), 0.0, 0.0).qty, 1.0);
-    // OrderBook 重载
-    const OrderBook a = makeBook("A", {{99.0, 1.0}}, {{100.0, 2.0}});
-    const OrderBook b = makeBook("B", {{101.0, 1.0}}, {{102.0, 1.0}});
-    CHECK_EQ(ArbitrageDetector::sweep(a, b, 0.0, 0.0).qty, 1.0);
-    CHECK_EQ(ArbitrageDetector::sweep(b, a, 0.0, 0.0).qty, 0.0);
 }
 
 // v1 的检测逻辑原样复刻（含去重），用来证明新实现在"每侧一档 + 相同手续费"时逐位等价
@@ -887,7 +828,7 @@ TEST_CASE("sweep: one level per side with equal fees reproduces the v1 formula a
     std::uniform_int_distribution<int> coin(0, 3);
     for (double fee : {0.0, 0.0001, 0.001}) {
         V1Detector v1(fee, 0.01);
-        ArbitrageDetector det(fee, 0.01);  // v1 兼容构造：两个交易所、只看最优档
+        ArbitrageDetector det({fee, fee}, 0.01, 0.0, 1);  // v1：两个交易所、相同手续费、只看最优档
         CHECK_EQ(det.maxLevels(), 1);
         // 价格以 5 美分为步长随机游走（变化要么为 0，要么 >= 0.05，远离 0.01 的去重阈值）；
         // B 相对 A 的偏移偶尔跳到 ±250 美元以内的随机值，任何手续费水平下都会出现可盈利与不可盈利的时段
@@ -909,7 +850,9 @@ TEST_CASE("sweep: one level per side with equal fees reproduces the v1 formula a
             const OrderBook b = makeBook("B:BTCUSDT", {{b_bid, lots(rng) / 100.0}, {b_bid - 1, 9.0}},
                                          {{b_ask, lots(rng) / 100.0}, {b_ask + 1, 9.0}});
             const bool old_found = v1.detect(a, b);
-            const bool new_found = det.detect(a, b);
+            const bool d1 = det.detectPair(0, 1, a, b) != nullptr;  // v1 的 detect()：两个方向都评估
+            const bool d2 = det.detectPair(1, 0, b, a) != nullptr;
+            const bool new_found = d1 || d2;
             REQUIRE_EQ(old_found, new_found);
         }
         REQUIRE_EQ(static_cast<std::uint64_t>(v1.signals.size()), det.getTotalSignals());
@@ -955,23 +898,23 @@ TEST_CASE("detector: dedup per ordered pair - a one-cent move counts, sub-cent m
     ArbitrageDetector det(std::vector<double>{0.0, 0.0}, 0.01, 0.0, 20);
     std::vector<OrderBook> books = {makeBook("A:X", {{66990.00, 1.0}}, {{67000.00, 1.0}}),
                                     makeBook("B:X", {{67010.00, 1.0}}, {{67020.00, 1.0}})};
-    CHECK_EQ(det.detectAll(books), 1u);
-    CHECK_EQ(det.detectAll(books), 0u);
-    CHECK_EQ(det.detectVenue(0, books), 0u);
+    CHECK_EQ(detectAll(det, books), 1u);
+    CHECK_EQ(detectAll(det, books), 0u);
+    CHECK_EQ(det.detectVenue(0, bookAt(books)), 0u);
     // 67000.01 - 67000.00 在二进制浮点里是 0.0099999999947...，仍然算 1 分的变动
     books[0] = makeBook("A:X", {{66990.00, 1.0}}, {{67000.01, 1.0}});
-    CHECK_EQ(det.detectVenue(0, books), 1u);
+    CHECK_EQ(det.detectVenue(0, bookAt(books)), 1u);
     books[0] = makeBook("A:X", {{66990.00, 1.0}}, {{67000.015, 1.0}});
-    CHECK_EQ(det.detectVenue(0, books), 0u);  // 半分：不算变动
+    CHECK_EQ(det.detectVenue(0, bookAt(books)), 0u);  // 半分：不算变动
     books[1] = makeBook("B:X", {{67010.01, 1.0}}, {{67020.00, 1.0}});
-    CHECK_EQ(det.detectVenue(1, books), 1u);  // 买一变动 1 分
+    CHECK_EQ(det.detectVenue(1, bookAt(books)), 1u);  // 买一变动 1 分
     // 数量变化不算价格变动
     books[1] = makeBook("B:X", {{67010.01, 5.0}}, {{67020.00, 1.0}});
-    CHECK_EQ(det.detectVenue(1, books), 0u);
+    CHECK_EQ(det.detectVenue(1, bookAt(books)), 0u);
     CHECK_EQ(det.pairState(0, 1).signals, 3u);
     // 另一个方向独立去重：B 便宜下来后 B->A 第一次出现机会立即出信号
     books[1] = makeBook("B:X", {{66900.00, 1.0}}, {{66950.00, 1.0}});
-    CHECK_EQ(det.detectVenue(1, books), 1u);
+    CHECK_EQ(det.detectVenue(1, bookAt(books)), 1u);
     CHECK_EQ(det.pairState(1, 0).signals, 1u);
     CHECK_EQ(det.getTotalSignals(), 4u);
     CHECK(ArbitrageDetector::moved(67000.01, 67000.00));
@@ -982,14 +925,14 @@ TEST_CASE("detector: dedup per ordered pair - a one-cent move counts, sub-cent m
     // 无数据（断线后的空簿）不出信号；恢复后价格未变 -> 仍被去重
     ArbitrageDetector d2(std::vector<double>{0.0, 0.0}, 0.01, 0.0, 20);
     std::vector<OrderBook> b2 = {makeBook("A:X", {{99.0, 1.0}}, {{100.0, 1.0}}), makeBook("B:X", {{101.0, 1.0}}, {{102.0, 1.0}})};
-    CHECK_EQ(d2.detectAll(b2), 1u);
+    CHECK_EQ(detectAll(d2, b2), 1u);
     const OrderBook saved = b2[1];
     b2[1] = OrderBook("B:X");
-    CHECK_EQ(d2.detectVenue(1, b2), 0u);
+    CHECK_EQ(d2.detectVenue(1, bookAt(b2)), 0u);
     CHECK(!d2.pairState(0, 1).has_data);
     CHECK_EQ(d2.pairState(0, 1).sweep.qty, 0.0);
     b2[1] = saved;
-    CHECK_EQ(d2.detectVenue(1, b2), 0u);
+    CHECK_EQ(d2.detectVenue(1, bookAt(b2)), 0u);
     CHECK(d2.pairState(0, 1).has_data);
     CHECK_GT(d2.pairState(0, 1).sweep.net, 0.0);
 }
@@ -997,16 +940,16 @@ TEST_CASE("detector: dedup per ordered pair - a one-cent move counts, sub-cent m
 TEST_CASE("detector: min_profit is a strict threshold on the net profit after fees") {
     std::vector<OrderBook> books = {makeBook("A", {{99.0, 1.0}}, {{100.0, 1.0}}), makeBook("B", {{100.5, 1.0}}, {{101.0, 1.0}})};
     ArbitrageDetector at(std::vector<double>{0.0, 0.0}, 0.5, 0.0, 20);
-    CHECK_EQ(at.detectAll(books), 0u);  // net == 0.5，不大于阈值
+    CHECK_EQ(detectAll(at, books), 0u);  // net == 0.5，不大于阈值
     CHECK_EQ(at.pairState(0, 1).sweep.net, 0.5);
     ArbitrageDetector below(std::vector<double>{0.0, 0.0}, 0.4999, 0.0, 20);
-    CHECK_EQ(below.detectAll(books), 1u);
+    CHECK_EQ(detectAll(below, books), 1u);
     // 手续费把净利润压到阈值以下
     ArbitrageDetector fee(std::vector<double>{0.001, 0.0015}, 0.3, 0.0, 20);
-    CHECK_EQ(fee.detectAll(books), 0u);
+    CHECK_EQ(detectAll(fee, books), 0u);
     CHECK_NEAR(fee.pairState(0, 1).sweep.net, 0.5 - (100.0 * 0.001 + 100.5 * 0.0015), 1e-12);
     ArbitrageDetector fee2(std::vector<double>{0.001, 0.0015}, 0.2, 0.0, 20);
-    CHECK_EQ(fee2.detectAll(books), 1u);
+    CHECK_EQ(detectAll(fee2, books), 1u);
     CHECK_NEAR(fee2.getSignals().back().fees, 100.0 * 0.001 + 100.5 * 0.0015, 1e-12);
 }
 
@@ -1015,7 +958,7 @@ TEST_CASE("detector: N venues - detectVenue touches exactly the 2(N-1) pairs of 
     ArbitrageDetector det(std::vector<double>(n, 0.0), 0.01, 0.0, 20);
     std::vector<OrderBook> books;
     for (std::size_t i = 0; i < n; ++i) books.push_back(makeBook("V" + std::to_string(i), {{99.0, 1.0}}, {{101.0, 1.0}}));
-    CHECK_EQ(det.detectVenue(2, books), 0u);
+    CHECK_EQ(det.detectVenue(2, bookAt(books)), 0u);
     for (std::size_t b = 0; b < n; ++b) {
         for (std::size_t s = 0; s < n; ++s) {
             if (b == s) continue;
@@ -1023,7 +966,7 @@ TEST_CASE("detector: N venues - detectVenue touches exactly the 2(N-1) pairs of 
             CHECK_EQ(det.pairState(b, s).evaluations, expected);
         }
     }
-    det.detectAll(books);
+    detectAll(det, books);
     for (std::size_t b = 0; b < n; ++b) {
         for (std::size_t s = 0; s < n; ++s) {
             if (b == s) {
@@ -1034,19 +977,10 @@ TEST_CASE("detector: N venues - detectVenue touches exactly the 2(N-1) pairs of 
             CHECK_EQ(det.pairState(b, s).evaluations, expected);
         }
     }
-    ArbitrageDetector mask(std::vector<double>(n, 0.0), 0.01, 0.0, 20);
-    mask.detectChanged({true, false, false, true}, books);
-    for (std::size_t b = 0; b < n; ++b) {
-        for (std::size_t s = 0; s < n; ++s) {
-            if (b == s) continue;
-            const bool involved = b == 0 || b == 3 || s == 0 || s == 3;
-            CHECK_EQ(mask.pairState(b, s).evaluations, involved ? 1u : 0u);
-        }
-    }
     // 越界与 buy == sell 什么也不做
     CHECK(det.detectPair(1, 1, books[1], books[1]) == nullptr);
     CHECK(det.detectPair(7, 1, books[1], books[1]) == nullptr);
-    CHECK_EQ(det.detectVenue(9, books), 0u);
+    CHECK_EQ(det.detectVenue(9, bookAt(books)), 0u);
     CHECK_THROWS(det.pairState(4, 0));
     CHECK_THROWS(ArbitrageDetector(std::vector<double>(ArbitrageDetector::kMaxVenues + 1, 0.0), 0.01));
 
@@ -1055,7 +989,7 @@ TEST_CASE("detector: N venues - detectVenue touches exactly the 2(N-1) pairs of 
     std::vector<OrderBook> tb = {makeBook("A:BTC", {{99.0, 1.0}}, {{100.0, 1.0}}),
                                  makeBook("B:BTC", {{101.0, 2.0}}, {{101.5, 2.0}}),
                                  makeBook("C:BTC", {{102.0, 0.5}}, {{103.0, 1.0}})};
-    CHECK_EQ(three.detectAll(tb), 3u);
+    CHECK_EQ(detectAll(three, tb), 3u);
     std::vector<std::pair<std::size_t, std::size_t>> got;
     for (const ArbitrageSignal& s : three.getSignals()) got.emplace_back(s.buy_venue, s.sell_venue);
     std::sort(got.begin(), got.end());
@@ -1084,7 +1018,7 @@ TEST_CASE("detector: the recent-signal deque is bounded at 1000 while totals kee
     for (int i = 0; i < 1500; ++i) {
         const double ask = i % 2 == 0 ? 100.0 : 100.05;
         books[0] = makeBook("A", {{99.0, 1.0}}, {{ask, 1.0}});
-        if (det.detectVenue(0, books) == 1) expected_net += (101.0 - ask) * 1.0;
+        if (det.detectVenue(0, bookAt(books)) == 1) expected_net += (101.0 - ask) * 1.0;
     }
     std::cout.rdbuf(old);
     CHECK(captured.str().empty());
@@ -1106,9 +1040,9 @@ TEST_CASE("detector: per-venue fee rates and depth caps flow from the constructo
     std::vector<OrderBook> books = {makeBook("A", {{90.0, 1.0}}, {{100.0, 1.0}, {100.5, 1.0}, {100.6, 1.0}}),
                                     makeBook("B", {{105.0, 1.0}, {104.0, 1.0}, {103.0, 1.0}}, {{110.0, 1.0}}),
                                     makeBook("C", {{80.0, 1.0}}, {{120.0, 1.0}})};
-    det.detectAll(books);
+    detectAll(det, books);
     const SweepResult& r = det.pairState(0, 1).sweep;
-    const SweepResult expect = ArbitrageDetector::sweep(books[0], books[1], 0.001, 0.002, 1.5, 2);
+    const SweepResult expect = sweepOf(books[0].getAsks(), books[1].getBids(), 0.001, 0.002, 1.5, 2);
     CHECK_EQ(r.qty, 1.5);
     CHECK_EQ(r.qty, expect.qty);
     CHECK_EQ(r.net, expect.net);
@@ -1359,16 +1293,11 @@ bool onlySgrControls(const std::string& s, std::string& why) {
 // 检查文本中的每一个框：从每个左上角（┌ / ╔）沿顶边找到右上角，沿左边向下直到左下角；中间每一行的左右两列
 // 必须是竖边（或 ├ ┤ 分隔线），底行必须是对应的两个底角。返回找到的框数；出错时 why 非空。
 int checkBoxes(const std::string& text, std::string& why) {
+    const std::vector<std::string> lines = splitLines(text_util::stripAnsi(text));
     std::vector<std::u32string> grid;
-    for (const std::string& line : splitLines(text_util::stripAnsi(text))) grid.push_back(decodeUtf8(line));
+    for (const std::string& line : lines) grid.push_back(decodeUtf8(line));
     auto at = [&](std::size_t r, std::size_t c) -> char32_t { return c < grid[r].size() ? grid[r][c] : U' '; };
-    auto rowText = [&](std::size_t r) {
-        std::string s;
-        for (const std::string& line : splitLines(text_util::stripAnsi(text))) {
-            if (r-- == 0) return line;
-        }
-        return s;
-    };
+    auto rowText = [&](std::size_t r) { return lines[r]; };
     int boxes = 0;
     for (std::size_t r = 0; r < grid.size(); ++r) {
         for (std::size_t c = 0; c < grid[r].size(); ++c) {
@@ -1430,11 +1359,11 @@ struct DisplayFixture {
         std::vector<double> fees = {0.0, 0.001, 0.0001};
         fees.resize(n);
         detector = std::make_unique<ArbitrageDetector>(fees, 0.01, 0.0, 20);
-        detector->detectAll(books);
+        detectAll(*detector, books);
         if (n >= 3) {
             // 再制造几条信号：Binance 卖一下移
             books[0].updateAsk(67000.20, 0.0);
-            detector->detectVenue(0, books);
+            detector->detectVenue(0, bookAt(books));
         }
         const FeedStatus statuses[] = {FeedStatus::Live, FeedStatus::Reconnecting, FeedStatus::Syncing};
         for (std::size_t i = 0; i < n; ++i) {
@@ -1532,29 +1461,17 @@ TEST_CASE("display: frames for 1, 2 and 3 venues keep every boxed line at the sa
             }
         }
     }
-}
-
-TEST_CASE("display: status colours (LIVE green, CONNECTING/SYNCING/RECONNECTING yellow, STOPPED red)") {
-    const display_detail::Palette pal = display_detail::Palette::make(true);
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Live, pal)), std::string("\033[32m"));
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Connecting, pal)), std::string("\033[33m"));
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Syncing, pal)), std::string("\033[33m"));
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Reconnecting, pal)), std::string("\033[33m"));
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Stopped, pal)), std::string("\033[31m"));
-    const display_detail::Palette none = display_detail::Palette::make(false);
-    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Live, none)), std::string());
-
+    // STOPPED 红、CONNECTING 黄
     DisplayFixture fx(3);
     fx.views[1].status = FeedStatus::Stopped;
     fx.views[2].status = FeedStatus::Connecting;
-    FrameOptions fo;
-    const std::string frame = Display::renderFrame(fx.views, *fx.detector, fo);
+    const std::string frame = Display::renderFrame(fx.views, *fx.detector, FrameOptions());
     CHECK(contains(frame, "\033[31mSTOPPED\033[0m"));
     CHECK(contains(frame, "\033[33mCONNECTING\033[0m"));
     checkFrame(frame, 3, true);
 }
 
-TEST_CASE("display: number formatting helpers keep fixed widths") {
+TEST_CASE("display: formatting helpers keep fixed widths; status colours; cursor sequences usable with write(2)") {
     CHECK_EQ(Display::formatNumber(67000.1, 2, 10), std::string("  67000.10"));
     CHECK_EQ(Display::formatNumber(123456.789, 4, 8), std::string("123456.8"));
     CHECK_EQ(Display::formatNumber(1.5, 2, 8, true), std::string("   +1.50"));
@@ -1569,6 +1486,23 @@ TEST_CASE("display: number formatting helpers keep fixed widths") {
     CHECK_EQ(Display::formatUs(950.0), std::string("0.9"));
     CHECK_EQ(Display::formatDuration(3723.9), std::string("01:02:03"));
     CHECK_EQ(Display::formatDuration(-5.0), std::string("00:00:00"));
+    // headless 状态行与报告共用同一个格式化函数
+    CHECK_EQ(Display::plainNumber(99.9, 3), std::string("99.900"));
+    CHECK_EQ(Display::plainNumber(-1.005, 2), std::string("-1.00"));
+    CHECK_EQ(Display::plainNumber(1234.4, 0), std::string("1234"));
+    // 状态的颜色：LIVE 绿，CONNECTING / SYNCING / RECONNECTING 黄，STOPPED 红；无色时为空
+    const display_detail::Palette pal = display_detail::Palette::make(true);
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Live, pal)), std::string("\033[32m"));
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Connecting, pal)), std::string("\033[33m"));
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Syncing, pal)), std::string("\033[33m"));
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Reconnecting, pal)), std::string("\033[33m"));
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Stopped, pal)), std::string("\033[31m"));
+    CHECK_EQ(std::string(Display::statusColor(FeedStatus::Live, display_detail::Palette::make(false))), std::string());
+    // 光标序列是字符数组：sizeof - 1 是长度，信号处理函数里可以直接 write(fd, kShowCursor, sizeof - 1)
+    static_assert(sizeof(Display::kHideCursor) == 7, "kHideCursor must be a char array");
+    static_assert(sizeof(Display::kShowCursor) == 7, "kShowCursor must be a char array");
+    CHECK_EQ(std::string(Display::kHideCursor), std::string("\033[?25l"));
+    CHECK_EQ(std::string(Display::kShowCursor), std::string("\033[?25h"));
 }
 
 TEST_CASE("display: pair rows show '--' for a venue that is not LIVE, even while its last book is still there") {
@@ -1577,7 +1511,7 @@ TEST_CASE("display: pair rows show '--' for a venue that is not LIVE, even while
     books.push_back(makeBook("A:BTCUSDT", {{99.90, 1.0}}, {{100.00, 1.0}}));
     books.push_back(makeBook("B:BTCUSDT", {{100.50, 2.0}}, {{100.60, 2.0}}));
     ArbitrageDetector det(std::vector<double>{0.0, 0.0}, 0.01, 0.0, 20);
-    det.detectAll(books);
+    detectAll(det, books);
     REQUIRE_EQ(det.getTotalSignals(), 1u);
     std::vector<VenueView> views(2);
     for (std::size_t i = 0; i < 2; ++i) {
@@ -1623,18 +1557,6 @@ TEST_CASE("display: pair rows show '--' for a venue that is not LIVE, even while
     CHECK(contains(frame, "B:BTCUSDT  STOPPED"));
     CHECK(contains(frame, "100.60"));
     checkFrame(frame, 2, false);
-}
-
-TEST_CASE("display: one shared plain-number formatter and cursor sequences usable with write(2)") {
-    // headless 状态行与报告共用同一个格式化函数
-    CHECK_EQ(Display::plainNumber(99.9, 3), std::string("99.900"));
-    CHECK_EQ(Display::plainNumber(-1.005, 2), std::string("-1.00"));
-    CHECK_EQ(Display::plainNumber(1234.4, 0), std::string("1234"));
-    // 光标序列是字符数组：sizeof - 1 是长度，信号处理函数里可以直接 write(fd, kShowCursor, sizeof - 1)
-    static_assert(sizeof(Display::kHideCursor) == 7, "kHideCursor must be a char array");
-    static_assert(sizeof(Display::kShowCursor) == 7, "kShowCursor must be a char array");
-    CHECK_EQ(std::string(Display::kHideCursor), std::string("\033[?25l"));
-    CHECK_EQ(std::string(Display::kShowCursor), std::string("\033[?25h"));
 }
 
 TEST_CASE("display: max_rows shrinks the frame step by step and cuts it with a notice only as a last resort") {
@@ -1823,13 +1745,12 @@ TEST_CASE("logger: signal line spacing, echo of selected tags, and an N-venue fi
 // 命令行
 // ============================================================================
 
-bool parse(std::initializer_list<const char*> args, CliOptions& out, std::string& error) {
-    std::vector<const char*> argv = {"crypto_hft_engine"};
-    argv.insert(argv.end(), args.begin(), args.end());
-    return parseCommandLine(static_cast<int>(argv.size()), argv.data(), out, error);
+bool parse(std::vector<const char*> args, CliOptions& out, std::string& error) {
+    args.insert(args.begin(), "crypto_hft_engine");
+    return parseCommandLine(static_cast<int>(args.size()), args.data(), out, error);
 }
 
-TEST_CASE("cli: --config/--headless/--duration/--help in both '--opt value' and '--opt=value' forms") {
+TEST_CASE("cli: --config/--headless/--duration/--busy-poll/--help in both '--opt value' and '--opt=value' forms") {
     CliOptions o;
     std::string err;
     REQUIRE(parse({}, o, err));
@@ -1837,6 +1758,7 @@ TEST_CASE("cli: --config/--headless/--duration/--help in both '--opt value' and 
     CHECK(!o.config_given);
     CHECK(!o.headless);
     CHECK_EQ(o.duration_s, 0.0);
+    CHECK(!o.busy_poll);
     CHECK(!o.help);
     REQUIRE(parse({"--config", "tools/mock_config.json", "--headless", "--duration", "2.5"}, o, err));
     CHECK_EQ(o.config_path, std::string("tools/mock_config.json"));
@@ -1850,45 +1772,39 @@ TEST_CASE("cli: --config/--headless/--duration/--help in both '--opt value' and 
     CHECK(o.help);
     REQUIRE(parse({"--help", "--headless"}, o, err));
     CHECK(o.help);
-    const std::string usage = usageText("crypto_hft_engine");
-    for (const char* opt : {"--config <path>", "--headless", "--duration <seconds>", "--help"}) CHECK(contains(usage, opt));
-}
-
-TEST_CASE("cli: errors for unknown options, missing values, bad durations and positional arguments") {
-    CliOptions o;
-    std::string err;
-    CHECK(!parse({"--bogus"}, o, err));
-    CHECK(contains(err, "unknown option \"--bogus\""));
-    CHECK(!parse({"--config"}, o, err));
-    CHECK(contains(err, "--config requires a value"));
-    CHECK(!parse({"--config="}, o, err));
-    CHECK(contains(err, "non-empty"));
-    CHECK(!parse({"--duration"}, o, err));
-    for (const char* bad : {"0", "-1", "abc", "2s", "inf", "nan", "1e20", ""}) {
-        err.clear();
-        const std::string arg = std::string("--duration=") + bad;
-        CHECK(!parse({arg.c_str()}, o, err));
-        CHECK(!err.empty());
-    }
-    CHECK(!parse({"config.json"}, o, err));
-    CHECK(contains(err, "unexpected argument \"config.json\""));
-    CHECK(!parse({"--headlessly"}, o, err));
-    CHECK(!parse({"--configs", "x"}, o, err));
-}
-
-TEST_CASE("cli: --busy-poll is parsed and documented in --help") {
-    CliOptions o;
-    std::string err;
-    REQUIRE(parse({}, o, err));
-    CHECK(!o.busy_poll);
     REQUIRE(parse({"--busy-poll", "--headless"}, o, err));
     CHECK(o.busy_poll);
     CHECK(o.headless);
-    CHECK(!parse({"--busy-poll=1"}, o, err));
-    CHECK(contains(err, "unknown option \"--busy-poll=1\""));
     const std::string usage = usageText("crypto_hft_engine");
-    CHECK(contains(usage, "[--busy-poll]"));
-    CHECK(contains(usage, "\n  --busy-poll  "));
+    for (const char* opt : {"--config <path>", "--headless", "--duration <seconds>", "--help", "[--busy-poll]",
+                            "\n  --busy-poll  "}) {
+        CHECK(contains(usage, opt));
+    }
+}
+
+TEST_CASE("cli: errors for unknown options, missing values, bad durations and positional arguments") {
+    std::vector<std::pair<std::vector<const char*>, std::string>> cases = {
+        {{"--bogus"}, "unknown option \"--bogus\""},
+        {{"--headlessly"}, "unknown option \"--headlessly\""},
+        {{"--configs", "x"}, "unknown option \"--configs\""},
+        {{"--busy-poll=1"}, "unknown option \"--busy-poll=1\""},  // 开关选项不接受 "=value"
+        {{"--config"}, "--config requires a value"},
+        {{"--config="}, "--config requires a non-empty value"},
+        {{"--duration"}, "--duration requires a value"},
+        {{"--duration="}, "--duration requires a non-empty value"},
+        {{"config.json"}, "unexpected argument \"config.json\""},
+    };
+    std::vector<std::string> durations;
+    for (const char* bad : {"0", "-1", "abc", "2s", "inf", "nan", "1e20"}) durations.push_back(std::string("--duration=") + bad);
+    for (const std::string& arg : durations) {
+        cases.push_back({{arg.c_str()}, "--duration expects a positive number of seconds, got \"" + arg.substr(11) + "\""});
+    }
+    for (const auto& c : cases) {
+        CliOptions o;
+        std::string err;
+        CHECK(!parse(c.first, o, err));
+        CHECK_EQ(err, c.second);
+    }
 }
 
 TEST_CASE("cli: cli_util::parseUnsigned shared by exchange_sim and mock_exchange") {
@@ -1917,9 +1833,7 @@ constexpr const char* kBinanceDiffPath = "/ws/btcusdt@depth@100ms";
 constexpr const char* kBinancePartialPath = "/ws/btcusdt@depth20@100ms";
 constexpr const char* kOkxPath = "/ws/v5/public";
 constexpr const char* kBybitPath = "/v5/public/spot";
-constexpr const char* kOkxBooksSub = R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
 constexpr const char* kOkxBooks5Sub = R"({"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT"}]})";
-constexpr const char* kBybitSub = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
 
 std::string levelsJson(const Levels& levels, bool okx) {
     std::string s = "[";
@@ -1990,6 +1904,28 @@ AppConfig mockAppConfig(MockExchangeServer& server) {
     return c;
 }
 
+// 两个交易所：Binance 部分深度流（不需要 REST 快照）与 OKX books5；Bybit 关闭
+AppConfig twoVenueConfig(MockExchangeServer& server) {
+    AppConfig c = mockAppConfig(server);
+    c.venues[0].path = kBinancePartialPath;
+    c.venues[0].rest_host.clear();
+    c.venues[0].snapshot_path.clear();
+    c.venues[1].subscribe_msg = kOkxBooks5Sub;
+    c.venues[2].enabled = false;
+    return c;
+}
+
+// OKX books5 会话：第一个会话推送一本簿（买一 100.5、卖一 100.6），linger_ms 后断线并置位 closed；
+// 重连后的会话保持静默（状态不会回到 LIVE）
+void okxOneBookThenClose(WsSession& ws, std::atomic<int>& sessions, std::atomic<bool>& closed, int linger_ms) {
+    ws.expectText(kOkxBooks5Sub);
+    if (sessions.fetch_add(1) != 0) return;
+    ws.send(okxBooks5({{"100.5", "2"}}, {{"100.6", "2"}}));
+    ws.sleepMs(linger_ms);
+    ws.close(1001, "going away");
+    closed.store(true);
+}
+
 // 在测试线程上运行 app.run()；另一个线程在 done() 成立且至少运行了 min_ms 后设置停止标志（最长 timeout_ms）
 template <class Done>
 int runApp(MonitorApp& app, Done done, int min_ms, int timeout_ms, double* stop_to_return_ms = nullptr) {
@@ -2010,6 +1946,27 @@ int runApp(MonitorApp& app, Done done, int min_ms, int timeout_ms, double* stop_
     if (stop_to_return_ms != nullptr) *stop_to_return_ms = static_cast<double>(end - stop_ns.load()) / 1e6;
     return rc;
 }
+
+// MonitorApp 的运行环境：临时日志目录、日志器与输出流（RunOptions::out）。
+// log() 关闭日志器（写入 Stopped 行）后返回日志文件的内容，只能在 MonitorApp 销毁之后调用。
+struct AppEnv {
+    TempPath logs{"test_app_logs"};
+    TempStream out;
+    std::unique_ptr<Logger> logger = std::make_unique<Logger>(logs.str(), false);
+    const std::string log_path = logger->path();
+
+    RunOptions options(bool headless = true) const {
+        RunOptions o;
+        o.headless = headless;
+        o.out = out.f;
+        return o;
+    }
+    std::string output() const { return readAll(out.f); }
+    std::string log() {
+        logger.reset();
+        return readFile(log_path);
+    }
+};
 
 // 管道：写端交给被测代码（fdopen 成 FILE*，或 dup2 成子进程的 stdout/stderr），后台线程读取读端。
 // 可以暂停读取来模拟被阻塞的终端（Ctrl+S 流控、卡住的 SSH 会话）：管道写满后写入方阻塞在 write(2) 里。
@@ -2044,6 +2001,11 @@ public:
     }
 
     int capacity() const noexcept { return capacity_; }
+    // 写满管道：读取暂停时，之后的任何写入都会阻塞
+    bool fill() const {
+        const std::string filler(static_cast<std::size_t>(capacity_), '.');
+        return ::write(write_fd_, filler.data(), filler.size()) == static_cast<ssize_t>(filler.size());
+    }
     void setReading(bool on) noexcept { reading_.store(on); }
     // 管道中尚未读取的字节数
     int buffered() const noexcept {
@@ -2130,8 +2092,7 @@ TEST_CASE("app: feedConfigFor carries venue, connection and logging settings int
 }
 
 TEST_CASE("app: the venue list is AppConfig::enabledVenues() of the app's own copy, so a temporary config is safe") {
-    TempPath logs("test_app_logs");
-    Logger logger(logs.str(), false);
+    AppEnv env;
     auto disabledBinance = [] {
         AppConfig c = ConfigReader::getDefaults();
         c.venues[0].enabled = false;
@@ -2140,7 +2101,7 @@ TEST_CASE("app: the venue list is AppConfig::enabledVenues() of the app's own co
         return c;
     };
     // 临时 AppConfig：构造结束后即被销毁，MonitorApp 只能引用自己的副本（ASan 下悬空指针会被发现）
-    MonitorApp app(disabledBinance(), logger, RunOptions{});
+    MonitorApp app(disabledBinance(), *env.logger, RunOptions{});
     const AppConfig expect = disabledBinance();
     const std::vector<const VenueConfig*> enabled = expect.enabledVenues();
     REQUIRE_EQ(app.venueCount(), enabled.size());
@@ -2184,17 +2145,9 @@ TEST_CASE("app: three mock venues end to end - REST sync, checksummed books, eve
             bybit_sent.fetch_add(1);
         }
     });
-    TempPath logs("test_app_e2e_logs");
-    TempStream out;
-    std::string log_path;
-    const AppConfig cfg = mockAppConfig(server);
+    AppEnv env;
     {
-        Logger logger(logs.str(), false);
-        log_path = logger.path();
-        RunOptions opt;
-        opt.headless = true;
-        opt.out = out.f;
-        MonitorApp app(cfg, logger, opt);
+        MonitorApp app(mockAppConfig(server), *env.logger, env.options());
         REQUIRE_EQ(app.venueCount(), 3u);
         double stop_ms = 0.0;
         const int rc = runApp(app, [&] { return done.load(); }, 1300, 15000, &stop_ms);
@@ -2243,7 +2196,7 @@ TEST_CASE("app: three mock venues end to end - REST sync, checksummed books, eve
         CHECK_GT(app.ticks(), 10u);
         CHECK_EQ(app.renders(), 0u);
     }
-    const std::string text = readAll(out.f);
+    const std::string text = env.output();
     const std::string port = server.portString();
     CHECK(contains(text, "[FEED] [Binance] connecting to wss://127.0.0.1:" + port + kBinanceDiffPath));
     CHECK(contains(text, "[FEED] [OKX] book synced (LIVE)"));
@@ -2264,7 +2217,7 @@ TEST_CASE("app: three mock venues end to end - REST sync, checksummed books, eve
     CHECK_EQ(checkBoxes(text.substr(report_at), why), 5);
     CHECK(why.empty());
 
-    const std::string log = readFile(log_path);
+    const std::string log = env.log();
     CHECK_EQ(countOf(log, "[SIGNAL] SIGNAL | Buy "), 4u);
     CHECK(contains(log, "[INFO] Venue Binance: wss://127.0.0.1:" + port + kBinanceDiffPath));
     CHECK(contains(log, "REST https://127.0.0.1:" + port + "/api/v3/depth?symbol=BTCUSDT&limit=1000"));
@@ -2289,31 +2242,14 @@ TEST_CASE("app: a venue that disconnects publishes an empty book -> no data, no 
             ws.sleepMs(300);
             done.store(true);
         } else if (ws.target() == kOkxPath) {
-            ws.expectText(kOkxBooks5Sub);
-            if (okx_sessions.fetch_add(1) == 0) {
-                ws.send(okxBooks5({{"100.5", "2"}}, {{"100.6", "2"}}));
-                ws.sleepMs(300);
-                ws.close(1001, "going away");
-                okx_closed.store(true);
-            }
-            // 重连后的会话保持静默
+            okxOneBookThenClose(ws, okx_sessions, okx_closed, 300);
         }
     });
-    AppConfig cfg = mockAppConfig(server);
-    cfg.venues[0].path = kBinancePartialPath;
-    cfg.venues[0].rest_host.clear();
-    cfg.venues[0].snapshot_path.clear();
-    cfg.venues[1].subscribe_msg = kOkxBooks5Sub;
-    cfg.venues[2].enabled = false;
-    TempPath logs("test_app_e2e_logs");
-    TempStream out;
+    AppEnv env;
     {
-        Logger logger(logs.str(), false);
-        RunOptions opt;
-        opt.headless = false;  // 终端模式：帧写到 out（不是终端：不限制尺寸）
+        RunOptions opt = env.options(false);  // 终端模式：帧写到 out（不是终端：不限制尺寸）
         opt.color = false;
-        opt.out = out.f;
-        MonitorApp app(cfg, logger, opt);
+        MonitorApp app(twoVenueConfig(server), *env.logger, opt);
         REQUIRE_EQ(app.venueCount(), 2u);
         // 等 Binance 脚本结束，并且 OKX 已经重连上（第二个会话）
         const int rc = runApp(app, [&] { return done.load() && okx_sessions.load() >= 2; }, 500, 15000);
@@ -2330,7 +2266,7 @@ TEST_CASE("app: a venue that disconnects publishes an empty book -> no data, no 
         CHECK_GT(app.renders(), 5u);
         CHECK_EQ(app.renders(), app.ticks());
     }
-    const std::string text = readAll(out.f);
+    const std::string text = env.output();
     CHECK(contains(text, Display::kHideCursor));
     CHECK(contains(text, Display::kShowCursor));
     // 最后一帧：最后一个 "光标归位" 到显示光标之间
@@ -2374,39 +2310,21 @@ TEST_CASE("app: a stale book drained after its venue left LIVE never pairs for a
         if (ws.target() == kBinancePartialPath) {
             ws.send(binanceDepth(1, {{"99.90", "1"}}, {{"100.00", "1"}}));
         } else if (ws.target() == kOkxPath) {
-            ws.expectText(kOkxBooks5Sub);
-            if (okx_sessions.fetch_add(1) == 0) {
-                ws.send(okxBooks5({{"100.5", "2"}}, {{"100.6", "2"}}));
-                ws.sleepMs(100);
-                ws.close(1001, "going away");
-                okx_closed.store(true);
-            }
-            // 重连后的会话保持静默
+            okxOneBookThenClose(ws, okx_sessions, okx_closed, 100);
         }
     });
-    AppConfig cfg = mockAppConfig(server);
-    cfg.venues[0].path = kBinancePartialPath;
-    cfg.venues[0].rest_host.clear();
-    cfg.venues[0].snapshot_path.clear();
-    cfg.venues[1].subscribe_msg = kOkxBooks5Sub;
-    cfg.venues[2].enabled = false;
-    TempPath logs("test_app_e2e_logs");
+    AppEnv env;
     PipeReader pipe(4096, false);  // 先不读
     REQUIRE(pipe.capacity() > 0);
-    const std::string filler(static_cast<std::size_t>(pipe.capacity()), '.');
-    REQUIRE_EQ(::write(pipe.writeFd(), filler.data(), filler.size()), static_cast<ssize_t>(filler.size()));
+    REQUIRE(pipe.fill());
     REQUIRE_EQ(pipe.buffered(), pipe.capacity());  // 管道已满：之后的任何写入都会阻塞
     std::FILE* out = ::fdopen(pipe.releaseWriteFd(), "w");
     REQUIRE(out != nullptr);
-    std::string log_path;
     {
-        Logger logger(logs.str(), false);
-        log_path = logger.path();
-        RunOptions opt;
-        opt.headless = false;
+        RunOptions opt = env.options(false);
         opt.color = false;
         opt.out = out;
-        MonitorApp app(cfg, logger, opt);
+        MonitorApp app(twoVenueConfig(server), *env.logger, opt);
         REQUIRE_EQ(app.venueCount(), 2u);
         std::atomic<bool> stop{false};
         std::atomic<bool> sequence_ok{false};
@@ -2442,7 +2360,7 @@ TEST_CASE("app: a stale book drained after its venue left LIVE never pairs for a
     CHECK(contains(text, "Binance:BTCUSDT  LIVE"));
     CHECK(contains(text, "-- no data --"));
     CHECK(contains(text, "Final Report"));
-    CHECK_EQ(countOf(readFile(log_path), "[SIGNAL]"), 0u);
+    CHECK_EQ(countOf(env.log(), "[SIGNAL]"), 0u);
     CHECK(server.errors().empty());
 }
 
@@ -2480,16 +2398,15 @@ std::string closedPort() {
     return std::to_string(ntohs(addr.sin_port));
 }
 
-// 所有交易所都连不上、长时间退避：没有任何数据的空闲监控程序
-AppConfig idleAppConfig() {
+// 所有交易所都连不上（端口已关闭），按 reconnect_ms 退避重连：没有任何数据的监控程序
+AppConfig unreachableConfig(int reconnect_ms) {
     AppConfig cfg = ConfigReader::getDefaults();
     const std::string port = closedPort();
     for (VenueConfig& v : cfg.venues) {
         v.host = "127.0.0.1";
         v.port = port;
     }
-    cfg.connection.reconnect_initial_ms = 30000;
-    cfg.connection.reconnect_max_ms = 30000;
+    cfg.connection.reconnect_initial_ms = cfg.connection.reconnect_max_ms = reconnect_ms;
     cfg.source = "<test>";
     return cfg;
 }
@@ -2603,15 +2520,10 @@ TEST_CASE("app: WakeSignal never loses a wakeup (ping-pong and burst stress with
 TEST_CASE("app: an idle main loop blocks until a feed publishes or a timer is due instead of polling") {
     // 修复前：没有数据时每轮 sleep_for(200 µs)，每秒约 3300 次唤醒（4 vCPU 虚拟机上约 10% 个核）。
     // 现在：只在 tick（refresh_ms = 200）与等待上限（50 ms）时醒来，每秒约 20 次
-    AppConfig cfg = idleAppConfig();
-    TempPath logs("test_app_logs");
-    TempStream out;
-    Logger logger(logs.str(), false);
-    RunOptions opt;
-    opt.headless = true;
+    AppEnv env;
+    RunOptions opt = env.options();
     opt.duration_s = 1.5;
-    opt.out = out.f;
-    MonitorApp app(cfg, logger, opt);
+    MonitorApp app(unreachableConfig(30000), *env.logger, opt);  // 长时间退避：没有任何数据
     std::atomic<bool> stop{false};
     const ThreadUsage u0 = threadUsage();
     const std::int64_t t0 = hft::nowNs();
@@ -2644,13 +2556,8 @@ TEST_CASE("app: a published snapshot wakes the waiting main loop at once, far be
     cfg.venues[0].enabled = false;
     cfg.venues[1].enabled = false;
     cfg.display.refresh_ms = 1000;
-    TempPath logs("test_app_e2e_logs");
-    TempStream out;
-    Logger logger(logs.str(), false);
-    RunOptions opt;
-    opt.headless = true;
-    opt.out = out.f;
-    MonitorApp app(cfg, logger, opt);
+    AppEnv env;
+    MonitorApp app(cfg, *env.logger, env.options());
     REQUIRE_EQ(app.venueCount(), 1u);
     CHECK_EQ(runApp(app, [&] { return done.load(); }, 100, 15000), 0);
     const LatencyTracker& q = app.queueLatency(0);
@@ -2676,17 +2583,11 @@ TEST_CASE("app: --busy-poll spins on the queues instead of sleeping and still pr
     AppConfig cfg = mockAppConfig(server);
     cfg.venues[0].enabled = false;
     cfg.venues[1].enabled = false;
-    TempPath logs("test_app_e2e_logs");
-    TempStream out;
-    std::string log_path;
+    AppEnv env;
     {
-        Logger logger(logs.str(), false);
-        log_path = logger.path();
-        RunOptions opt;
-        opt.headless = true;
+        RunOptions opt = env.options();
         opt.busy_poll = true;
-        opt.out = out.f;
-        MonitorApp app(cfg, logger, opt);
+        MonitorApp app(cfg, *env.logger, opt);
         const ThreadUsage u0 = threadUsage();
         const std::int64_t t0 = hft::nowNs();
         CHECK_EQ(runApp(app, [&] { return done.load() && app.feed(0).stats().published >= 30; }, 300, 15000), 0);
@@ -2697,62 +2598,36 @@ TEST_CASE("app: --busy-poll spins on the queues instead of sleeping and still pr
         // 自旋：主线程一直在运行（被抢占时除外），CPU 时间远高于事件驱动模式（约 0.2%）
         CHECK_GT(100.0 * (u1.cpu_s - u0.cpu_s) / wall_s, 20.0);
     }
-    CHECK(contains(readFile(log_path), "Mode: headless, refresh 20 ms, busy-poll"));
+    CHECK(contains(env.log(), "Mode: headless, refresh 20 ms, busy-poll"));
 }
 
 TEST_CASE("app: no enabled venue -> exit code 1 without starting anything") {
     AppConfig cfg = ConfigReader::getDefaults();
     for (VenueConfig& v : cfg.venues) v.enabled = false;
-    TempPath logs("test_app_logs");
-    TempStream out;
-    Logger logger(logs.str(), false);
-    RunOptions opt;
-    opt.headless = true;
-    opt.out = out.f;
-    MonitorApp app(cfg, logger, opt);
+    AppEnv env;
+    MonitorApp app(cfg, *env.logger, env.options());
     CHECK_EQ(app.venueCount(), 0u);
     std::atomic<bool> stop{false};
     CHECK_EQ(app.run(stop), 1);
-    CHECK(readAll(out.f).empty());
+    CHECK(env.output().empty());
 }
 
 TEST_CASE("app: --duration ends the run on time even while every venue keeps failing to connect") {
-    // 一个刚刚关闭的端口：连接被拒绝，feed 不停退避重连
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE(fd >= 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
-    socklen_t len = sizeof(addr);
-    REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
-    const std::string port = std::to_string(ntohs(addr.sin_port));
-    ::close(fd);
-
-    AppConfig cfg = ConfigReader::getDefaults();
-    for (VenueConfig& v : cfg.venues) {
-        v.host = "127.0.0.1";
-        v.port = port;
-    }
-    cfg.connection.reconnect_initial_ms = 20;
+    // 连接被拒绝，feed 不停退避重连
+    AppConfig cfg = unreachableConfig(20);
     cfg.connection.reconnect_max_ms = 50;
     cfg.display.refresh_ms = 50;
-    TempPath logs("test_app_logs");
-    TempStream out;
-    Logger logger(logs.str(), false);
-    RunOptions opt;
-    opt.headless = true;
+    AppEnv env;
+    RunOptions opt = env.options();
     opt.duration_s = 0.6;
-    opt.out = out.f;
-    MonitorApp app(cfg, logger, opt);
+    MonitorApp app(cfg, *env.logger, opt);
     std::atomic<bool> stop{false};
     const std::int64_t t0 = hft::nowNs();
     CHECK_EQ(app.run(stop), 0);
     const double ms = static_cast<double>(hft::nowNs() - t0) / 1e6;
     CHECK_GE(ms, 600.0);
     CHECK_LT(ms, 1600.0);
-    const std::string text = readAll(out.f);
+    const std::string text = env.output();
     CHECK(contains(text, "Shutting down (duration elapsed after 0.6 s)"));
     CHECK(contains(text, "connection refused") || contains(text, "Connection refused"));
     CHECK(contains(text, "reconnecting in "));
@@ -2801,12 +2676,7 @@ public:
     };
 
     explicit EngineProcess(const Options& o) : out_(o.pipe_capacity, !o.prefill) {
-        if (o.prefill) {
-            const std::string filler(static_cast<std::size_t>(out_.capacity()), '.');
-            if (::write(out_.writeFd(), filler.data(), filler.size()) != static_cast<ssize_t>(filler.size())) {
-                throw std::runtime_error("cannot fill the pipe");
-            }
-        }
+        if (o.prefill && !out_.fill()) throw std::runtime_error("cannot fill the pipe");
         const std::string bin = engineBinary();
         std::vector<std::string> args = {bin};
         args.insert(args.end(), o.args.begin(), o.args.end());

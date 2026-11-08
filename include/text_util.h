@@ -26,13 +26,13 @@ namespace text_util {
 
 namespace detail {
 
-// 一个词法单元：转义序列（宽度 0）或一个码点 / 非法字节
+// 一个词法单元：转义序列（宽度 0）或一个码点 / 非法字节。
+// 未结束的转义序列（complete = false）如果一直延续到字符串末尾，就是"悬空"序列（见文件头说明）。
 struct Token {
     std::size_t len = 0;      // 字节数（>= 1）
     std::size_t width = 0;    // 可见宽度（0 或 1）
     bool escape = false;      // 是否为转义序列
     bool complete = false;    // 转义序列以合法的终止字节（或 OSC 的 BEL / ST）结束
-    bool dangling = false;    // 未结束的转义序列一直延续到字符串末尾（见文件头说明）
 };
 
 inline bool isContinuation(unsigned char b) noexcept { return (b & 0xC0) == 0x80; }
@@ -43,32 +43,30 @@ inline bool inRange(unsigned char b, unsigned char lo, unsigned char hi) noexcep
 inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
     const std::size_t n = s.size();
     std::size_t j = i + 1;
-    if (j >= n) return Token{1, 0, true, false, true};  // 孤立的 ESC
+    if (j >= n) return Token{1, 0, true, false};  // 孤立的 ESC
     const unsigned char kind = static_cast<unsigned char>(s[j]);
     if (kind == '[') {  // CSI
         ++j;
         while (j < n && inRange(static_cast<unsigned char>(s[j]), 0x30, 0x3F)) ++j;
         while (j < n && inRange(static_cast<unsigned char>(s[j]), 0x20, 0x2F)) ++j;
-        if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x40, 0x7E)) {
-            return Token{j + 1 - i, 0, true, true, false};
-        }
+        if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x40, 0x7E)) return Token{j + 1 - i, 0, true, true};
         // 终止字节缺失：字符串在这里结束（悬空），或后面是非法字节（序列在此中断，之后的字节按普通字符处理）
-        return Token{j - i, 0, true, false, j >= n};
+        return Token{j - i, 0, true, false};
     }
     if (kind == ']') {  // OSC：到 BEL 或 ST（ESC \）为止
         ++j;
         while (j < n) {
             const unsigned char b = static_cast<unsigned char>(s[j]);
-            if (b == 0x07) return Token{j + 1 - i, 0, true, true, false};
-            if (b == 0x1B && j + 1 < n && s[j + 1] == '\\') return Token{j + 2 - i, 0, true, true, false};
+            if (b == 0x07) return Token{j + 1 - i, 0, true, true};
+            if (b == 0x1B && j + 1 < n && s[j + 1] == '\\') return Token{j + 2 - i, 0, true, true};
             ++j;
         }
-        return Token{j - i, 0, true, false, true};
+        return Token{j - i, 0, true, false};
     }
     // 其他 ESC 序列：中间字节 0x20-0x2F*，再加一个终止字节 0x30-0x7E
     while (j < n && inRange(static_cast<unsigned char>(s[j]), 0x20, 0x2F)) ++j;
-    if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x30, 0x7E)) return Token{j + 1 - i, 0, true, true, false};
-    return Token{j - i, 0, true, false, j >= n};
+    if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x30, 0x7E)) return Token{j + 1 - i, 0, true, true};
+    return Token{j - i, 0, true, false};
 }
 
 // 读取 s[i] 开始的一个词法单元（i < s.size()）。
@@ -77,7 +75,7 @@ inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
 inline Token nextToken(std::string_view s, std::size_t i) noexcept {
     const unsigned char b = static_cast<unsigned char>(s[i]);
     if (b == 0x1B) return escapeToken(s, i);
-    if (b < 0x80) return Token{1, (b < 0x20 || b == 0x7F) ? std::size_t{0} : std::size_t{1}, false, false, false};
+    if (b < 0x80) return Token{1, (b < 0x20 || b == 0x7F) ? std::size_t{0} : std::size_t{1}, false, false};
     std::size_t need = 0;
     unsigned char lo = 0x80, hi = 0xBF;  // 第二个字节的合法范围
     if (inRange(b, 0xC2, 0xDF)) {
@@ -91,15 +89,15 @@ inline Token nextToken(std::string_view s, std::size_t i) noexcept {
         if (b == 0xF0) lo = 0x90;
         if (b == 0xF4) hi = 0x8F;
     } else {
-        return Token{1, 1, false, false, false};  // 孤立续字节或非法首字节（C0、C1、F5-FF）
+        return Token{1, 1, false, false};  // 孤立续字节或非法首字节（C0、C1、F5-FF）
     }
     for (std::size_t k = 1; k <= need; ++k) {
         // 缺少续字节（含字符串在多字节序列中间结束）或第二个字节越界：首字节单独算一个非法字符，后面的字节重新解析
-        if (i + k >= s.size()) return Token{1, 1, false, false, false};
+        if (i + k >= s.size()) return Token{1, 1, false, false};
         const unsigned char c = static_cast<unsigned char>(s[i + k]);
-        if (k == 1 ? !inRange(c, lo, hi) : !isContinuation(c)) return Token{1, 1, false, false, false};
+        if (k == 1 ? !inRange(c, lo, hi) : !isContinuation(c)) return Token{1, 1, false, false};
     }
-    return Token{need + 1, 1, false, false, false};
+    return Token{need + 1, 1, false, false};
 }
 
 // 一次扫描得到可见宽度，以及去掉结尾悬空转义序列后的长度。
@@ -117,12 +115,12 @@ inline Measure measure(std::string_view s) noexcept {
     std::size_t run = kNone;  // 结尾处连续的未完成转义序列的起点
     for (std::size_t i = 0; i < s.size();) {
         const Token t = nextToken(s, i);
-        if (t.escape && !t.complete) {
-            if (run == kNone) run = i;
-        } else {
+        if (!t.escape || t.complete) {
             run = kNone;
+        } else if (run == kNone) {
+            run = i;
         }
-        if (t.dangling) {  // 悬空序列必然是最后一个词法单元
+        if (run != kNone && i + t.len == s.size()) {  // 悬空：未结束的序列一直延续到末尾（必然是最后一个词法单元）
             m.keep = run;
             break;
         }

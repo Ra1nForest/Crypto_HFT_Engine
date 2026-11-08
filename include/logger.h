@@ -38,12 +38,12 @@
 class Logger {
 public:
     // log_dir：日志目录；announce：是否在 stdout 打印 "[Logger] Log file: <path>"
-    explicit Logger(const std::string& log_dir = "logs", bool announce = true) : log_dir_(log_dir) {
-        if (::mkdir(log_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
-            std::cerr << "[Logger] Cannot create log directory " << log_dir_ << ": " << std::strerror(errno)
+    explicit Logger(const std::string& log_dir = "logs", bool announce = true) {
+        if (::mkdir(log_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+            std::cerr << "[Logger] Cannot create log directory " << log_dir << ": " << std::strerror(errno)
                       << std::endl;
         }
-        path_ = log_dir_ + "/arb_" + currentDate() + ".log";
+        path_ = log_dir + "/arb_" + now().date + ".log";
         file_.open(path_, std::ios::app);
         if (!file_.is_open()) {
             std::cerr << "[Logger] Failed to open log file: " << path_ << std::endl;
@@ -104,9 +104,6 @@ public:
         write("SPREAD", ss.str(), false, false);
     }
 
-    // 延迟统计（微秒，一位小数）
-    void logLatency(const LatencyTracker& tracker) { write("PERF", latencyLine("LATENCY", tracker), false, false); }
-
     // 最终报告：每个交易所的处理 / 队列 / 交易所延迟与连接统计，每个有序交易所对的信号汇总，以及总计
     void logFinalReport(const std::vector<VenueView>& venues, const ArbitrageDetector& detector) {
         write("INFO", "=== Final Report ===", false, false);
@@ -123,15 +120,11 @@ public:
                    << "ms | P99: " << static_cast<double>(e.percentileNs(0.99)) / 1e6 << "ms";
                 write("PERF", ss.str(), false, false);
             }
-            const FeedStats& st = v.stats;
-            std::ostringstream ss;
-            ss << "FEED | " << v.name << " | Status: " << feedStatusName(v.status) << " | Msgs: " << st.messages
-               << " | Bytes: " << st.bytes << " | Book updates: " << st.book_updates << " | Published: " << st.published
-               << " | Dropped: " << st.dropped_snapshots << " | Reconnects: " << st.reconnects
-               << " | Connect failures: " << st.connect_failures << " | Stalls: " << st.stalls << " | Gaps: " << st.gaps
-               << " | Checksum failures: " << st.checksum_failures << " | Resyncs: " << st.resyncs
-               << " | REST snapshots: " << st.rest_snapshots << " | Parse errors: " << st.parse_errors;
-            write("FEED", ss.str(), false, false);
+            std::string feed = "FEED | " + v.name + " | Status: " + feedStatusName(v.status);
+            for (const FeedCounter& c : kFeedCounters) {
+                feed += std::string(" | ") + c.log_label + ": " + std::to_string(v.stats.*c.field);
+            }
+            write("FEED", feed, false, false);
             if (!v.last_error.empty()) write("FEED", "FEED | " + v.name + " | Last error: " + v.last_error, false, false);
         }
         const std::size_t n = std::min(venues.size(), detector.venueCount());
@@ -177,9 +170,9 @@ private:
         }
     }
 
-    static std::string latencyLine(const char* kind, const LatencyTracker& t, const std::string& name = "") {
+    static std::string latencyLine(const char* kind, const LatencyTracker& t, const std::string& name) {
         std::ostringstream ss;
-        ss << std::fixed << std::setprecision(1) << kind << " | " << (name.empty() ? t.getName() : name)
+        ss << std::fixed << std::setprecision(1) << kind << " | " << name
            << " | Msgs: " << t.count() << " | Avg: " << t.meanNs() / 1000.0
            << "µs | P50: " << static_cast<double>(t.percentileNs(0.50)) / 1000.0
            << "µs | P95: " << static_cast<double>(t.percentileNs(0.95)) / 1000.0
@@ -208,9 +201,6 @@ private:
         return Stamp{date, time};
     }
 
-    static std::string currentDate() { return now().date; }
-
-    std::string log_dir_;
     std::string path_;
     std::mutex mutex_;          // 保护 file_ 与 echo_
     std::ofstream file_;

@@ -33,7 +33,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -82,25 +81,6 @@ inline std::string usageText(const std::string& program) {
 
 namespace app_detail {
 
-// "--name=value" 或 "--name value"：取出选项的值；缺失时返回 false
-inline bool optionValue(int argc, const char* const* argv, int& i, const std::string& name, std::string& value,
-                        std::string& error) {
-    const std::string arg = argv[i];
-    if (arg.size() > name.size() && arg.compare(0, name.size(), name) == 0 && arg[name.size()] == '=') {
-        value = arg.substr(name.size() + 1);
-    } else if (i + 1 < argc) {
-        value = argv[++i];
-    } else {
-        error = name + " requires a value";
-        return false;
-    }
-    if (value.empty()) {
-        error = name + " requires a non-empty value";
-        return false;
-    }
-    return true;
-}
-
 // 秒数：有限的正数，上限 1e9 秒（换算成纳秒不会溢出）
 inline bool parseSeconds(const std::string& text, double& out) {
     const char* begin = text.c_str();
@@ -115,13 +95,25 @@ inline bool parseSeconds(const std::string& text, double& out) {
 }  // namespace app_detail
 
 // 解析命令行；失败时返回 false 并在 error 中说明。选项可重复（后者覆盖前者），不接受位置参数。
+// 带值的选项写作 "--name value" 或 "--name=value"；开关选项不接受 "=value"。
 inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out, std::string& error) {
     CliOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] != nullptr ? argv[i] : "";
-        auto is = [&arg](const char* name) {
-            const std::size_t n = std::strlen(name);
-            return arg == name || (arg.size() > n && arg.compare(0, n, name) == 0 && arg[n] == '=');
+        const std::size_t eq = arg.rfind("--", 0) == 0 ? arg.find('=') : std::string::npos;
+        const std::string name = arg.substr(0, eq);
+        // 选项的值：'=' 之后的部分，或者下一个参数；缺失或为空时返回 false
+        auto value = [&](std::string& v) {
+            if (eq != std::string::npos) {
+                v = arg.substr(eq + 1);
+            } else if (i + 1 < argc) {
+                v = argv[++i];
+            } else {
+                error = name + " requires a value";
+                return false;
+            }
+            if (v.empty()) error = name + " requires a non-empty value";
+            return !v.empty();
         };
         if (arg == "--help" || arg == "-h") {
             opt.help = true;
@@ -129,14 +121,14 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
             opt.headless = true;
         } else if (arg == "--busy-poll") {
             opt.busy_poll = true;
-        } else if (is("--config")) {
-            if (!app_detail::optionValue(argc, argv, i, "--config", opt.config_path, error)) return false;
+        } else if (name == "--config") {
+            if (!value(opt.config_path)) return false;
             opt.config_given = true;
-        } else if (is("--duration")) {
-            std::string value;
-            if (!app_detail::optionValue(argc, argv, i, "--duration", value, error)) return false;
-            if (!app_detail::parseSeconds(value, opt.duration_s)) {
-                error = "--duration expects a positive number of seconds, got \"" + text_util::sanitize(value) + "\"";
+        } else if (name == "--duration") {
+            std::string value_text;
+            if (!value(value_text)) return false;
+            if (!app_detail::parseSeconds(value_text, opt.duration_s)) {
+                error = "--duration expects a positive number of seconds, got \"" + text_util::sanitize(value_text) + "\"";
                 return false;
             }
         } else if (!arg.empty() && arg[0] == '-') {
@@ -328,60 +320,13 @@ public:
             logger_.setEcho(nullptr);
             return 1;
         }
-
         start_ns_ = hft::nowNs();
-        const std::int64_t refresh_ns = static_cast<std::int64_t>(std::max(1, cfg_.display.refresh_ms)) * 1000000;
-        const std::int64_t deadline = opt_.duration_s > 0.0
-                                          ? start_ns_ + static_cast<std::int64_t>(opt_.duration_s * 1e9)
-                                          : std::numeric_limits<std::int64_t>::max();
-        std::int64_t next_tick = start_ns_;
-        std::int64_t next_status = start_ns_ + kStatusIntervalNs;
         if (!opt_.headless) {
             setCursorState(CursorState::Hidden);  // 先改状态再隐藏（见 RunOptions::cursor_state）
             cursor_hidden_ = true;
             writeOut(Display::kHideCursor);
         }
-
-        const char* reason = "stop requested";
-        while (!stop.load(std::memory_order_acquire)) {
-            std::int64_t now = hft::nowNs();
-            if (now >= deadline) {
-                reason = "duration elapsed";
-                break;
-            }
-            const bool busy = drainQueues();
-            now = hft::nowNs();
-            if (now >= next_tick) {
-                onTick(now);
-                next_tick = nextDeadline(next_tick, refresh_ns, now);
-            }
-            if (opt_.headless && now >= next_status) {
-                printStatusLine(now);
-                next_status = nextDeadline(next_status, kStatusIntervalNs, now);
-            }
-            if (busy) continue;
-            if (opt_.busy_poll) {
-                hft::cpuRelax();
-                continue;
-            }
-            // 没有数据：等到有 feed 发布快照，或下一个定时任务到期（最长 kMaxIdleWaitNs）
-            std::int64_t wake_at = std::min({next_tick, deadline, now + kMaxIdleWaitNs});
-            if (opt_.headless) wake_at = std::min(wake_at, next_status);
-            wake_.waitUntil([this] { return anyQueued(); }, wake_at);
-        }
-
-        const double ran_s = static_cast<double>(hft::nowNs() - start_ns_) / 1e9;
-        restoreCursor();
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "Shutting down (%s after %.1f s): stopping %zu feed%s...", reason, ran_s,
-                      feeds_.size(), feeds_.size() == 1 ? "" : "s");
-        announce(buf);
-        const std::int64_t t0 = hft::nowNs();
-        stopFeeds();
-        std::snprintf(buf, sizeof(buf), "All feeds stopped in %.1f ms", static_cast<double>(hft::nowNs() - t0) / 1e6);
-        announce(buf);
-        logger_.setEcho(nullptr);
-
+        shutdown(eventLoop(stop));
         finalReport();
         return 0;
     }
@@ -436,6 +381,55 @@ private:
     static std::int64_t nextDeadline(std::int64_t previous, std::int64_t period, std::int64_t now) noexcept {
         const std::int64_t next = previous + period;
         return next > now ? next : now + period;
+    }
+
+    // 事件循环（见类注释）：运行到 stop 为 true 或 duration 到期，返回结束原因
+    const char* eventLoop(const std::atomic<bool>& stop) {
+        const std::int64_t refresh_ns = static_cast<std::int64_t>(std::max(1, cfg_.display.refresh_ms)) * 1000000;
+        const std::int64_t deadline = opt_.duration_s > 0.0
+                                          ? start_ns_ + static_cast<std::int64_t>(opt_.duration_s * 1e9)
+                                          : std::numeric_limits<std::int64_t>::max();
+        std::int64_t next_tick = start_ns_;
+        std::int64_t next_status = start_ns_ + kStatusIntervalNs;
+        while (!stop.load(std::memory_order_acquire)) {
+            std::int64_t now = hft::nowNs();
+            if (now >= deadline) return "duration elapsed";
+            const bool busy = drainQueues();
+            now = hft::nowNs();
+            if (now >= next_tick) {
+                onTick(now);
+                next_tick = nextDeadline(next_tick, refresh_ns, now);
+            }
+            if (opt_.headless && now >= next_status) {
+                printStatusLine(now);
+                next_status = nextDeadline(next_status, kStatusIntervalNs, now);
+            }
+            if (busy) continue;
+            if (opt_.busy_poll) {
+                hft::cpuRelax();
+                continue;
+            }
+            // 没有数据：等到有 feed 发布快照，或下一个定时任务到期（最长 kMaxIdleWaitNs）
+            std::int64_t wake_at = std::min({next_tick, deadline, now + kMaxIdleWaitNs});
+            if (opt_.headless) wake_at = std::min(wake_at, next_status);
+            wake_.waitUntil([this] { return anyQueued(); }, wake_at);
+        }
+        return "stop requested";
+    }
+
+    // 恢复光标，停止所有 feed 并报告进度（之后日志不再回显）
+    void shutdown(const char* reason) {
+        const double ran_s = static_cast<double>(hft::nowNs() - start_ns_) / 1e9;
+        restoreCursor();
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "Shutting down (%s after %.1f s): stopping %zu feed%s...", reason, ran_s,
+                      feeds_.size(), feeds_.size() == 1 ? "" : "s");
+        announce(buf);
+        const std::int64_t t0 = hft::nowNs();
+        stopFeeds();
+        std::snprintf(buf, sizeof(buf), "All feeds stopped in %.1f ms", static_cast<double>(hft::nowNs() - t0) / 1e6);
+        announce(buf);
+        logger_.setEcho(nullptr);
     }
 
     void writeOut(const std::string& s) const {
@@ -576,38 +570,24 @@ private:
         return any;
     }
 
-    // 应用一个快照（直接读队列槽位，不额外复制）并检测涉及该交易所的所有有序交易所对
+    // 应用一个快照（直接读队列槽位，不额外复制），检测涉及该交易所的所有有序交易所对并记录新信号。
+    // 不参与检测的交易所（见 participates）用空簿代替：该交易所对按"无数据"处理（不出信号，has_data = false）。
     void applySnapshot(std::size_t v, const BookSnapshot& s) {
         const std::int64_t queued = hft::nowNs() - s.publish_ns;
         queue_latency_[v]->recordNs(queued > 0 ? static_cast<std::uint64_t>(queued) : 0);
         s.copyTo(books_[v]);
         ++applied_[v];
-        const std::size_t found = detectVenue(v);
-        if (found > 0) {
-            // detectVenue 的新信号是 getSignals() 的最后 found 条（found <= 2(N-1)，远小于 deque 上限）
-            const std::deque<ArbitrageSignal>& signals = detector_.getSignals();
-            for (std::size_t k = signals.size() - found; k < signals.size(); ++k) logger_.logSignal(signals[k]);
-        }
+        const std::size_t found = detector_.detectVenue(
+            v, [this](std::size_t i) -> const OrderBook& { return participates(i) ? books_[i] : no_data_; });
+        // 新信号是 getSignals() 的最后 found 条（found <= 2(N-1)，远小于 deque 上限）
+        const std::deque<ArbitrageSignal>& signals = detector_.getSignals();
+        for (std::size_t k = signals.size() - found; k < signals.size(); ++k) logger_.logSignal(signals[k]);
     }
 
     // 交易所 v 是否参与套利检测与价差日志：只有行情源状态为 LIVE 时才参与（簿还必须非空，由检测器判断）。
     // 不是 LIVE 时本地簿可能已经过期：例如主线程曾被阻塞，断线时发布的空簿还排在队列里、在过期的簿之后。
     // 状态在取出快照时读取：feed 先更新状态再发布，所以它至少与取出的快照一样新。
     bool participates(std::size_t v) const noexcept { return feeds_[v]->status() == FeedStatus::Live; }
-
-    // 检测涉及 v 的所有有序交易所对（顺序同 ArbitrageDetector::detectVenue）。不参与检测的交易所用空簿代替：
-    // 该交易所对按"无数据"处理（不出信号，pairState().has_data = false）。返回新信号数。
-    std::size_t detectVenue(std::size_t v) {
-        const OrderBook& mine = participates(v) ? books_[v] : no_data_;
-        std::size_t found = 0;
-        for (std::size_t other = 0; other < books_.size(); ++other) {
-            if (other == v) continue;
-            const OrderBook& theirs = participates(other) ? books_[other] : no_data_;
-            if (detector_.detectPair(v, other, mine, theirs) != nullptr) ++found;
-            if (detector_.detectPair(other, v, theirs, mine) != nullptr) ++found;
-        }
-        return found;
-    }
 
     void onTick(std::int64_t now) {
         for (auto& f : feeds_) f->checkHealth(now);

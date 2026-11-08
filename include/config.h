@@ -15,9 +15,9 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,19 +86,11 @@ struct AppConfig {
         }
         return out;
     }
-
-    const VenueConfig* venue(Exchange exchange) const {
-        for (const VenueConfig& v : venues) {
-            if (v.exchange == exchange) return &v;
-        }
-        return nullptr;
-    }
 };
 
 namespace config_detail {
 
 using simdjson::dom::element;
-using simdjson::dom::element_type;
 using simdjson::dom::object;
 
 // double 的最短往返表示（0.001 → "0.001"）
@@ -109,6 +102,11 @@ inline std::string formatNumber(double v) {
 }
 
 inline std::string quote(const std::string& s) { return "\"" + s + "\""; }
+
+// 一条告警："[Config] <field>: <message>"
+inline void addWarning(std::vector<std::string>& warnings, const std::string& field, const std::string& message) {
+    warnings.push_back("[Config] " + field + ": " + message);
+}
 
 // 只保留字母数字并转大写："BTC-USDT" / "btcusdt@depth" 中的 "BTCUSDT" 可以直接比较
 inline std::string normalizeSymbol(std::string_view s) {
@@ -150,92 +148,80 @@ inline bool isBinanceDiffDepthPath(std::string_view path) {
     return false;
 }
 
-// 逐字段读取器：每个读取函数在字段缺失 / 类型错误 / 越界时保留默认值（或钳制）并记录一条告警。
-// value 参数进来时就是默认值。
+// 一个配置块（顶层对象的子对象，如 "display"）的逐字段读取器。构造时取出该块：缺失或不是对象时告警一次
+// （整块用默认值），operator bool 为 false。每个读取函数在字段缺失 / 类型错误 / 校验失败时保留默认值
+// （或钳制到合法范围）并记录一条告警 "[Config] <块>.<键>: ..."。value 参数进来时就是默认值。
 class FieldReader {
 public:
-    explicit FieldReader(std::vector<std::string>& warnings) : warnings_(warnings) {}
+    static constexpr double kMaxFeeRate = 0.1;
 
-    void warn(const std::string& field, const std::string& message) {
-        warnings_.push_back("[Config] " + field + ": " + message);
+    FieldReader(std::vector<std::string>& warnings, const object& root, const std::string& block)
+        : warnings_(warnings), prefix_(block) {
+        element el;
+        if (root.at_key(block).get(el) != simdjson::SUCCESS) {
+            addWarning(warnings_, block, "missing, using defaults");
+        } else if (el.get_object().get(o_) != simdjson::SUCCESS) {
+            addWarning(warnings_, block, "expected an object, using defaults");
+        } else {
+            ok_ = true;
+        }
     }
 
-    // 子对象：缺失或不是对象时告警（整块用默认值）并返回 false
-    bool block(const object& root, const char* key, object& out) {
-        element el;
-        if (root.at_key(key).get(el) != simdjson::SUCCESS) {
-            warn(key, "missing, using defaults");
-            return false;
-        }
-        if (el.get_object().get(out) != simdjson::SUCCESS) {
-            warn(key, "expected an object, using defaults");
-            return false;
-        }
-        return true;
-    }
+    explicit operator bool() const noexcept { return ok_; }
 
-    void readBool(const object& o, const std::string& prefix, const char* key, bool& value) {
+    void warn(const char* key, const std::string& message) { addWarning(warnings_, prefix_ + "." + key, message); }
+
+    void readBool(const char* key, bool& value) {
+        const char* def = value ? "true" : "false";
         element el;
-        if (!find(o, prefix, key, el, value ? "true" : "false")) return;
         bool b = false;
-        if (el.get_bool().get(b) != simdjson::SUCCESS) {
-            warn(field(prefix, key), std::string("expected true or false, using default ") + (value ? "true" : "false"));
-            return;
-        }
+        if (!find(key, el, def)) return;
+        if (el.get_bool().get(b) != simdjson::SUCCESS) return reject(key, "expected true or false", def);
         value = b;
     }
 
     // 字符串。required = false 时缺失不告警；allow_empty = false 时空串告警并用默认值
-    void readString(const object& o, const std::string& prefix, const char* key, std::string& value,
-                    bool required = true, bool allow_empty = false) {
+    void readString(const char* key, std::string& value, bool required = true, bool allow_empty = false) {
+        const std::string def = quote(value);
         element el;
-        if (!find(o, prefix, key, el, quote(value), required)) return;
         std::string_view sv;
-        if (el.get_string().get(sv) != simdjson::SUCCESS) {
-            warn(field(prefix, key), "expected a string, using default " + quote(value));
-            return;
-        }
-        if (sv.empty() && !allow_empty) {
-            warn(field(prefix, key), "must not be empty, using default " + quote(value));
-            return;
-        }
+        if (!find(key, el, def, required)) return;
+        if (el.get_string().get(sv) != simdjson::SUCCESS) return reject(key, "expected a string", def);
+        if (sv.empty() && !allow_empty) return reject(key, "must not be empty", def);
         value.assign(sv.data(), sv.size());
     }
 
     // URL 路径：非空且以 '/' 开头
-    void readPath(const object& o, const std::string& prefix, const char* key, std::string& value) {
-        std::string candidate = value;
-        readString(o, prefix, key, candidate);
-        if (candidate != value && candidate.front() != '/') {
-            warn(field(prefix, key), quote(candidate) + " must start with '/', using default " + quote(value));
-            return;
-        }
-        value = std::move(candidate);
+    void readPath(const char* key, std::string& value) {
+        readChecked(key, value, true, false, [](const std::string& s) {
+            return s.front() == '/' ? std::string() : quote(s) + " must start with '/'";
+        });
     }
 
     // 主机名（见 validHost）。allow_empty：空串合法（如可选的 rest_host）
-    void readHost(const object& o, const std::string& prefix, const char* key, std::string& value,
-                  bool allow_empty = false) {
-        std::string candidate = value;
-        readString(o, prefix, key, candidate, true, allow_empty);
-        if (candidate == value || (allow_empty && candidate.empty())) {
-            value = std::move(candidate);
-            return;
-        }
-        if (!validHost(candidate)) {
-            warn(field(prefix, key), quote(candidate) +
-                                         " is not a host name (no scheme, path or spaces, e.g. \"ws.okx.com\"), "
-                                         "using default " +
-                                         quote(value));
-            return;
-        }
-        value = std::move(candidate);
+    void readHost(const char* key, std::string& value, bool allow_empty = false) {
+        readChecked(key, value, true, allow_empty, [](const std::string& s) {
+            return validHost(s) ? std::string()
+                                : quote(s) + " is not a host name (no scheme, path or spaces, e.g. \"ws.okx.com\")";
+        });
+    }
+
+    // 订阅消息（键 "subscribe"）：必须是合法 JSON（拼写错误时交易所会静默不推送数据，所以在这里拦住）。
+    // required = false 时可以缺失或为空
+    void readSubscribe(std::string& value, bool required) {
+        readChecked("subscribe", value, required, !required, [](const std::string& s) {
+            simdjson::dom::parser check;  // 独立的解析器：不能使配置文档的元素失效
+            const simdjson::padded_string padded(s);
+            element el;
+            return check.parse(padded).get(el) == simdjson::SUCCESS ? std::string() : std::string("is not valid JSON");
+        });
     }
 
     // 端口：JSON 字符串或整数，取值 1-65535
-    void readPort(const object& o, const std::string& prefix, const char* key, std::string& value) {
+    void readPort(const char* key, std::string& value) {
+        const std::string def = quote(value);
         element el;
-        if (!find(o, prefix, key, el, quote(value))) return;
+        if (!find(key, el, def)) return;
         std::string_view sv;
         std::int64_t i = 0;
         std::string candidate;
@@ -244,104 +230,94 @@ public:
         } else if (el.get_int64().get(i) == simdjson::SUCCESS) {
             candidate = std::to_string(i);
         } else {
-            warn(field(prefix, key), "expected string or integer, using default " + quote(value));
-            return;
+            return reject(key, "expected string or integer", def);
         }
-        if (!validPort(candidate)) {
-            warn(field(prefix, key), quote(candidate) + " is not a valid port (1-65535), using default " + quote(value));
-            return;
-        }
+        if (!validPort(candidate)) return reject(key, quote(candidate) + " is not a valid port (1-65535)", def);
         value = std::move(candidate);
     }
 
-    // 数字（整数或小数），钳制到 [lo, hi]
-    void readDouble(const object& o, const std::string& prefix, const char* key, double& value, double lo, double hi) {
-        double d = 0.0;
-        if (!readNumber(o, prefix, key, value, d)) return;
-        value = clamp(prefix, key, d, lo, hi);
+    // 数字，钳制到 [lo, hi]（hi 为 double 最大值时显示为 inf）。int 字段也接受值为整数的小数（如 200.0），拒绝 2.5
+    template <class T>
+    void readNumber(const char* key, T& value, T lo, T hi) {
+        constexpr bool kInt = std::is_integral_v<T>;
+        std::string def;
+        if constexpr (kInt) {
+            def = std::to_string(value);
+        } else {
+            def = formatNumber(value);
+        }
+        element el;
+        double d = 0.0;  // get_double 也接受 JSON 整数（int64 / uint64 换算成 double）
+        if (!find(key, el, def)) return;
+        if (el.get_double().get(d) != simdjson::SUCCESS || (kInt && d != std::floor(d))) {
+            return reject(key, kInt ? "expected an integer" : "expected a number", def);
+        }
+        const double l = static_cast<double>(lo), h = static_cast<double>(hi);
+        if (d < l || d > h) {
+            const double c = d < l ? l : h;
+            const std::string upper = h >= std::numeric_limits<double>::max() ? std::string("inf") : formatNumber(h);
+            warn(key, formatNumber(d) + " is out of range [" + formatNumber(l) + ", " + upper + "], clamped to " +
+                          formatNumber(c));
+            d = c;
+        }
+        value = static_cast<T>(d);
     }
 
-    // 整数（也接受值为整数的小数，如 200.0），钳制到 [lo, hi]
-    void readInt(const object& o, const std::string& prefix, const char* key, int& value, int lo, int hi) {
+    // 手续费（键 "fee_rate"）：[0, 0.1)。负数钳制为 0；>= 0.1（10%）几乎一定是单位写错（0.001 = 0.1%），
+    // 上界是开区间无法钳制到边界，改用 fallback 描述的值（如 "default 0.001" 或 "the global fee_rate"）。
+    // 返回读到的可用值；缺失（required 时告警）或不可用时返回 nullopt。
+    std::optional<double> readFeeRate(bool required, const std::string& fallback) {
         element el;
-        if (!find(o, prefix, key, el, std::to_string(value))) return;
         double d = 0.0;
-        std::int64_t i = 0;
-        std::uint64_t u = 0;
-        if (el.get_int64().get(i) == simdjson::SUCCESS) {
-            d = static_cast<double>(i);
-        } else if (el.get_uint64().get(u) == simdjson::SUCCESS) {
-            d = static_cast<double>(u);
-        } else if (el.get_double().get(d) != simdjson::SUCCESS || d != std::floor(d)) {
-            warn(field(prefix, key), "expected an integer, using default " + std::to_string(value));
-            return;
+        if (o_.at_key("fee_rate").get(el) != simdjson::SUCCESS) {
+            if (required) warn("fee_rate", "missing, using " + fallback);
+            return std::nullopt;
         }
-        value = static_cast<int>(clamp(prefix, key, d, static_cast<double>(lo), static_cast<double>(hi)));
-    }
-
-    // 手续费：[0, 0.1)。负数钳制为 0；>= 0.1（10%）几乎一定是单位写错（0.001 = 0.1%），
-    // 上界是开区间无法钳制到边界，改用默认值。fallback_desc 描述默认值（如 "0.001" 或 "the global fee_rate"）。
-    // 返回是否读到了可用的值（out 被赋值）。
-    bool readFeeRate(const object& o, const std::string& prefix, const char* key, double& out, bool required,
-                     const std::string& fallback_desc) {
-        element el;
-        if (o.at_key(key).get(el) != simdjson::SUCCESS) {
-            if (required) warn(field(prefix, key), "missing, using " + fallback_desc);
-            return false;
-        }
-        double d = 0.0;
         if (el.get_double().get(d) != simdjson::SUCCESS) {
-            warn(field(prefix, key), "expected a number, using " + fallback_desc);
-            return false;
+            warn("fee_rate", "expected a number, using " + fallback);
+            return std::nullopt;
         }
         if (d < 0.0) {
-            warn(field(prefix, key), formatNumber(d) + " is negative, clamped to 0");
-            d = 0.0;
-        } else if (d >= kMaxFeeRate) {
-            warn(field(prefix, key), formatNumber(d) + " must be below " + formatNumber(kMaxFeeRate) +
-                                         " (fee rates are fractions: 0.001 = 0.1%), using " + fallback_desc);
-            return false;
+            warn("fee_rate", formatNumber(d) + " is negative, clamped to 0");
+            return 0.0;
         }
-        out = d;
-        return true;
-    }
-
-    static constexpr double kMaxFeeRate = 0.1;
-
-private:
-    static std::string field(const std::string& prefix, const char* key) { return prefix + "." + key; }
-
-    // 查找字段；缺失时（required）告警。found 返回 true。
-    bool find(const object& o, const std::string& prefix, const char* key, element& el, const std::string& default_desc,
-              bool required = true) {
-        if (o.at_key(key).get(el) == simdjson::SUCCESS) return true;
-        if (required) warn(field(prefix, key), "missing, using default " + default_desc);
-        return false;
-    }
-
-    bool readNumber(const object& o, const std::string& prefix, const char* key, double default_value, double& out) {
-        element el;
-        if (!find(o, prefix, key, el, formatNumber(default_value))) return false;
-        if (el.get_double().get(out) != simdjson::SUCCESS) {
-            warn(field(prefix, key), "expected a number, using default " + formatNumber(default_value));
-            return false;
-        }
-        return true;
-    }
-
-    double clamp(const std::string& prefix, const char* key, double d, double lo, double hi) {
-        if (d < lo || d > hi) {
-            const double c = d < lo ? lo : hi;
-            const std::string range = "[" + formatNumber(lo) + ", " +
-                                      (hi >= std::numeric_limits<double>::max() ? std::string("inf") : formatNumber(hi)) +
-                                      "]";
-            warn(field(prefix, key), formatNumber(d) + " is out of range " + range + ", clamped to " + formatNumber(c));
-            return c;
+        if (d >= kMaxFeeRate) {
+            warn("fee_rate", formatNumber(d) + " must be below " + formatNumber(kMaxFeeRate) +
+                                 " (fee rates are fractions: 0.001 = 0.1%), using " + fallback);
+            return std::nullopt;
         }
         return d;
     }
 
+private:
+    // 字段不可用："<problem>, using default <def>"（def 是默认值的显示形式）
+    void reject(const char* key, const std::string& problem, const std::string& def) {
+        warn(key, problem + ", using default " + def);
+    }
+
+    // 查找字段；缺失时（required）告警 "missing, using default <def>"
+    bool find(const char* key, element& el, const std::string& def, bool required = true) {
+        if (o_.at_key(key).get(el) == simdjson::SUCCESS) return true;
+        if (required) warn(key, "missing, using default " + def);
+        return false;
+    }
+
+    // 字符串字段，取值变化且非空时再校验：check 返回问题描述（空串 = 通过），不通过时保留默认值
+    template <class Check>
+    void readChecked(const char* key, std::string& value, bool required, bool allow_empty, Check check) {
+        std::string candidate = value;
+        readString(key, candidate, required, allow_empty);
+        if (candidate != value && !candidate.empty()) {
+            const std::string problem = check(candidate);
+            if (!problem.empty()) return reject(key, problem, quote(value));
+        }
+        value = std::move(candidate);
+    }
+
     std::vector<std::string>& warnings_;
+    std::string prefix_;
+    object o_;
+    bool ok_ = false;
 };
 
 }  // namespace config_detail
@@ -356,6 +332,7 @@ private:
 // - 一致性检查（只告警，不改值）：已启用交易所的 symbol 是否出现在它真正订阅的 path / subscribe 中，
 //   各交易所的 symbol 是否相同（不同则套利比较的是不同品种），Binance 增量深度流是否配置了 REST 快照。
 // - 默认值 = 仓库里的 config.json，只有全局 fee_rate 的默认值是 0.001（config.json 里是 0.0）。
+// - 告警按读取顺序排列：各交易所（固定顺序，块内按字段）、arbitrage、display、connection，最后是一致性检查。
 class ConfigReader {
 public:
     static constexpr int kMinRefreshMs = 10, kMaxRefreshMs = 10000;
@@ -394,124 +371,107 @@ public:
         simdjson::dom::parser parser;
         const simdjson::padded_string padded(json);
         element doc;
+        object root;
         const simdjson::error_code err = parser.parse(padded).get(doc);
         if (err != simdjson::SUCCESS) {
             config.warnings.push_back("[Config] " + source + ": invalid JSON (" + simdjson::error_message(err) +
                                       "), using defaults");
             return config;
         }
-        object root;
         if (doc.get_object().get(root) != simdjson::SUCCESS) {
             config.warnings.push_back("[Config] " + source + ": top-level value is not a JSON object, using defaults");
             return config;
         }
         config.source = source;
-        FieldReader r(config.warnings);
+        std::vector<std::string>& w = config.warnings;
+        constexpr double kUnbounded = std::numeric_limits<double>::max();
 
-        for (VenueConfig& v : config.venues) readVenue(r, root, v);
-
-        object o;
-        if (r.block(root, "arbitrage", o)) {
+        for (VenueConfig& v : config.venues) readVenue(FieldReader(w, root, v.key), v);
+        if (FieldReader r{w, root, "arbitrage"}) {
             ArbitrageConfig& a = config.arbitrage;
-            double fee = a.fee_rate;
-            if (r.readFeeRate(o, "arbitrage", "fee_rate", fee, true, "default " + formatNumber(a.fee_rate))) {
-                a.fee_rate = fee;
-            }
-            r.readDouble(o, "arbitrage", "min_profit", a.min_profit, 0.0, std::numeric_limits<double>::max());
-            r.readDouble(o, "arbitrage", "max_qty", a.max_qty, 0.0, std::numeric_limits<double>::max());
-            r.readInt(o, "arbitrage", "max_levels", a.max_levels, kMinMaxLevels, kMaxMaxLevels);
+            if (const auto fee = r.readFeeRate(true, "default " + formatNumber(a.fee_rate))) a.fee_rate = *fee;
+            r.readNumber("min_profit", a.min_profit, 0.0, kUnbounded);
+            r.readNumber("max_qty", a.max_qty, 0.0, kUnbounded);
+            r.readNumber("max_levels", a.max_levels, kMinMaxLevels, kMaxMaxLevels);
         }
-        if (r.block(root, "display", o)) {
+        if (FieldReader r{w, root, "display"}) {
             DisplayConfig& d = config.display;
-            r.readInt(o, "display", "refresh_ms", d.refresh_ms, kMinRefreshMs, kMaxRefreshMs);
-            r.readInt(o, "display", "levels", d.levels, kMinLevels, kMaxLevels);
-            r.readInt(o, "display", "spread_log_interval", d.spread_log_interval, kMinSpreadLogInterval,
-                      kMaxSpreadLogInterval);
+            r.readNumber("refresh_ms", d.refresh_ms, kMinRefreshMs, kMaxRefreshMs);
+            r.readNumber("levels", d.levels, kMinLevels, kMaxLevels);
+            r.readNumber("spread_log_interval", d.spread_log_interval, kMinSpreadLogInterval, kMaxSpreadLogInterval);
         }
-        if (r.block(root, "connection", o)) {
+        if (FieldReader r{w, root, "connection"}) {
             ConnectionConfig& c = config.connection;
-            r.readBool(o, "connection", "tls_verify", c.tls_verify);
-            r.readString(o, "connection", "ca_file", c.ca_file, true, true);
-            r.readInt(o, "connection", "stall_timeout_ms", c.stall_timeout_ms, kMinStallTimeoutMs, kMaxStallTimeoutMs);
-            r.readInt(o, "connection", "reconnect_initial_ms", c.reconnect_initial_ms, kMinReconnectMs, kMaxReconnectMs);
+            r.readBool("tls_verify", c.tls_verify);
+            r.readString("ca_file", c.ca_file, true, true);
+            r.readNumber("stall_timeout_ms", c.stall_timeout_ms, kMinStallTimeoutMs, kMaxStallTimeoutMs);
+            r.readNumber("reconnect_initial_ms", c.reconnect_initial_ms, kMinReconnectMs, kMaxReconnectMs);
             // 上限不能小于初始值（给出的值按此钳制；缺失时默认值也可能小于给出的初始值）
-            r.readInt(o, "connection", "reconnect_max_ms", c.reconnect_max_ms, c.reconnect_initial_ms, kMaxReconnectMs);
+            r.readNumber("reconnect_max_ms", c.reconnect_max_ms, c.reconnect_initial_ms, kMaxReconnectMs);
             if (c.reconnect_max_ms < c.reconnect_initial_ms) {
-                r.warn("connection.reconnect_max_ms", std::to_string(c.reconnect_max_ms) +
-                                                          " is below connection.reconnect_initial_ms, using " +
-                                                          std::to_string(c.reconnect_initial_ms));
+                r.warn("reconnect_max_ms", std::to_string(c.reconnect_max_ms) +
+                                               " is below connection.reconnect_initial_ms, using " +
+                                               std::to_string(c.reconnect_initial_ms));
                 c.reconnect_max_ms = c.reconnect_initial_ms;
             }
             // CA 文件读不了时每次连接都会在 TLS 设置阶段失败：提前告警（值保留）
             if (!c.ca_file.empty() && !std::ifstream(c.ca_file).is_open()) {
-                r.warn("connection.ca_file", "cannot read " + quote(c.ca_file) + ", every TLS connection will fail");
+                r.warn("ca_file", "cannot read " + quote(c.ca_file) + ", every TLS connection will fail");
             }
         }
-        checkSymbols(r, config);
-        checkBinanceRest(r, config);
+        checkSymbols(config);
+        checkBinanceRest(config);
         return config;
     }
 
     // 内置默认值（与仓库里的 config.json 相同，只是全局 fee_rate = 0.001）
     static AppConfig getDefaults() {
+        auto venue = [](Exchange e, const char* key, const char* host, const char* port, const char* path,
+                        const char* subscribe) {
+            VenueConfig v;
+            v.exchange = e;
+            v.key = key;
+            v.name = exchangeName(e);
+            v.host = host;
+            v.port = port;
+            v.path = path;
+            v.symbol = "BTCUSDT";
+            v.subscribe_msg = subscribe;
+            return v;
+        };
         AppConfig config;
-        VenueConfig binance;
-        binance.exchange = Exchange::BINANCE;
-        binance.key = "binance";
-        binance.name = exchangeName(Exchange::BINANCE);
-        binance.host = "stream.binance.com";
-        binance.port = "9443";
-        binance.path = "/ws/btcusdt@depth@100ms";
-        binance.symbol = "BTCUSDT";
+        config.venues = {
+            venue(Exchange::BINANCE, "binance", "stream.binance.com", "9443", "/ws/btcusdt@depth@100ms", ""),
+            venue(Exchange::OKX, "okx", "ws.okx.com", "8443", "/ws/v5/public",
+                  R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})"),
+            venue(Exchange::BYBIT, "bybit", "stream.bybit.com", "443", "/v5/public/spot",
+                  R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})"),
+        };
+        VenueConfig& binance = config.venues[0];
         binance.rest_host = "api.binance.com";
-        binance.rest_port = "443";
         binance.snapshot_path = "/api/v3/depth?symbol=BTCUSDT&limit=1000";
-
-        VenueConfig okx;
-        okx.exchange = Exchange::OKX;
-        okx.key = "okx";
-        okx.name = exchangeName(Exchange::OKX);
-        okx.host = "ws.okx.com";
-        okx.port = "8443";
-        okx.path = "/ws/v5/public";
-        okx.symbol = "BTCUSDT";
-        okx.subscribe_msg = R"({"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT"}]})";
-
-        VenueConfig bybit;
-        bybit.exchange = Exchange::BYBIT;
-        bybit.key = "bybit";
-        bybit.name = exchangeName(Exchange::BYBIT);
-        bybit.host = "stream.bybit.com";
-        bybit.port = "443";
-        bybit.path = "/v5/public/spot";
-        bybit.symbol = "BTCUSDT";
-        bybit.subscribe_msg = R"({"op":"subscribe","args":["orderbook.50.BTCUSDT"]})";
-
-        config.venues = {binance, okx, bybit};
         return config;
     }
 
     // 一行摘要，如 "Venues: Binance, OKX, Bybit (disabled)  Fee: 0.100% (OKX 0.080%)  Min profit: 0.01  Refresh: 200ms"
     static std::string summary(const AppConfig& c) {
-        std::ostringstream ss;
-        ss << "Venues: ";
+        auto percent = [](double fee) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.3f%%", fee * 100.0);
+            return std::string(buf);
+        };
+        std::string s = "Venues: ";
         for (std::size_t i = 0; i < c.venues.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << c.venues[i].name << (c.venues[i].enabled ? "" : " (disabled)");
+            s += (i > 0 ? ", " : "") + c.venues[i].name + (c.venues[i].enabled ? "" : " (disabled)");
         }
-        ss << std::fixed << std::setprecision(3) << "  Fee: " << c.arbitrage.fee_rate * 100.0 << "%";
+        s += "  Fee: " + percent(c.arbitrage.fee_rate);
         std::string overrides;
         for (const VenueConfig& v : c.venues) {
-            if (!v.fee_rate) continue;
-            std::ostringstream o;
-            o << std::fixed << std::setprecision(3) << (overrides.empty() ? "" : ", ") << v.name << " "
-              << *v.fee_rate * 100.0 << "%";
-            overrides += o.str();
+            if (v.fee_rate) overrides += (overrides.empty() ? "" : ", ") + v.name + " " + percent(*v.fee_rate);
         }
-        if (!overrides.empty()) ss << " (" << overrides << ")";
-        ss << "  Min profit: " << config_detail::formatNumber(c.arbitrage.min_profit)
-           << "  Refresh: " << c.display.refresh_ms << "ms";
-        return ss.str();
+        if (!overrides.empty()) s += " (" + overrides + ")";
+        return s + "  Min profit: " + config_detail::formatNumber(c.arbitrage.min_profit) +
+               "  Refresh: " + std::to_string(c.display.refresh_ms) + "ms";
     }
 
 private:
@@ -534,70 +494,49 @@ private:
 
     // 一个交易所块。enabled 为 false 时其余字段不读取也不校验（保持默认值）：
     // "bybit": {"enabled": false} 就是关闭 Bybit 的完整写法，不会产生一串 "missing" 告警。
-    static void readVenue(config_detail::FieldReader& r, const config_detail::object& root, VenueConfig& v) {
-        using namespace config_detail;
-        object o;
-        if (!r.block(root, v.key.c_str(), o)) return;
-        const std::string& p = v.key;
-        r.readBool(o, p, "enabled", v.enabled);
+    static void readVenue(config_detail::FieldReader r, VenueConfig& v) {
+        using config_detail::quote;
+        if (!r) return;
+        r.readBool("enabled", v.enabled);
         if (!v.enabled) return;
-        r.readHost(o, p, "host", v.host);
-        r.readPort(o, p, "port", v.port);
-        r.readPath(o, p, "path", v.path);
-        r.readString(o, p, "symbol", v.symbol);
-        if (v.exchange == Exchange::BINANCE) {
-            // Binance 通过 URL 路径订阅：subscribe 可选（例如组合流 /ws 上发 SUBSCRIBE）；
+        r.readHost("host", v.host);
+        r.readPort("port", v.port);
+        r.readPath("path", v.path);
+        r.readString("symbol", v.symbol);
+        // Binance 通过 URL 路径订阅：subscribe 可选（例如组合流 /ws 上发 SUBSCRIBE）
+        const bool binance = v.exchange == Exchange::BINANCE;
+        r.readSubscribe(v.subscribe_msg, !binance);
+        if (binance) {
             // rest_host / snapshot_path 只有增量深度流需要，可以为空（见 checkBinanceRest）
-            readSubscribe(r, o, p, v.subscribe_msg, false);
-            r.readHost(o, p, "rest_host", v.rest_host, true);
-            r.readPort(o, p, "rest_port", v.rest_port);
-            r.readString(o, p, "snapshot_path", v.snapshot_path, true, true);
+            r.readHost("rest_host", v.rest_host, true);
+            r.readPort("rest_port", v.rest_port);
+            r.readString("snapshot_path", v.snapshot_path, true, true);
             if (!v.snapshot_path.empty() && v.snapshot_path.front() != '/') {
-                r.warn(p + ".snapshot_path", quote(v.snapshot_path) + " must start with '/', using \"\"");
+                r.warn("snapshot_path", quote(v.snapshot_path) + " must start with '/', using \"\"");
                 v.snapshot_path.clear();
             }
-        } else {
-            readSubscribe(r, o, p, v.subscribe_msg, true);
         }
-        double fee = 0.0;
-        if (r.readFeeRate(o, p, "fee_rate", fee, false, "the global fee_rate")) v.fee_rate = fee;
+        v.fee_rate = r.readFeeRate(false, "the global fee_rate");
     }
 
     // Binance 增量深度流（path 含 "@depth" / "@depth@100ms"）必须先拉 REST 快照才能同步：缺少 rest_host 或
     // snapshot_path 时 feed 每个会话都会以错误结束并重连，这里提前告警
-    static void checkBinanceRest(config_detail::FieldReader& r, const AppConfig& c) {
+    static void checkBinanceRest(AppConfig& c) {
         for (const VenueConfig& v : c.venues) {
             if (v.exchange != Exchange::BINANCE || !v.enabled) continue;
             if (!config_detail::isBinanceDiffDepthPath(v.path)) continue;
             if (v.rest_host.empty() || v.snapshot_path.empty()) {
-                r.warn(v.key + (v.rest_host.empty() ? ".rest_host" : ".snapshot_path"),
-                       "required by the diff-depth stream in " + v.key + ".path " + config_detail::quote(v.path) +
-                           " (REST snapshot); the feed cannot sync without it");
+                config_detail::addWarning(c.warnings, v.key + (v.rest_host.empty() ? ".rest_host" : ".snapshot_path"),
+                                          "required by the diff-depth stream in " + v.key + ".path " +
+                                              config_detail::quote(v.path) +
+                                              " (REST snapshot); the feed cannot sync without it");
             }
         }
     }
 
-    // 订阅消息：必须是合法 JSON（拼写错误时交易所会静默不推送数据，所以在这里拦住）
-    static void readSubscribe(config_detail::FieldReader& r, const config_detail::object& o, const std::string& p,
-                              std::string& value, bool required) {
-        std::string candidate = value;
-        r.readString(o, p, "subscribe", candidate, required, !required);
-        if (candidate == value || candidate.empty()) {
-            value = std::move(candidate);
-            return;
-        }
-        simdjson::dom::parser check;  // 独立的解析器：不能使配置文档的元素失效
-        const simdjson::padded_string padded(candidate);
-        simdjson::dom::element el;
-        if (check.parse(padded).get(el) != simdjson::SUCCESS) {
-            r.warn(p + ".subscribe", "is not valid JSON, using default " + config_detail::quote(value));
-            return;
-        }
-        value = std::move(candidate);
-    }
-
     // 一致性检查：symbol 只是标签，真正订阅的品种来自 path / subscribe
-    static void checkSymbols(config_detail::FieldReader& r, const AppConfig& c) {
+    static void checkSymbols(AppConfig& c) {
+        using config_detail::addWarning;
         using config_detail::normalizeSymbol;
         std::string first_symbol, listing;
         bool any = false, differs = false;
@@ -609,9 +548,9 @@ private:
                 std::string where = v.key + (v.exchange != Exchange::BINANCE ? ".subscribe"
                                              : v.subscribe_msg.empty()    ? ".path"
                                                                           : ".path / " + v.key + ".subscribe");
-                r.warn(v.key + ".symbol", config_detail::quote(v.symbol) + " does not appear in " + where +
-                                              " (symbol is only a label; the streamed instrument comes from " + where +
-                                              ")");
+                addWarning(c.warnings, v.key + ".symbol",
+                           config_detail::quote(v.symbol) + " does not appear in " + where +
+                               " (symbol is only a label; the streamed instrument comes from " + where + ")");
             }
             listing += (any ? ", " : "") + v.name + " " + v.symbol;
             if (!any) first_symbol = sym;
@@ -619,8 +558,9 @@ private:
             any = true;
         }
         if (differs) {
-            r.warn("symbol", "enabled venues use different symbols (" + listing +
-                                 "): arbitrage signals would compare different instruments");
+            addWarning(c.warnings, "symbol",
+                       "enabled venues use different symbols (" + listing +
+                           "): arbitrage signals would compare different instruments");
         }
     }
 };

@@ -62,6 +62,12 @@ void writeAll(int fd, const char* s, std::size_t n) noexcept {
     }
 }
 
+// 写出字符数组（如 Display::kShowCursor），不含结尾的 '\0'
+template <std::size_t N>
+void writeAll(int fd, const char (&s)[N]) noexcept {
+    writeAll(fd, s, N - 1);
+}
+
 void installHandler(int sig, void (*handler)(int)) noexcept {
     struct sigaction sa {};
     sa.sa_handler = handler;
@@ -84,11 +90,10 @@ void onStopSignal(int sig) {
     }
     if (cursorMayBeHidden()) {
         // 与 MonitorApp::restoreCursor 相同：显示光标并换行
-        writeAll(STDOUT_FILENO, Display::kShowCursor, sizeof(Display::kShowCursor) - 1);
-        writeAll(STDOUT_FILENO, "\n", 1);
+        writeAll(STDOUT_FILENO, Display::kShowCursor);
+        writeAll(STDOUT_FILENO, "\n");
     }
-    static const char kMsg[] = "[Signal] second signal received, exiting immediately\n";
-    writeAll(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
+    writeAll(STDERR_FILENO, "[Signal] second signal received, exiting immediately\n");
     std::_Exit(128 + sig);
 }
 
@@ -101,11 +106,8 @@ void onHangup(int) { g_stop.store(true, std::memory_order_release); }
 // 进程才停止，直到 SIGCONT（onContinue 重新接管 SIGTSTP）。
 void onTerminalStop(int) {
     const int saved_errno = errno;
-    if (cursorMayBeHidden()) writeAll(STDOUT_FILENO, Display::kShowCursor, sizeof(Display::kShowCursor) - 1);
-    struct sigaction dfl {};
-    dfl.sa_handler = SIG_DFL;
-    sigemptyset(&dfl.sa_mask);
-    ::sigaction(SIGTSTP, &dfl, nullptr);
+    if (cursorMayBeHidden()) writeAll(STDOUT_FILENO, Display::kShowCursor);
+    installHandler(SIGTSTP, SIG_DFL);
     ::raise(SIGTSTP);
     sigset_t tstp;
     sigemptyset(&tstp);
@@ -120,7 +122,7 @@ void onContinue(int) {
     const int saved_errno = errno;
     if (g_handle_tstp.load(std::memory_order_relaxed)) installHandler(SIGTSTP, onTerminalStop);
     if (g_cursor.load(std::memory_order_seq_cst) == CursorState::Hidden) {  // Restoring 时不能再隐藏
-        writeAll(STDOUT_FILENO, Display::kHideCursor, sizeof(Display::kHideCursor) - 1);
+        writeAll(STDOUT_FILENO, Display::kHideCursor);
         g_redraw.store(true, std::memory_order_seq_cst);
     }
     errno = saved_errno;

@@ -61,9 +61,10 @@ struct SweepResult {
 //   （bid × (1 - f_sell) - ask × (1 + f_buy) > 0）就继续，受 max_qty（0 = 不限）与每侧 max_levels 限制。
 // - 信号条件：净利润 > min_profit，且通过去重：同一有序交易所对上，买方卖一或卖方买一相对该对上一次信号
 //   至少变动了 0.01（kDedupStep；1 分的变动也算，见 moved()）。
-// - 事件驱动：某个交易所的簿变化后只需检测涉及它的交易所对（detectVenue / detectChanged）。
+// - 事件驱动：某个交易所的簿变化后只需检测涉及它的交易所对（detectVenue）。
 //   任一侧为空（行情源断线时会发布空簿）视为"无数据"：不出信号，pairState().has_data = false。
 // - 信号保存在有界 deque 中（最近 kMaxSignals 条），另有累计统计；检测器从不向 stdout 打印。
+// - 每侧一档、两侧手续费相等时与 v1 的公式与去重决策逐位相同（v1 只有两个交易所、只看最优档：max_levels = 1）。
 // - 非线程安全：只在主线程使用。
 class ArbitrageDetector {
 public:
@@ -74,12 +75,10 @@ public:
     // 每个有序交易所对的状态
     struct PairState {
         bool has_data = false;          // 最近一次评估时两侧都有数据
-        double best_ask = 0.0;          // 最近一次评估时买方的卖一
-        double best_bid = 0.0;          // 最近一次评估时卖方的买一
         SweepResult sweep;              // 最近一次评估的扫单结果（即当前盘口下的机会）
         std::uint64_t evaluations = 0;  // 评估次数
         bool has_signal = false;        // 是否出过信号（去重基准有效）
-        double signal_ask = 0.0;        // 上一次信号时的卖一 / 买一（去重基准）
+        double signal_ask = 0.0;        // 上一次信号时买方的卖一 / 卖方的买一（去重基准）
         double signal_bid = 0.0;
         std::uint64_t signals = 0;      // 该交易所对的信号数
         double net_total = 0.0;         // 该交易所对的累计净利润
@@ -98,10 +97,6 @@ public:
           pairs_(fees_.size() * fees_.size()) {
         if (fees_.size() > kMaxVenues) throw std::invalid_argument("ArbitrageDetector: too many venues");
     }
-
-    // 兼容 v1：两个交易所（编号 0、1）、相同手续费、只看最优档（max_levels = 1），与 v1 的 detect() 结果相同
-    explicit ArbitrageDetector(double fee_rate = 0.001, double min_profit = 0.01)
-        : ArbitrageDetector(std::vector<double>{fee_rate, fee_rate}, min_profit, 0.0, 1) {}
 
     // ---------------- 纯函数：扫单 ----------------
 
@@ -156,13 +151,6 @@ public:
         return r;
     }
 
-    static SweepResult sweep(const OrderBook& buy_book, const OrderBook& sell_book, double fee_buy, double fee_sell,
-                             double max_qty = 0.0, int max_levels = 0) noexcept {
-        const std::vector<PriceLevel>& asks = buy_book.getAsks();
-        const std::vector<PriceLevel>& bids = sell_book.getBids();
-        return sweep(asks.data(), asks.size(), bids.data(), bids.size(), fee_buy, fee_sell, max_qty, max_levels);
-    }
-
     // 去重用的"价格变动"：|a - b| >= 0.01，带一个随价格量级缩放的容差。
     // 二进制浮点里 67000.01 - 67000.00 = 0.0099999999947...，不加容差时 1 分的变动会被当成"没动"（v1 的问题）。
     static bool moved(double a, double b) noexcept {
@@ -184,31 +172,28 @@ public:
         const std::vector<PriceLevel>& bids = sell_book.getBids();
         if (asks.empty() || bids.empty()) {  // 无数据
             st.has_data = false;
-            st.best_ask = 0.0;
-            st.best_bid = 0.0;
             st.sweep = SweepResult{};
             return nullptr;
         }
         st.has_data = true;
-        st.best_ask = asks[0].price;
-        st.best_bid = bids[0].price;
         st.sweep = sweep(asks.data(), asks.size(), bids.data(), bids.size(), fees_[buy], fees_[sell], max_qty_,
                          max_levels_);
         const SweepResult& r = st.sweep;
+        const double ask = asks[0].price, bid = bids[0].price;
         if (!(r.qty > 0.0) || !(r.net > min_profit_)) return nullptr;
-        if (st.has_signal && !moved(st.best_ask, st.signal_ask) && !moved(st.best_bid, st.signal_bid)) return nullptr;
+        if (st.has_signal && !moved(ask, st.signal_ask) && !moved(bid, st.signal_bid)) return nullptr;
 
         st.has_signal = true;
-        st.signal_ask = st.best_ask;
-        st.signal_bid = st.best_bid;
+        st.signal_ask = ask;
+        st.signal_bid = bid;
 
         ArbitrageSignal s;
         s.buy_exchange = label(buy_book, buy);
         s.sell_exchange = label(sell_book, sell);
         s.buy_venue = buy;
         s.sell_venue = sell;
-        s.buy_price = st.best_ask;
-        s.sell_price = st.best_bid;
+        s.buy_price = ask;
+        s.sell_price = bid;
         s.quantity = r.qty;
         s.vwap_buy = r.vwapBuy();
         s.vwap_sell = r.vwapSell();
@@ -235,43 +220,22 @@ public:
         return &signals_.back();
     }
 
-    // 检测所有涉及 venue 的有序交易所对（venue 买 / venue 卖）。books[i] 是交易所 i 的最新簿
-    // （只用前 min(books.size(), venueCount()) 个）。返回新信号数 k：它们是 getSignals() 的最后 k 条。
-    std::size_t detectVenue(std::size_t venue, const std::vector<OrderBook>& books) {
-        const std::size_t n = std::min(books.size(), fees_.size());
+    // 检测所有涉及 venue 的有序交易所对：对每个 other 依次评估 venue → other 与 other → venue。
+    // book_of(i) 返回交易所 i 当前参与检测的簿（i < venueCount()；调用方可以用空簿代替不参与的交易所）。
+    // 返回新信号数 k：它们是 getSignals() 的最后 k 条。venue 越界时什么也不做。
+    template <class BookOf>
+    std::size_t detectVenue(std::size_t venue, const BookOf& book_of) {
+        const std::size_t n = fees_.size();
         if (venue >= n) return 0;
+        const OrderBook& mine = book_of(venue);
         std::size_t found = 0;
         for (std::size_t other = 0; other < n; ++other) {
             if (other == venue) continue;
-            if (detectPair(venue, other, books[venue], books[other])) ++found;
-            if (detectPair(other, venue, books[other], books[venue])) ++found;
+            const OrderBook& theirs = book_of(other);
+            if (detectPair(venue, other, mine, theirs) != nullptr) ++found;
+            if (detectPair(other, venue, theirs, mine) != nullptr) ++found;
         }
         return found;
-    }
-
-    // 检测所有至少一侧在 changed 中被标记的有序交易所对（每对只评估一次）。返回值同 detectVenue。
-    std::size_t detectChanged(const std::vector<bool>& changed, const std::vector<OrderBook>& books) {
-        const std::size_t n = std::min({books.size(), fees_.size(), changed.size()});
-        std::size_t found = 0;
-        for (std::size_t buy = 0; buy < n; ++buy) {
-            for (std::size_t sell = 0; sell < n; ++sell) {
-                if (buy == sell || !(changed[buy] || changed[sell])) continue;
-                if (detectPair(buy, sell, books[buy], books[sell])) ++found;
-            }
-        }
-        return found;
-    }
-
-    // 检测所有有序交易所对
-    std::size_t detectAll(const std::vector<OrderBook>& books) {
-        return detectChanged(std::vector<bool>(books.size(), true), books);
-    }
-
-    // 兼容 v1：两个交易所（编号 0 与 1）双向检测，返回是否发现信号
-    bool detect(const OrderBook& book_a, const OrderBook& book_b) {
-        const bool d1 = detectPair(0, 1, book_a, book_b) != nullptr;
-        const bool d2 = detectPair(1, 0, book_b, book_a) != nullptr;
-        return d1 || d2;
     }
 
     // ---------------- 访问器 ----------------
