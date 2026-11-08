@@ -3,6 +3,11 @@
 // 撮合引擎公共类型：订单请求、成交回报、深度/订单查询行，以及枚举的字符串化与相等比较。
 // 参考模型（tests/reference_order_book.h）与优化引擎（matching/order_book.h）共用本文件，
 // 两者必须对同一命令序列产生完全相同的事件流（语义见 docs/MATCHING_ENGINE.md「Semantics」）。
+// Shared matching engine types: order requests, trade reports, depth/order query rows, plus enum
+// stringification and equality comparison.
+// The reference model (tests/reference_order_book.h) and the optimized engine (matching/order_book.h) share
+// this file, and both must produce exactly the same event stream for the same command sequence (semantics:
+// see docs/MATCHING_ENGINE.md "Semantics").
 //
 
 #pragma once
@@ -14,15 +19,26 @@
 namespace hft::matching {
 
 using OrderId   = std::uint64_t;   // 客户端分配，在活动（挂单中）订单里唯一
+                                   // client-assigned, unique among live (resting) orders
 using AccountId = std::uint32_t;   // 订单所有者，用于自成交保护（STP）
+                                   // order owner, used for self-trade prevention (STP)
 using Price     = std::int64_t;    // 整数 tick
+                                   // integer ticks
 using Qty       = std::int64_t;    // 整数手数
+                                   // integer lots
 using TradeId   = std::uint64_t;   // 每个订单簿从 1 开始、每笔成交加 1
+                                   // starts at 1 in each order book and increases by 1 per trade
 using SymbolId  = std::uint32_t;   // 多交易对路由使用
+                                   // used for multi-symbol routing
 
 // 档位总量上限：同一侧同一价位全部挂单的剩余量之和不得超过它，因此档位总量（缓存或现算）、depth()
 // 与 volumeAt() 的结果都能用 Qty 表示。会让某档总量超过上限的请求——限价 GTC 新单、改价或加量的改单——
 // 在产生任何其他事件之前以 InvalidQuantity 拒绝（规则顺序见 docs/MATCHING_ENGINE.md）。
+// Level total bound: the remaining quantities of all resting orders at one price on one side must not sum
+// to more than this, so level totals (cached or computed on the fly) and the results of depth() and
+// volumeAt() are all representable as Qty. A request that would take a level's total past the bound — a
+// new limit GTC order, or a modify that reprices or increases the quantity — is rejected with
+// InvalidQuantity before any other event is produced (rule order: see docs/MATCHING_ENGINE.md).
 inline constexpr Qty kMaxLevelQty = std::numeric_limits<Qty>::max();
 
 enum class Side : std::uint8_t { Buy, Sell };
@@ -37,6 +53,7 @@ enum class CancelReason : std::uint8_t {
     UserRequested, IocRemainder, MarketRemainder, FokUnfillable, SelfTradePrevention };
 
 // 新订单请求（市价单忽略 price 字段）
+// New order request (market orders ignore the price field)
 struct OrderRequest {
     OrderId id = 0; AccountId account = 0; Side side = Side::Buy;
     OrderType type = OrderType::Limit; TimeInForce tif = TimeInForce::GTC;
@@ -44,6 +61,8 @@ struct OrderRequest {
 };
 
 // 成交回报：价格恒为 maker（挂单方）价格；*_remaining 为本笔成交之后的剩余量
+// Trade report: the price is always the maker's (resting side's) price; *_remaining is the remaining
+// quantity after this trade
 struct Trade {
     TradeId trade_id; OrderId maker_id; OrderId taker_id;
     AccountId maker_account; AccountId taker_account; Side taker_side;
@@ -51,19 +70,23 @@ struct Trade {
 };
 
 // 深度查询的一行：价格、该档剩余总量、该档订单数
+// One row of a depth query: price, total remaining quantity of the level, number of orders at the level
 struct LevelInfo { Price price; Qty qty; std::uint32_t orders; };
 
 // 订单查询的一行：remaining 为当前未成交（挂单）数量
+// One row of an order query: remaining is the currently unfilled (resting) quantity
 struct OrderInfo { OrderId id; AccountId account; Side side; Price price;
                    Qty remaining; bool post_only; StpMode stp; };
 
 // 引擎线程的命令/事件需要按位拷贝穿过 SPSC 队列
+// The engine thread's commands/events must be bitwise-copied through SPSC queues
 static_assert(std::is_trivially_copyable_v<OrderRequest>);
 static_assert(std::is_trivially_copyable_v<Trade>);
 static_assert(std::is_trivially_copyable_v<LevelInfo>);
 static_assert(std::is_trivially_copyable_v<OrderInfo>);
 
 // ---- 枚举转字符串（未知取值返回 "?"）----
+// ---- Enum to string (unknown values return "?") ----
 
 constexpr const char* toString(Side v) noexcept {
     switch (v) {
@@ -135,6 +158,7 @@ constexpr const char* toString(CancelReason v) noexcept {
 }
 
 // ---- 逐字段相等比较（!= 为其取反，C++17 不会自动生成）----
+// ---- Field-by-field equality (!= is its negation; C++17 does not generate it automatically) ----
 
 constexpr bool operator==(const Trade& a, const Trade& b) noexcept {
     return a.trade_id == b.trade_id && a.maker_id == b.maker_id && a.taker_id == b.taker_id &&

@@ -300,7 +300,7 @@ Crypto_HFT_Engine/
 │   ├── app.h                 # monitor event loop + CLI;  display.h, text_util.h, logger.h, config.h
 │   └── latency_tracker.h
 ├── src/                      # main.cpp (monitor), exchange_sim.cpp
-├── tools/                    # mock exchange, demo config and script
+├── tools/                    # mock exchange, demo config and script, bilingual comment checker
 ├── tests/                    # test framework, reference models, 7 suites, mock TLS server
 ├── benchmark/                # hft, matching engine, market data (+ the v1 map/parse benchmarks)
 └── docs/                     # MATCHING_ENGINE.md, screenshots

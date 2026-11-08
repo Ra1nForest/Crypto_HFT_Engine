@@ -2,9 +2,13 @@
 // test_matching.cpp
 // 撮合引擎测试：规范套件（参考模型、朴素模型、优化引擎）、参考模型随机自检、差分测试
 // （优化引擎 vs 参考模型的多场景模糊测试）、多交易对路由、零分配验证、测试工具自身的校验。
+// Matching engine tests: spec suites (reference model, naive model, optimized engine), random self-checks of
+// the reference model, differential tests (multi-scenario fuzzing of the optimized engine vs the reference
+// model), multi-symbol routing, zero-allocation checks and checks of the test tools themselves.
 //
 
 // 启用 hft 头文件中的调试断言：必须在包含任何 hft 头文件之前定义
+// Enable the debug asserts in the hft headers: must be defined before any hft header is included
 #define HFT_ENABLE_ASSERTS 1
 
 #include "hft/alloc_counter.h"
@@ -45,6 +49,11 @@ namespace {
 // "reference"：参考模型（差分测试的标准答案）
 // "naive"：第二个独立实现，交叉验证规范用例本身与参考模型
 // "optimized"：被测的优化引擎（matching/order_book.h）
+// ---- Register the spec suites during static initialization ----
+// "reference": the reference model (the ground truth for the differential tests)
+// "naive": a second independent implementation, cross-validating the spec cases themselves and the
+//   reference model
+// "optimized": the optimized engine under test (matching/order_book.h)
 struct RegisterSpecSuites {
     RegisterSpecSuites() {
         registerMatchingSpecTests<ReferenceOrderBook>("reference");
@@ -58,6 +67,9 @@ using NaiveBook = NaiveOrderBook<RecordingListener>;
 
 // 单个订单簿 + 记录型监听器：逐条执行命令并返回该命令产生的事件（引用在下一次 run() 之前有效）。
 // 三个实现的构造参数相同：(listener, max_orders, reserve_orders)
+// A single order book + a recording listener: runs commands one at a time and returns the events each command
+// produces (the reference stays valid until the next run()).
+// All three implementations take the same constructor arguments: (listener, max_orders, reserve_orders)
 template <class Book>
 struct Stepper {
     RecordingListener listener;
@@ -72,6 +84,7 @@ struct Stepper {
 };
 
 // 把命令发给多交易对引擎的某个交易对
+// Sends a command to one symbol of the multi-symbol engine
 template <class Engine>
 void applyTo(Engine& engine, SymbolId symbol, const Command& c) {
     switch (c.type) {
@@ -84,15 +97,21 @@ void applyTo(Engine& engine, SymbolId symbol, const Command& c) {
 // ============================================================================
 // 与实现无关的单命令事件流检查：只依赖命令前后的查询结果，
 // 独立地重新推导校验结果、数量守恒、成交 id 连续、价格不穿越限价、STP 事件结构等。
+// Implementation-independent event stream check for a single command: relies only on the query results before
+// and after the command, and independently re-derives the validation outcome, quantity conservation,
+// consecutive trade ids, no trade through the limit price, the STP event structure, etc.
 // ============================================================================
 
 struct PreState {
     std::optional<OrderInfo> target;  // 命令执行前 findOrder(cmd.id)
+                                      // findOrder(cmd.id) before the command runs
     std::size_t order_count = 0;
     std::optional<Price> best_bid;
     std::optional<Price> best_ask;
     TradeId last_trade_id = 0;
     Qty level_volume = 0;  // 命令可能挂单的那一档的现有总量：新单 (side, price)，改单 (原方向, 新价格)
+                           // current total of the level where the command may rest:
+                           // new order (side, price), modify (original side, new price)
 };
 
 template <class Book>
@@ -121,6 +140,8 @@ struct TakerView {
 };
 
 // 检查 Accepted/Modified 之后的成交与撤单序列，以及命令结束后 taker 是否正确挂单
+// Checks the trade and cancel sequence after Accepted/Modified, and whether the taker rests correctly
+// once the command finishes
 template <class Book>
 bool checkTakerTail(const std::vector<Event>& ev, std::size_t start, const TakerView& t,
                     const Book& book, std::string* why) {
@@ -202,6 +223,8 @@ bool checkTakerTail(const std::vector<Event>& ev, std::size_t start, const Taker
     const bool still_crosses =
         opposite && (t.market || (t.side == Side::Buy ? t.limit >= *opposite : t.limit <= *opposite));
     // 正常剩余撤单意味着撮合循环是因"无可成交对手"而结束的
+    // A regular remainder cancel means the matching loop ended because there was
+    // "no counterparty to trade with"
     if (final_reason == CancelReason::MarketRemainder && opposite)
         return fail("MarketRemainder although the opposite side is not empty");
     if (final_reason == CancelReason::IocRemainder && still_crosses)
@@ -270,6 +293,8 @@ bool checkCommandEvents(const Command& cmd, const PreState& pre, const std::vect
             const OrderInfo& o = *pre.target;
             const bool in_place = cmd.price == o.price && cmd.qty <= o.remaining;
             // 重新挂单时目标档位里的其他订单：同价加量时扣掉它自己原来的数量
+            // The other orders in the target level when re-resting: on a same-price quantity increase, subtract the
+            // order's own original quantity
             const Qty others = pre.level_volume - (cmd.price == o.price ? o.remaining : 0);
             std::optional<RejectReason> expect;
             if (cmd.qty <= 0) expect = RejectReason::InvalidQuantity;
@@ -302,6 +327,7 @@ bool checkCommandEvents(const Command& cmd, const PreState& pre, const std::vect
 
 // ============================================================================
 // 覆盖率统计：确认随机流真的走到了每一条规则分支
+// Coverage statistics: confirm that the random streams really reach every rule branch
 // ============================================================================
 
 struct Coverage {
@@ -342,6 +368,9 @@ struct Coverage {
                     if (e.cancel_reason == CancelReason::SelfTradePrevention) {
                         // maker 撤单后紧跟 taker 撤单 = CancelBoth；单独的 maker 撤单 = CancelMaker；
                         // 前面没有 maker 撤单的 taker 撤单 = CancelTaker
+                        // A maker cancel directly followed by a taker cancel = CancelBoth;
+                        // a lone maker cancel = CancelMaker;
+                        // a taker cancel with no maker cancel before it = CancelTaker
                         const bool is_taker = e.id == cmd.id;
                         const bool next_is_taker = i + 1 < ev.size() &&
                                                    ev[i + 1].kind == Event::Kind::Cancelled &&
@@ -379,6 +408,9 @@ struct Coverage {
 
     // 档位总量上限：被上限拒绝的新单 / 改单（数量为正的 InvalidQuantity），以及限价 GTC 新单或生效的改单
     // 之后所在档位恰好等于上限
+    // Level total bound: new orders / modifies rejected by the bound (InvalidQuantity with a positive
+    // quantity), and limit GTC new orders or applied modifies after which their level sits exactly at
+    // the bound
     template <class Book>
     void classifyLevelBound(const Command& cmd, const PreState& pre, const std::vector<Event>& ev, const Book& book) {
         if (ev.empty() || cmd.type == RequestType::Cancel) return;
@@ -405,6 +437,8 @@ struct Coverage {
 };
 
 // 档位总量上限的分支（Coverage::classifyLevelBound 的键）：极端数量的随机流必须全部触发过
+// Level-total-bound branches (keys of Coverage::classifyLevelBound): the extreme-quantity random streams must
+// exercise all of them
 const std::vector<const char*>& requiredLevelBoundBranches() {
     static const std::vector<const char*> kRequired = {"bound/reject_new", "bound/reject_modify",
                                                         "bound/level_at_max"};
@@ -412,6 +446,7 @@ const std::vector<const char*>& requiredLevelBoundBranches() {
 }
 
 // 随机流必须触发过的全部规则分支（Coverage::classify 的键）
+// All the rule branches the random streams must exercise (keys of Coverage::classify)
 const std::vector<const char*>& requiredBranches() {
     static const std::vector<const char*> kRequired = {
         "accepted", "trade", "trade/maker_filled", "trade/maker_partial", "trade/self_trade",
@@ -429,6 +464,7 @@ const std::vector<const char*>& requiredBranches() {
 }
 
 // 逐个报告 keys 中从未触发过的分支；全部触发过时返回 true
+// Reports each branch in keys that was never exercised; returns true when all of them were exercised
 bool checkExercised(const Coverage& cov, const std::vector<const char*>& keys, const char* file, int line) {
     bool all = true;
     for (const char* key : keys) {
@@ -440,6 +476,7 @@ bool checkExercised(const Coverage& cov, const std::vector<const char*>& keys, c
 }
 
 // requiredBranches() 加上 extra 都必须触发过；有遗漏时打印完整覆盖统计
+// requiredBranches() plus extra must all be exercised; if any is missed, prints the full coverage statistics
 void checkAllBranchesExercised(const Coverage& cov, const char* file, int line,
                                const std::vector<const char*>& extra = {}) {
     const bool required = checkExercised(cov, requiredBranches(), file, line);
@@ -489,6 +526,8 @@ std::string describe(const FuzzRun& run, std::size_t index, const Command& cmd,
 
 // ============================================================================
 // 参考模型随机自检：每条命令后 checkInvariants()，并做独立的事件流检查
+// Random self-check of the reference model: checkInvariants() after every command, plus an independent
+// event stream check
 // ============================================================================
 
 TEST_CASE("reference/fuzz: random streams keep invariants and a self-consistent event stream") {
@@ -522,6 +561,7 @@ TEST_CASE("reference/fuzz: random streams keep invariants and a self-consistent 
     CHECK_GE(total, 200'000u);
 
     // 每个规则分支都必须被随机流触发过
+    // Every rule branch must have been exercised by the random streams
     checkAllBranchesExercised(cov, __FILE__, __LINE__);
     std::printf("    coverage: %llu trades, %llu STP cancels, %llu in-place modifies, %llu FOK kills\n",
                 static_cast<unsigned long long>(cov.get("trade")),
@@ -532,6 +572,8 @@ TEST_CASE("reference/fuzz: random streams keep invariants and a self-consistent 
 
 // ============================================================================
 // 差分测试：参考模型 vs 朴素模型（数据结构完全不同的两个实现）
+// Differential test: reference model vs naive model (two implementations with completely different data
+// structures)
 // ============================================================================
 
 TEST_CASE("differential/reference vs naive: identical event streams and book state") {
@@ -585,11 +627,13 @@ TEST_CASE("differential/reference vs reference: replaying a stream is determinis
 
 // ============================================================================
 // 测试工具自身：生成器、sameState、queriesConsistent 必须真的能发现问题
+// The test tools themselves: the generator, sameState and queriesConsistent must really detect problems
 // ============================================================================
 
 namespace {
 
 // 包装一个真实订单簿，并按开关篡改某个查询的结果
+// Wraps a real order book and tampers with the result of one query, selected by a switch
 template <class Inner>
 struct TamperedBook {
     enum class Fault {
@@ -639,6 +683,7 @@ struct TamperedBook {
 };
 
 // 包装一个真实订单簿，记下按价格查询（ordersAt / volumeAt）时传入的每个价格
+// Wraps a real order book and records every price passed to the by-price queries (ordersAt / volumeAt)
 template <class Inner>
 struct ProbeRecordingBook {
     const Inner& inner;
@@ -670,6 +715,7 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
         s.run(Command::newOrder(r));
     }
     s.run(Command::newOrder(buy(7, 102, 1).account(4)));  // 产生一笔成交，使 lastTradeId 非零
+                                                          // produces a trade so that lastTradeId is non-zero
     REQUIRE_EQ(s.book.lastTradeId(), 1u);
 
     using T = TamperedBook<RefBook>;
@@ -679,6 +725,7 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
     CHECK(sameState(s.book, clean, &why));
 
     // queriesConsistent 能发现的（单个簿内部矛盾）
+    // What queriesConsistent can detect (internal contradictions within a single book)
     for (T::Fault f : {T::Fault::BestBid, T::Fault::BestAsk, T::Fault::OrderCount, T::Fault::LevelCount,
                        T::Fault::DepthQty, T::Fault::DepthOrders, T::Fault::DepthPrefix,
                        T::Fault::OrdersAtRemaining, T::Fault::FindOrder, T::Fault::VolumeAt}) {
@@ -688,6 +735,7 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
         CHECK(!why.empty());
     }
     // sameState 能发现的（与真实簿对比）：所有篡改都会被发现
+    // What sameState can detect (comparison against the real book): every tampering is detected
     for (T::Fault f : {T::Fault::BestBid, T::Fault::BestAsk, T::Fault::OrderCount, T::Fault::LevelCount,
                        T::Fault::DepthQty, T::Fault::DepthOrders, T::Fault::OrdersAtRemaining,
                        T::Fault::OrdersAtOrder, T::Fault::FindOrder, T::Fault::VolumeAt,
@@ -701,6 +749,8 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
 
 TEST_CASE("tools: queriesConsistent never computes a price beyond the representable range") {
     // 卖盘最差价为 INT64_MAX、买盘最差价为 1：检查"最差档之外没有幻影档位"时不能计算 INT64_MAX + 1
+    // The worst ask is INT64_MAX and the worst bid is 1: checking "no phantom levels beyond the worst level"
+    // must not compute INT64_MAX + 1
     Stepper<RefBook> s;
     s.run(Command::newOrder(sell(1, INT64_MAX, 2)));
     s.run(Command::newOrder(sell(2, INT64_MAX - 1, 1)));
@@ -711,6 +761,8 @@ TEST_CASE("tools: queriesConsistent never computes a price beyond the representa
     CHECK(queriesConsistent(probe, &why));
     REQUIRE(!probe.probed.empty());
     // 合法的簿上所有价格都 > 0；买盘最差档之外的探测价格是 0，因此任何负数都是算越界后回绕的结果
+    // On a valid book every price is > 0; the probe price beyond the worst bid level is 0, so any negative
+    // value is the result of an out-of-range computation wrapping around
     const Price lowest = *std::min_element(probe.probed.begin(), probe.probed.end());
     if (lowest < 0)
         ::hft_test::reportFailure(__FILE__, __LINE__,
@@ -730,6 +782,7 @@ TEST_CASE("tools: sameState detects a real divergence between two books") {
     REQUIRE(sameState(a.book, b.book, &why));
     REQUIRE(a.book.orderCount() > 0);
     // 撤掉 a 中一个挂单：两簿必须被判为不同
+    // Cancel one resting order in a: the two books must be judged different
     const std::vector<LevelInfo> bids = a.book.depth(Side::Buy);
     const std::vector<LevelInfo> asks = a.book.depth(Side::Sell);
     const LevelInfo& level = bids.empty() ? asks.front() : bids.front();
@@ -750,9 +803,11 @@ TEST_CASE("tools: event comparison reports the first difference") {
     y.pop_back();
     CHECK(!sameEvents(x, y, &why));
     // 不同种类的事件即使字段巧合也不相等
+    // Events of different kinds are not equal even if their fields happen to match
     CHECK(cancelled(1, 5, CancelReason::UserRequested) != modified(1, 0, 5));
     CHECK(rejectedNew(1, RejectReason::UnknownOrder) != rejectedCancel(1));
     // Accepted 比较完整请求
+    // Accepted compares the full request
     CHECK(accepted(buy(1, 100, 5)) != accepted(buy(1, 100, 5).stp(StpMode::CancelMaker)));
     CHECK(accepted(marketBuy(1, 5).price(3)) != accepted(marketBuy(1, 5)));
 }
@@ -813,8 +868,10 @@ TEST_CASE("generator: produces every request flavour around a drifting mid") {
     }
     CHECK_EQ(seen["bad_account"], 0);
     CHECK_EQ(seen["far_price"], 0);  // 限价都在中间价附近几十个 tick 内
+                                     // all limit prices are within a few dozen ticks of the mid
     CHECK_LE(max_tracked, cfg.max_live + 1);
     // 命令类型比例大致符合权重 60/22/18
+    // The command type mix roughly matches the weights 60/22/18
     CHECK_GT(seen["type/New"], 30'000);
     CHECK_GT(seen["type/Cancel"], 9'000);
     CHECK_GT(seen["type/Modify"], 7'000);
@@ -823,11 +880,14 @@ TEST_CASE("generator: produces every request flavour around a drifting mid") {
 
 // ============================================================================
 // 参考模型特有的行为：回调时刻的簿状态
+// Behavior specific to the reference model: the book state at callback time
 // ============================================================================
 
 namespace {
 
 // 在每个回调里检查簿的不变量：参考模型承诺回调发生时簿状态已一致
+// Checks the book invariants in every callback: the reference model promises that the book state is already
+// consistent when a callback runs
 struct ProbeListener {
     const ReferenceOrderBook<ProbeListener>* book = nullptr;
     int callbacks = 0;
@@ -858,14 +918,21 @@ TEST_CASE("reference: the book is consistent whenever a callback runs") {
 // ============================================================================
 // 优化引擎（matching/order_book.h、matching/matching_engine.h）专项测试：
 // 与参考模型的多场景差分模糊测试、回调时刻的簿状态、零分配、白盒不变量、极端数值、多交易对路由
+// Dedicated tests of the optimized engine (matching/order_book.h, matching/matching_engine.h):
+// multi-scenario differential fuzzing against the reference model, the book state at callback time,
+// zero allocations, white-box invariants, extreme values, multi-symbol routing
 // ============================================================================
 
 // 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
+// Heap allocation counting: see hft/alloc_counter.h (counting global operator new/delete; this is the only
+// translation unit of this program that includes it)
 namespace {
 std::uint64_t heapAllocations() { return hft::alloc_counter::total(); }
 }  // namespace
 
 // ---- 白盒访问：故意破坏优化引擎的内部结构，验证 checkInvariants() 能发现每一种问题 ----
+// ---- White-box access: deliberately corrupt the optimized engine's internal structures and verify that
+// checkInvariants() detects every kind of problem ----
 namespace hft::matching::detail {
 template <class Book>
 struct OrderBookTestPeer {
@@ -881,6 +948,8 @@ namespace {
 using OptBook = LimitOrderBook<RecordingListener>;
 
 // 场景改写器的随机源：与生成器一样只用 mt19937_64 的原始输出，任何标准库实现上都可复现
+// Random source for the scenario mutators: like the generator, it uses only raw mt19937_64 output, so it is
+// reproducible on any standard library implementation
 class Mutator {
 public:
     explicit Mutator(std::uint64_t seed) : rng_(seed ^ 0x9e3779b97f4a7c15ULL) {}
@@ -897,6 +966,8 @@ private:
 using MutateFn = void (*)(Command&, Mutator&);
 
 // 主动扫档：三成新单数量放大 3~12 倍（配合更大的穿价幅度，一单常扫多档）
+// Aggressive sweeps: 30% of new orders get their quantity scaled up 3~12 times (together with a larger
+// crossing distance, one order often sweeps several levels)
 void mutateAggressive(Command& c, Mutator& m) {
     if (c.type != RequestType::New) return;
     OrderRequest& r = c.order;
@@ -904,6 +975,8 @@ void mutateAggressive(Command& c, Mutator& m) {
 }
 
 // STP 密集：只有账户 0 和 1（0 是普通账户），四分之三的新单启用某种 STP 模式
+// STP heavy: only accounts 0 and 1 (0 is an ordinary account), and three quarters of new orders enable
+// some STP mode
 void mutateStpHeavy(Command& c, Mutator& m) {
     if (c.type != RequestType::New) return;
     OrderRequest& r = c.order;
@@ -912,6 +985,8 @@ void mutateStpHeavy(Command& c, Mutator& m) {
 }
 
 // FOK/IOC 密集：大量限价单改成 FOK/IOC 或市价单，FOK 数量偏大（整单撤销更常见），并混入各种 STP
+// FOK/IOC heavy: many limit orders become FOK/IOC or market orders, FOK quantities skew large (whole-order
+// cancels are more common), and all kinds of STP are mixed in
 void mutateFokIoc(Command& c, Mutator& m) {
     if (c.type != RequestType::New) return;
     OrderRequest& r = c.order;
@@ -932,6 +1007,9 @@ void mutateFokIoc(Command& c, Mutator& m) {
 
 // 边界 id 与账户：把生成器的小 id 双射到 {0, 1, 2, ...} ∪ {..., UINT64_MAX - 1, UINT64_MAX}，
 // 使 0 与 UINT64_MAX（哈希表的表外专用槽位）频繁出现；账户 1 → 0、账户 4 → UINT32_MAX
+// Edge ids and accounts: map the generator's small ids bijectively onto
+// {0, 1, 2, ...} ∪ {..., UINT64_MAX - 1, UINT64_MAX}, so that 0 and UINT64_MAX (the latter lives in the
+// hash map's dedicated out-of-table slot) show up often; account 1 → 0, account 4 → UINT32_MAX
 OrderId edgeId(OrderId x) {
     if (x == 0) return OrderId{1} << 62;
     return x % 2 == 1 ? UINT64_MAX - x / 2 : x / 2 - 1;
@@ -946,6 +1024,8 @@ void mutateEdgeIds(Command& c, Mutator&) {
 }
 
 // 大数量：新单与改单数量乘以 2^40（档位总量仍远小于 INT64_MAX），检查不存在 32 位截断
+// Large quantities: multiply new-order and modify quantities by 2^40 (level totals stay far below INT64_MAX)
+// to check that there is no 32-bit truncation
 void mutateLargeQty(Command& c, Mutator&) {
     constexpr Qty kScale = Qty{1} << 40;
     if (c.type == RequestType::New && c.order.qty > 0) c.order.qty *= kScale;
@@ -955,6 +1035,11 @@ void mutateLargeQty(Command& c, Mutator&) {
 // 极端数量：八成新单与改单的数量改成 kUnit = INT64_MAX / 7 的 1~7 倍（7 个单位恰好是 INT64_MAX），
 // 同一价位两三张挂单的总量就会恰好到达、或将要超过档位总量上限 kMaxLevelQty；其余保留原来的小数量
 // （非法数量保持非法），部分成交后的剩余量于是不再是单位的整数倍，"离上限只差几手"也常出现
+// Extreme quantities: 80% of new-order and modify quantities become 1~7 times kUnit = INT64_MAX / 7
+// (7 units are exactly INT64_MAX), so the total of two or three resting orders at one price exactly reaches,
+// or is about to exceed, the level total bound kMaxLevelQty; the rest keep their original small quantities
+// (invalid quantities stay invalid), so remainders after partial fills are no longer whole multiples of the
+// unit, and "only a few lots short of the bound" also comes up often
 void mutateExtremeQty(Command& c, Mutator& m) {
     constexpr Qty kUnit = kMaxLevelQty / 7;
     static_assert(kUnit * 7 == kMaxLevelQty, "INT64_MAX is a multiple of 7");
@@ -964,13 +1049,20 @@ void mutateExtremeQty(Command& c, Mutator& m) {
 }
 
 // 差分测试场景：生成器参数 + 订单簿参数 + 可选的命令改写
+// Differential test scenario: generator parameters + order book parameters + an optional command mutation
 struct DiffProfile {
     const char* name;
     std::uint64_t seed_base;     // 第 k 个种子 = seed_base + k
+                                 // the k-th seed = seed_base + k
     std::size_t seeds;           // 常规运行的种子数
+                                 // number of seeds in a regular run
     std::size_t commands;        // 每个种子的命令数
+                                 // commands per seed
     std::size_t max_orders;      // 0 = 不限
+                                 // 0 = unlimited
     std::size_t reserve_orders;  // 优化引擎的预留容量（1 = 从极小容量开始反复扩容）
+                                 // the optimized engine's reserved capacity
+                                 // (1 = start from a tiny capacity and grow repeatedly)
     GeneratorConfig gen;
     MutateFn mutate;
 };
@@ -1041,6 +1133,11 @@ std::string diffFailure(const DiffProfile& p, std::uint64_t seed, std::size_t in
 // 一个种子的差分运行：同一命令流同时喂给参考模型与优化引擎。
 // 每条命令之后：事件序列逐条完全相同 + 与实现无关的事件流检查；每 64 条命令及结束时：
 // 两边 checkInvariants()、sameState()、优化引擎的 queriesConsistent()。返回空串表示通过。
+// Differential run for one seed: the same command stream is fed to both the reference model and the
+// optimized engine.
+// After every command: identical event sequences, event by event, + the implementation-independent event
+// stream check; every 64 commands and at the end: checkInvariants() on both sides, sameState(), and the
+// optimized engine's queriesConsistent(). Returns an empty string when the run passes.
 std::string runDifferential(const DiffProfile& p, std::uint64_t seed, std::size_t commands, Coverage* cov,
                             DiffTotals& totals) {
     RandomCommandGenerator gen(seed, p.gen);
@@ -1090,6 +1187,10 @@ bool envFlag(const char* name) {
 
 // 运行一组场景。seed_offset / seed_multiplier 用于长时运行（不同的种子区间、更多种子）。
 // 环境变量 HFT_DIFF_PROFILE / HFT_DIFF_SEED 可只重放某个场景/种子（失败信息里给出了完整命令）。
+// Runs a set of scenarios. seed_offset / seed_multiplier are for long runs (different seed ranges, more
+// seeds).
+// The environment variables HFT_DIFF_PROFILE / HFT_DIFF_SEED replay only one scenario/seed (the failure
+// message gives the full command).
 void runDiffSuite(std::uint64_t seed_offset, std::size_t seed_multiplier, bool enforce_totals) {
     const char* only_profile = std::getenv("HFT_DIFF_PROFILE");
     const char* only_seed = std::getenv("HFT_DIFF_SEED");
@@ -1104,6 +1205,8 @@ void runDiffSuite(std::uint64_t seed_offset, std::size_t seed_multiplier, bool e
             const std::uint64_t seed = p.seed_base + seed_offset + k;
             if (only_seed != nullptr && std::to_string(seed) != only_seed) continue;
             // 覆盖率统计较慢（每个事件拼一次字符串），只对每个场景的第一个种子做
+            // Coverage statistics are slow (one string concatenation per event), so they are collected only for the
+            // first seed of each scenario
             const std::string failure = runDifferential(p, seed, p.commands, k == 0 ? &cov : nullptr, totals);
             if (!failure.empty()) FAIL(failure);
         }
@@ -1141,6 +1244,8 @@ TEST_CASE("optimized/differential (long, set HFT_LONG_TESTS=1): ten times more s
 
 TEST_CASE("optimized/differential: identical events and state vs the naive model") {
     // 朴素模型的数据结构与另外两者都不同（无序 vector + 线性扫描），用它再交叉验证一次
+    // The naive model's data structures differ from both of the others (unordered vector + linear scans), so it
+    // is used to cross-check once more
     const std::vector<FuzzRun> runs = {
         {"default mix", 201, 20'000, 0, GeneratorConfig()},
         {"two accounts", 202, 15'000, 0, makeConfig([](GeneratorConfig& c) { c.accounts = 2; })},
@@ -1173,6 +1278,10 @@ TEST_CASE("optimized/differential: identical events and state vs the naive model
 TEST_CASE("differential/reference vs naive: level totals at the INT64_MAX bound") {
     // 两个预言机用不同写法实现档位总量上限（参考模型：上限减去现有总量；朴素模型：逐单求和并检测加法溢出，
     // 改单时按 id 排除订单自己），在极端数量的随机流上事件流与簿状态必须逐条一致
+    // The two oracles implement the level total bound in different ways (reference model: the bound minus the
+    // current total; naive model: sums order by order and detects addition overflow, excluding the order itself
+    // by id on a modify); on extreme-quantity random streams their event streams and book states must agree
+    // step by step
     Coverage cov;
     for (const std::uint64_t seed : {121, 122, 123}) {
         RandomCommandGenerator gen(seed);
@@ -1209,6 +1318,10 @@ TEST_CASE("differential/reference vs naive: level totals at the INT64_MAX bound"
 // ============================================================================
 // 回调时刻的簿状态：优化引擎与参考模型在每个回调中暴露的查询结果必须完全相同
 // （规范未规定回调期间的可见状态；这里与参考模型对齐："事件发出时簿已包含该事件的效果"）
+// Book state at callback time: the query results that the optimized engine and the reference model expose in
+// every callback must be identical
+// (the spec does not define the state visible during callbacks; here it follows the reference model:
+// "when an event is emitted, the book already includes the effect of that event")
 // ============================================================================
 namespace {
 
@@ -1221,7 +1334,9 @@ struct CallbackView {
     std::size_t ask_levels = 0;
     TradeId last_trade_id = 0;
     std::optional<OrderInfo> subject;      // findOrder(事件的订单 id；成交事件为 maker)
+                                           // findOrder(the event's order id; the maker for trade events)
     std::optional<OrderInfo> counterpart;  // 成交事件：findOrder(taker)
+                                           // trade events: findOrder(taker)
     std::vector<LevelInfo> bids;           // depth(Buy, 4)
     std::vector<LevelInfo> asks;           // depth(Sell, 4)
 };
@@ -1234,6 +1349,7 @@ bool operator==(const CallbackView& a, const CallbackView& b) {
 }
 
 using hft::matching::test::str;  // 本命名空间新增的 str 重载不能遮蔽工具库中的那些
+                                 // the str overloads added in this namespace must not hide those in the tool library
 
 std::string str(const CallbackView& v) {
     return v.event.toString() + " | orders=" + std::to_string(v.order_count) + " bid=" + str(v.best_bid) +
@@ -1244,11 +1360,14 @@ std::string str(const CallbackView& v) {
 }
 
 // 在每个回调里拍下簿的查询结果，并检查簿此刻的不变量与查询一致性
+// Snapshots the book's query results in every callback and checks the book's invariants and query
+// consistency at that moment
 template <template <class> class BookT>
 struct ViewRecorder {
     const BookT<ViewRecorder>* book = nullptr;
     std::vector<CallbackView> views;
     std::string problem;  // 第一处回调时刻的不一致（空 = 无）
+                          // first inconsistency seen at callback time (empty = none)
     std::size_t callbacks = 0;
 
     void record(const Event& e, OrderId subject, std::optional<OrderId> counterpart) {
@@ -1329,6 +1448,7 @@ TEST_CASE("optimized: listeners observe exactly the reference book state during 
 
 // ============================================================================
 // 零分配：预留容量之后 submit/cancel/modify 不调用全局 operator new
+// Zero allocations: once capacity is reserved, submit/cancel/modify never call the global operator new
 // ============================================================================
 namespace {
 
@@ -1363,6 +1483,8 @@ std::vector<Command> profileCommands(const DiffProfile& p, std::uint64_t seed, s
 
 TEST_CASE("optimized: no heap allocation once capacity is reserved") {
     // 计数器自检：参考模型（std::map/list/unordered_map）在同样的命令流上必然分配
+    // Counter self-check: the reference model (std::map/list/unordered_map) necessarily allocates on the same
+    // command stream
     const std::vector<DiffProfile> profiles = diffProfiles();
     {
         const std::vector<Command> cmds = profileCommands(profiles[0], 1, 2'000);
@@ -1373,8 +1495,11 @@ TEST_CASE("optimized: no heap allocation once capacity is reserved") {
         CHECK_GT(heapAllocations() - before, 100u);
     }
     // 每个场景（容量充足的那些）：从构造之后的第一条命令起就不分配
+    // Every scenario (those with enough capacity): no allocations, starting with the first command after
+    // construction
     for (const DiffProfile& p : profiles) {
         if (p.reserve_orders < 1024) continue;  // 小预留量场景本来就要扩容
+                                                // small-reservation scenarios have to grow anyway
         const std::vector<Command> cmds = profileCommands(p, p.seed_base + 77, 60'000);
         CountingListener l;
         LimitOrderBook<CountingListener> book(l, p.max_orders, 4096);
@@ -1389,6 +1514,7 @@ TEST_CASE("optimized: no heap allocation once capacity is reserved") {
         CHECK(book.checkInvariants(&why));
     }
     // 多交易对引擎（含未知交易对的拒单）同样不分配
+    // The multi-symbol engine (including rejects for unknown symbols) does not allocate either
     {
         CountingEngineListener l;
         MatchingEngine<CountingEngineListener> engine(l);
@@ -1405,6 +1531,8 @@ TEST_CASE("optimized: no heap allocation once capacity is reserved") {
         CHECK_GT(l.trades, 1'000u);
     }
     // 超出预留量时会扩容（计数器确实能看到优化引擎的分配），而且扩容后结果依然正确
+    // Beyond the reservation it grows (the counter really does see the optimized engine's allocations), and the
+    // results are still correct after growing
     {
         CountingListener l;
         LimitOrderBook<CountingListener> small(l, 0, 4);
@@ -1420,19 +1548,25 @@ TEST_CASE("optimized: no heap allocation once capacity is reserved") {
 
 // ============================================================================
 // 白盒：每一种内部结构损坏都会被 checkInvariants() 发现
+// White box: every kind of internal structure corruption is detected by checkInvariants()
 // ============================================================================
 TEST_CASE("optimized: checkInvariants detects every kind of internal corruption") {
     using Peer = hft::matching::detail::OrderBookTestPeer<OptBook>;
     struct Corruption {
         const char* name;
         const char* expect;  // why 中必须出现的子串
+                             // substring that must appear in why
         void (*apply)(OptBook&);
     };
     // 布局：买盘 100 = [1, 2]、99 = [3]；卖盘 101 = [4]、103 = [5, 6]
     // sides[0] = 买盘（升序，末尾最优），sides[1] = 卖盘（价格降序，末尾最优）
+    // Layout: bids 100 = [1, 2], 99 = [3]; asks 101 = [4], 103 = [5, 6]
+    // sides[0] = bids (ascending, best at the back), sides[1] = asks (prices descending, best at the back)
     const Corruption cases[] = {
         {"level total", "caches total", [](OptBook& b) { Peer::sides(b)[0].back().level->total += 1; }},
         // 卖盘 103 = [5, 6]：5 号单的剩余量改成 INT64_MAX，两单之和超出档位总量上限
+        // Asks 103 = [5, 6]: order 5's remaining becomes INT64_MAX, so the sum of the two orders exceeds the level
+        // total bound
         {"level total past the bound", "exceeds kMaxLevelQty",
          [](OptBook& b) { Peer::sides(b)[1].front().level->head->remaining = kMaxLevelQty; }},
         {"level count", "counts", [](OptBook& b) { Peer::sides(b)[1].front().level->count += 1; }},
@@ -1469,6 +1603,7 @@ TEST_CASE("optimized: checkInvariants detects every kind of internal corruption"
         {"extra index entry", "index holds 7 entries (0 placeholders)",
          [](OptBook& b) { Peer::index(b).insert(OrderId{99}, *Peer::index(b).find(1)); }},
         // 占位条目（空指针）只在回调期间存在且至多一个
+        // Placeholder entries (null pointers) exist only during a callback, and there is at most one
         {"two placeholder entries", "(2 placeholders)", [](OptBook& b) {
              Peer::index(b).insert(OrderId{98}, nullptr);
              Peer::index(b).insert(OrderId{99}, nullptr);
@@ -1493,6 +1628,8 @@ TEST_CASE("optimized: checkInvariants detects every kind of internal corruption"
              bids.front().key = 0;
          }},
         // 不属于对象池的指针（内容是真实对象的拷贝，但 checkInvariants 不能信任它）
+        // A pointer that does not belong to the object pool (its contents are a copy of a real object, but
+        // checkInvariants must not trust it)
         {"foreign order", "does not come from the order pool", [](OptBook& b) {
              auto* level = Peer::sides(b)[1].back().level;
              static auto fake = *level->head;
@@ -1521,15 +1658,19 @@ TEST_CASE("optimized: checkInvariants detects every kind of internal corruption"
             ::hft_test::reportFailure(__FILE__, __LINE__, std::string("corruption '") + c.name +
                                                               "' not reported as expected; why = '" + why + "'");
         // 被破坏的簿只析构（Order/Level 平凡析构，对象池直接释放内存），不再调用任何修改接口
+        // A corrupted book is only destroyed (Order/Level are trivially destructible and the object pools free the
+        // memory directly); no modifying call is made on it anymore
     }
 }
 
 // ============================================================================
 // 与参考模型逐条比对的定向场景
+// Targeted scenarios compared event by event against the reference model
 // ============================================================================
 namespace {
 
 // 同一命令同时执行在参考模型与优化引擎上：事件必须完全相同
+// Runs each command on both the reference model and the optimized engine: the events must be identical
 struct DualBook {
     Stepper<RefBook> ref;
     Stepper<OptBook> opt;
@@ -1567,6 +1708,7 @@ struct DualBook {
 #define DUAL_VERIFY(d) (d).verify(__FILE__, __LINE__)
 
 // 确定性的 Fisher-Yates 洗牌（只用 mt19937_64 原始输出）
+// Deterministic Fisher-Yates shuffle (uses only raw mt19937_64 output)
 template <class T>
 void shuffleInPlace(std::vector<T>& v, std::mt19937_64& rng) {
     for (std::size_t i = v.size(); i > 1; --i) std::swap(v[i - 1], v[rng() % i]);
@@ -1577,6 +1719,10 @@ void shuffleInPlace(std::vector<T>& v, std::mt19937_64& rng) {
 TEST_CASE("optimized: long FIFO queues and deep books match the reference") {
     // 两个实现的事件逐条相同、DUAL_VERIFY 校验两边不变量与完整状态相同：以下断言对两者同时成立。
     // 同一价位 3000 个订单（账户轮换），市价单吃掉前 2000 个再加 1 手；优化引擎的小预留量同时覆盖扩容路径
+    // The two implementations' events match one by one, and DUAL_VERIFY checks that both sides' invariants
+    // hold and their full states are equal: the assertions below hold for both.
+    // 3000 orders at one price (rotating accounts); a market order takes the first 2000 plus 1 lot; the
+    // optimized engine's small reservation also covers the growth path
     DualBook d(0, 16);
     for (OrderId id = 1; id <= 3000; ++id)
         DUAL_RUN(d, Command::newOrder(sell(id, 500, 2).account(static_cast<AccountId>(1 + id % 3))));
@@ -1585,6 +1731,7 @@ TEST_CASE("optimized: long FIFO queues and deep books match the reference") {
     CHECK_LEVELS(d.ref.book.depth(Side::Sell), {500, 6000, 3000});
     const std::vector<Event> ev = DUAL_RUN(d, Command::newOrder(marketBuy(9000, 4001).account(9)));
     // Accepted + 2000 笔完整成交 + 1 笔部分成交；市价单全部成交，没有撤单
+    // Accepted + 2000 full fills + 1 partial fill; the market order is completely filled, with no cancel
     REQUIRE_EQ(ev.size(), 2002u);
     bool fifo = true;
     for (std::size_t i = 1; i < ev.size(); ++i) {
@@ -1597,12 +1744,16 @@ TEST_CASE("optimized: long FIFO queues and deep books match the reference") {
     CHECK_EQ(d.opt.book.orderCount(), 1000u);
     CHECK_LEVELS(d.opt.book.depth(Side::Sell), {500, 1999, 1000});
     // 先把临时 vector 存下来：CHECK_EQ 内部用 const auto& 绑定，取临时对象成员的引用会悬空
+    // Store the temporary vector first: CHECK_EQ binds with const auto& internally, so a reference to a
+    // member of a temporary would dangle
     const std::vector<OrderInfo> queue = d.ref.book.ordersAt(Side::Sell, 500);
     REQUIRE_EQ(queue.size(), 1000u);
     CHECK_EQ(queue.front().id, 2001u);
     CHECK_EQ(queue.back().id, 3000u);
     DUAL_VERIFY(d);
     // 2000 个价位的深簿（新簿）：一张卖单从 2000 扫到 1，剩余量挂在 1
+    // A deep book with 2000 levels (a new book): one sell order sweeps from 2000 down to 1, and its remainder
+    // rests at 1
     DualBook e(0, 16);
     for (OrderId id = 1; id <= 2000; ++id) DUAL_RUN(e, Command::newOrder(buy(id, static_cast<Price>(id), 1)));
     DUAL_VERIFY(e);
@@ -1623,6 +1774,8 @@ TEST_CASE("optimized: long FIFO queues and deep books match the reference") {
 
 TEST_CASE("optimized: deep books built in random price order match the reference") {
     // 价位远超线性探测范围、乱序插入：覆盖二分查找与数组中间的插入/删除
+    // Far more levels than the linear probe range, inserted in random order: covers binary search and
+    // insertion/removal in the middle of the array
     DualBook d(0, 64);
     std::mt19937_64 rng(4242);
     std::vector<Command> adds;
@@ -1645,6 +1798,8 @@ TEST_CASE("optimized: deep books built in random price order match the reference
     CHECK_EQ(d.opt.book.levelCount(Side::Buy), 1500u);
     CHECK_EQ(d.opt.book.levelCount(Side::Sell), 1500u);
     // 乱序撤掉一半、乱序改价一部分（远距离改价：删除深处价位 + 在别处新建价位）
+    // Cancel half in random order and reprice some in random order (long-distance reprices: remove a deep
+    // level + create a new level elsewhere)
     std::vector<OrderId> ids;
     for (OrderId id = 1; id < next_id; ++id) ids.push_back(id);
     shuffleInPlace(ids, rng);
@@ -1661,6 +1816,8 @@ TEST_CASE("optimized: deep books built in random price order match the reference
     }
     DUAL_VERIFY(d);
     // 两次深扫：市价卖单吃掉大半买盘，限价买单穿过一段卖盘后挂单
+    // Two deep sweeps: a market sell takes most of the bids, and a limit buy crosses part of the asks and then
+    // rests
     DUAL_RUN(d, Command::newOrder(marketSell(900'001, 2'500).account(7)));
     DUAL_RUN(d, Command::newOrder(buy(900'002, 24'000, 3'000).account(7)));
     DUAL_VERIFY(d);
@@ -1674,21 +1831,27 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
     DualBook d(0, 8);
     DUAL_RUN(d, Command::newOrder(sell(1, 100, kHalf).account(1)));
     DUAL_RUN(d, Command::newOrder(sell(2, 100, kHalf).account(2)));  // 档位总量 = INT64_MAX - 1
+                                                                     // level total = INT64_MAX - 1
     CHECK_LEVELS(d.opt.book.depth(Side::Sell), {100, kMax - 1, 2});
     // FOK 需要 INT64_MAX，只有 INT64_MAX - 1：预检做减法，不溢出，整单撤销
+    // The FOK needs INT64_MAX but only INT64_MAX - 1 is available: the pre-check subtracts, does not
+    // overflow, and cancels the whole order
     const OrderRequest f1 = buy(3, 100, kMax).fok().account(3);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f1)), accepted(f1), cancelled(3, kMax, CancelReason::FokUnfillable));
     const OrderRequest f2 = buy(4, kTop, kMax).fok().account(3).stp(StpMode::CancelMaker);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f2)), accepted(f2), cancelled(4, kMax, CancelReason::FokUnfillable));
     // CancelMaker 跳过本账户的一半，另一半正好够
+    // CancelMaker skips the half from its own account, and the other half is exactly enough
     const OrderRequest f3 = buy(5, 100, kHalf).fok().account(1).stp(StpMode::CancelMaker);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(f3)), accepted(f3),
                  cancelled(1, kHalf, CancelReason::SelfTradePrevention),
                  trade(1, 2, 5, 2, 1, Side::Buy, 100, kHalf, 0, 0));
     DUAL_VERIFY(d);
     // 价格为 INT64_MAX 的卖单与限价 INT64_MAX 的买单
+    // A sell order priced at INT64_MAX and a buy order with limit price INT64_MAX
     DUAL_RUN(d, Command::newOrder(sell(6, kTop, 7).account(1)));
     DUAL_VERIFY(d);  // 卖盘最差价为 INT64_MAX 时的完整查询一致性检查
+                     // full query consistency check while the worst ask is INT64_MAX
     DUAL_RUN(d, Command::newOrder(sell(7, kTop - 1, 5).account(1)));
     DUAL_VERIFY(d);
     const OrderRequest i1 = buy(8, kTop, kMax).ioc().account(2);
@@ -1697,11 +1860,14 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
                  trade(3, 6, 8, 1, 2, Side::Buy, kTop, 7, 0, kMax - 12),
                  cancelled(8, kMax - 12, CancelReason::IocRemainder));
     // 巨量买单挂在价格 1；巨量市价卖单几乎吃光它
+    // A huge buy order rests at price 1; a huge market sell almost consumes it
     DUAL_RUN(d, Command::newOrder(buy(9, 1, kMax).account(1)));
     const OrderRequest m1 = marketSell(10, kMax - 1).account(2);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(m1)), accepted(m1),
                  trade(4, 9, 10, 1, 2, Side::Sell, 1, kMax - 1, 1, 0));
     // 改到最高价、最大数量（失去优先级、重新挂单），再被一张价格为 1 的卖单成交
+    // Modified to the highest price and the maximum quantity (losing priority and resting again), then
+    // filled by a sell order priced at 1
     CHECK_EVENTS(DUAL_RUN(d, Command::modify(9, kTop - 1, kMax)), modified(9, kTop - 1, kMax));
     CHECK_TOP(d.opt.book, kTop - 1, std::nullopt);
     const OrderRequest s1 = sell(11, 1, 5).fok().account(2);
@@ -1713,6 +1879,7 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
     DUAL_VERIFY(d);
     CHECK_EQ(d.opt.book.orderCount(), 0u);
     // 查询任意（包括极端负数）价格不会溢出
+    // Querying any price (including extreme negative ones) does not overflow
     CHECK_EQ(d.opt.book.volumeAt(Side::Sell, INT64_MIN), 0);
     CHECK(d.opt.book.ordersAt(Side::Sell, INT64_MIN).empty());
     CHECK_EQ(d.opt.book.volumeAt(Side::Buy, 0), 0);
@@ -1724,6 +1891,8 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
     using RR = RejectReason;
     {
         // 两张 2^62 的卖单：第二张被拒；之后不启用 STP（整档快速路径）与启用 STP（逐单遍历）的 FOK 都成交
+        // Two sell orders of 2^62: the second is rejected; afterwards a FOK without STP (whole-level fast path)
+        // and one with STP (order-by-order walk) both fill
         DualBook d(0, 8);
         const OrderRequest a1 = sell(1, 100, kP62).account(1);
         CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(a1)), accepted(a1));
@@ -1737,6 +1906,8 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
     }
     {
         // 三张 INT64_MAX 的卖单挂同一价位：后两张被拒；要 INT64_MAX 的 FOK 吃掉第一张
+        // Three sell orders of INT64_MAX at the same price: the last two are rejected; a FOK for INT64_MAX
+        // takes the first one
         DualBook d(0, 8);
         const OrderRequest a1 = sell(1, 100, kMax).account(1);
         CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(a1)), accepted(a1));
@@ -1751,6 +1922,8 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
     }
     {
         // 改单路径：1 手的卖单同价加量到 2^62 被拒，订单原样保留（含队列位置）；加到 2^62 - 1 恰好到上限
+        // Modify path: increasing a 1-lot sell order at the same price to 2^62 is rejected and the order is kept
+        // as is (including its queue position); increasing it to 2^62 - 1 reaches the bound exactly
         DualBook d(0, 8);
         DUAL_RUN(d, Command::newOrder(sell(1, 100, kP62).account(1)));
         DUAL_RUN(d, Command::newOrder(sell(2, 100, 1).account(2)));
@@ -1776,6 +1949,8 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
 
 TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {
     // 规范之外的输入（只能经强制类型转换构造）：优化引擎按 InvalidFlags 拒单，不越界、不崩溃
+    // Inputs outside the spec (constructible only through casts): the optimized engine rejects them as
+    // InvalidFlags, with no out-of-bounds access and no crash
     Stepper<OptBook> s(0, 16);
     s.book.submit(sell(1, 101, 5));
     s.book.submit(buy(2, 99, 5));
@@ -1799,6 +1974,7 @@ TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {
     CHECK_EVENTS(s.run(Command::newOrder(bad_tif)), rejectedNew(10, RejectReason::InvalidFlags));
     CHECK_EVENTS(s.run(Command::newOrder(bad_stp)), rejectedNew(10, RejectReason::InvalidFlags));
     // 规范中排在前面的规则仍然优先
+    // Rules that come earlier in the spec still take precedence
     CHECK_EVENTS(s.run(Command::newOrder(bad_side_zero_qty)), rejectedNew(10, RejectReason::InvalidQuantity));
     CHECK_EVENTS(s.run(Command::newOrder(bad_stp_zero_px)), rejectedNew(10, RejectReason::InvalidPrice));
     CHECK_UNCHANGED(before, s.book);
@@ -1809,6 +1985,7 @@ TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {
 namespace {
 
 // 下一次 onAccepted / onModified 记录事件后抛异常的监听器
+// A listener that throws after recording the event on the next onAccepted / onModified
 struct ThrowingListener : RecordingListener {
     bool throw_on_accepted = false;
     bool throw_on_modified = false;
@@ -1826,6 +2003,8 @@ struct ThrowingListener : RecordingListener {
 
 TEST_CASE("optimized: a listener exception aborts the command and leaves the book consistent") {
     // 不穿价的新单与改单在回调期间持有索引中的占位条目：回调抛异常时占位必须撤销，id 随即可以再用
+    // Non-crossing new orders and modifies hold a placeholder entry in the index during the callback: when the
+    // callback throws, the placeholder must be removed, and the id can be reused right away
     ThrowingListener l;
     LimitOrderBook<ThrowingListener> book(l, 0, 16);
     book.submit(sell(1, 105, 5));
@@ -1839,6 +2018,8 @@ TEST_CASE("optimized: a listener exception aborts the command and leaves the boo
     book.submit(buy(2, 100, 3));
     CHECK_EVENTS(l.take(), accepted(buy(2, 100, 3)));
     // 改价：onModified 发出时订单已离开订单簿，命令中止后它不再挂单
+    // Reprice: when onModified is emitted the order has already left the order book, so after the command
+    // aborts it no longer rests
     l.throw_on_modified = true;
     CHECK_THROWS(book.modify(2, 101, 3));
     CHECK(book.checkInvariants(&why));
@@ -1864,6 +2045,7 @@ TEST_CASE("optimized: zero reservation and growth from empty are fine") {
 
 // ============================================================================
 // 多交易对撮合引擎（matching/matching_engine.h）
+// Multi-symbol matching engine (matching/matching_engine.h)
 // ============================================================================
 namespace {
 
@@ -1929,6 +2111,7 @@ TEST_CASE("engine: addSymbol assigns sequential ids and exposes names and books"
     CHECK_EQ(engine.book(eth).maxOrders(), 10u);
     CHECK_EQ(engine.book(btc).maxOrders(), 0u);
     // 名称重复：抛异常且引擎不变
+    // Duplicate name: throws and leaves the engine unchanged
     CHECK_THROWS(engine.addSymbol("ETH-USDT"));
     CHECK_EQ(engine.symbolCount(), 3u);
     CHECK(engine.findSymbol("ETH-USDT") == std::optional<SymbolId>(eth));
@@ -1944,6 +2127,7 @@ TEST_CASE("engine: commands are routed to each symbol's own independent book") {
     const SymbolId a = engine.addSymbol("A");
     const SymbolId b = engine.addSymbol("B", 1);
     // 同一个订单 id 可以同时活在两个交易对里
+    // The same order id can be live in two symbols at once
     const OrderRequest a1 = sell(1, 101, 5).account(1);
     const OrderRequest b1 = sell(1, 201, 3).account(1);
     engine.submit(a, a1);
@@ -1952,6 +2136,8 @@ TEST_CASE("engine: commands are routed to each symbol's own independent book") {
     CHECK_ORDER(engine.book(a), 1, infoOf(a1));
     CHECK_ORDER(engine.book(b), 1, infoOf(b1));
     // 成交 id 按交易对各自从 1 开始（B 已满 1 单：GTC 会被容量规则拒绝，所以用 IOC 吃单）
+    // Trade ids start at 1 separately for each symbol (B is full with 1 order: a GTC would be rejected by the
+    // capacity rule, so an IOC order is the taker)
     const OrderRequest bt = buy(2, 201, 1).ioc().account(2);
     engine.submit(b, bt);
     CHECK_SYMBOL_EVENTS(rec.take(), {b, accepted(bt)}, {b, trade(1, 1, 2, 1, 2, Side::Buy, 201, 1, 2, 0)});
@@ -1961,12 +2147,15 @@ TEST_CASE("engine: commands are routed to each symbol's own independent book") {
     CHECK_EQ(engine.book(a).lastTradeId(), 1u);
     CHECK_EQ(engine.book(b).lastTradeId(), 1u);
     // 每个交易对自己的容量上限
+    // Each symbol's own capacity limit
     const OrderRequest b4 = buy(4, 100, 1).account(3);  // 不穿价（A 的卖一为 101）
+                                                        // does not cross (A's best ask is 101)
     engine.submit(b, b4);
     CHECK_SYMBOL_EVENTS(rec.take(), {b, rejectedNew(4, RejectReason::CapacityExceeded)});
     engine.submit(a, b4);
     CHECK_SYMBOL_EVENTS(rec.take(), {a, accepted(b4)});
     // 撤单与改单只作用于指定交易对
+    // Cancels and modifies apply only to the given symbol
     engine.modify(a, 1, 102, 4);
     CHECK_SYMBOL_EVENTS(rec.take(), {a, modified(1, 102, 4)});
     engine.cancel(b, 1);
@@ -1997,6 +2186,7 @@ TEST_CASE("engine: unknown symbols are rejected with UnknownSymbol and nothing e
         engine.modify(bad, 1, 100, 1);
         CHECK_SYMBOL_EVENTS(rec.take(), {bad, rejectedModify(1, RejectReason::UnknownSymbol)});
         // 未知交易对的检查先于一切订单校验
+        // The unknown-symbol check comes before all order validation
         engine.submit(bad, buy(9, 0, 0));
         CHECK_SYMBOL_EVENTS(rec.take(), {bad, rejectedNew(9, RejectReason::UnknownSymbol)});
     }
@@ -2017,6 +2207,7 @@ TEST_CASE("engine/differential: a multi-symbol engine matches independent refere
     };
     std::vector<std::unique_ptr<Lane>> lanes;
     const std::size_t picks[] = {0, 2, 6, 8};  // balanced、STP 密集、容量受限、极小预留量
+                                               // balanced, STP heavy, capacity limited, tiny reservation
     for (std::size_t k = 0; k < 4; ++k) {
         const DiffProfile& p = profiles[picks[k]];
         const SymbolId id = engine.addSymbol(p.name, p.max_orders, p.reserve_orders);
@@ -2024,6 +2215,7 @@ TEST_CASE("engine/differential: a multi-symbol engine matches independent refere
         lanes.push_back(std::make_unique<Lane>(&p, 600 + k));
     }
     RandomCommandGenerator stray(699);  // 发往未知交易对的命令
+                                        // commands sent to unknown symbols
     Mutator pick(700);
     std::size_t unknown = 0;
     for (std::size_t i = 0; i < 160'000; ++i) {

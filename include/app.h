@@ -2,6 +2,10 @@
 // app.h
 // 监控程序主体：命令行解析，按配置创建行情源与套利检测器，事件驱动主循环（排空快照队列 → 更新本地簿 → 套利检测 →
 // 定时健康检查 / 渲染 / 价差日志），停止后输出最终报告。src/main.cpp 只负责信号处理并调用这里（测试直接驱动本类）。
+// Monitor core: command-line parsing, creating the feeds and the arbitrage detector from the config, the
+// event-driven main loop (drain the snapshot queues → update the local books → arbitrage detection →
+// periodic health checks / rendering / spread logging), and the final report after stopping.
+// src/main.cpp only handles signals and calls into this (tests drive this class directly).
 //
 
 #pragma once
@@ -45,18 +49,27 @@
 
 // ---------------------------------------------------------------------------
 // 命令行
+// Command line
 // ---------------------------------------------------------------------------
 
 struct CliOptions {
     std::string config_path = "config.json";  // --config <path>（相对当前目录）
+                                              // --config <path> (relative to the current directory)
     bool config_given = false;                // 显式给出了 --config：文件必须能读取并解析（见 main.cpp）
+                                              // --config given explicitly: the file must be readable
+                                              // and parseable (see main.cpp)
     bool headless = false;                    // --headless：不渲染终端界面，每秒一行状态
+                                              // --headless: no terminal UI rendering, one status line per second
     double duration_s = 0.0;                  // --duration <seconds>：> 0 时到时自动停止；0 = 直到收到信号
+                                              // --duration <seconds>: if > 0, stop automatically when
+                                              // it elapses; 0 = until a signal is received
     bool busy_poll = false;                   // --busy-poll：主循环空闲时忙等（见 RunOptions::busy_poll）
+                                              // --busy-poll: main loop busy-waits when idle (see RunOptions::busy_poll)
     bool help = false;                        // --help / -h
 };
 
 // 用法说明（英文，--help 与参数错误时输出）
+// Usage text (in English, printed for --help and on argument errors)
 inline std::string usageText(const std::string& program) {
     const std::string prog = program.empty() ? std::string("crypto_hft_engine") : program;
     return std::string(kAppVersion) +
@@ -82,6 +95,7 @@ inline std::string usageText(const std::string& program) {
 namespace app_detail {
 
 // 秒数：有限的正数，上限 1e9 秒（换算成纳秒不会溢出）
+// Seconds: a finite positive number, at most 1e9 seconds (converting to nanoseconds cannot overflow)
 inline bool parseSeconds(const std::string& text, double& out) {
     const char* begin = text.c_str();
     char* end = nullptr;
@@ -96,6 +110,9 @@ inline bool parseSeconds(const std::string& text, double& out) {
 
 // 解析命令行；失败时返回 false 并在 error 中说明。选项可重复（后者覆盖前者），不接受位置参数。
 // 带值的选项写作 "--name value" 或 "--name=value"；开关选项不接受 "=value"。
+// Parses the command line; on failure returns false and explains why in error. Options may be repeated
+// (a later one overrides an earlier one); positional arguments are not accepted.
+// Options with a value are written "--name value" or "--name=value"; flag options do not accept "=value".
 inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out, std::string& error) {
     CliOptions opt;
     for (int i = 1; i < argc; ++i) {
@@ -103,6 +120,7 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
         const std::size_t eq = arg.rfind("--", 0) == 0 ? arg.find('=') : std::string::npos;
         const std::string name = arg.substr(0, eq);
         // 选项的值：'=' 之后的部分，或者下一个参数；缺失或为空时返回 false
+        // The option's value: the part after '=', or the next argument; returns false when missing or empty
         auto value = [&](std::string& v) {
             if (eq != std::string::npos) {
                 v = arg.substr(eq + 1);
@@ -145,6 +163,7 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
 
 // ---------------------------------------------------------------------------
 // 主循环的唤醒信号
+// Wake-up signal for the main loop
 // ---------------------------------------------------------------------------
 
 // 多个生产者（feed 线程：快照入队之后 notify()）、一个消费者（主线程：没有数据时 waitUntil()）。
@@ -156,9 +175,27 @@ inline bool parseCommandLine(int argc, const char* const* argv, CliOptions& out,
 // pending_ 在互斥锁内设置与检查：notify 落在"复查之后、开始等待之前"同样不会丢。
 // 消费者不在睡眠时（正在处理数据），notify() 只有一个栅栏与一次原子读：不加锁、不做系统调用。
 // 多余的唤醒（生产者读到的是消费者刚要清除的 true）无害：消费者多醒一次，排空后再等待。
+// Multiple producers (feed threads: notify() after enqueuing a snapshot), one consumer (the main thread:
+// waitUntil() when there is no data).
+// Dekker-style handshake that never loses a wake-up:
+// - Consumer: sleeping_ = true → seq_cst fence → check all queues once more (ready()) → wait on the
+//   condition variable only if they really are empty;
+// - Producer: enqueue the element (release store of the write index) → seq_cst fence → read sleeping_;
+//   only if it is true, take the lock, set pending_ and notify.
+// The two fences are always ordered in the seq_cst total order S: if the consumer's comes first, the
+// producer reads sleeping_ == true (or a newer value); if the producer's comes first, the consumer's
+// re-check reads the new write index ([atomics.order]: A before fence X, fence Y before B, X before Y in
+// S → B sees A or a newer value).
+// pending_ is set and checked under the mutex: a notify that lands "after the re-check, before the wait
+// starts" is not lost either.
+// While the consumer is not sleeping (it is processing data), notify() is only one fence and one atomic
+// load: no lock, no system call.
+// An extra wake-up (the producer read a true that the consumer is about to clear) is harmless: the
+// consumer wakes once more, drains, and waits again.
 class WakeSignal {
 public:
     // 生产者（任意线程）：新元素已经入队之后调用
+    // Producer (any thread): call after the new element has been enqueued
     void notify() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (!sleeping_.load(std::memory_order_relaxed)) return;
@@ -171,6 +208,9 @@ public:
 
     // 消费者（只能有一个线程）：ready() 在宣布睡眠之后复查是否已有数据；没有就等到 notify() 或 deadline_ns
     // （hft::nowNs() 的时钟，即 steady_clock）。返回 true = 复查时已有数据或被唤醒，false = 到期。
+    // Consumer (one thread only): ready() re-checks for data after the sleep is announced; if there is none,
+    // waits until notify() or deadline_ns (the hft::nowNs() clock, i.e. steady_clock). Returns true = data
+    // found on the re-check or woken, false = deadline reached.
     template <class Ready>
     bool waitUntil(Ready&& ready, std::int64_t deadline_ns) {
         sleeping_.store(true, std::memory_order_relaxed);
@@ -192,32 +232,56 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     bool pending_ = false;  // 受 mutex_ 保护
+                            // guarded by mutex_
 };
 
 // ---------------------------------------------------------------------------
 // 监控程序
+// Monitor
 // ---------------------------------------------------------------------------
 
 // 终端界面的光标状态（与信号处理函数共享，见 RunOptions::cursor_state）
+// Cursor state of the terminal UI (shared with the signal handler, see RunOptions::cursor_state)
 enum class CursorState : int {
     Visible = 0,    // 光标显示着：终端界面未运行，或显示序列已经写完
+                    // cursor shown: the terminal UI is not running, or the show sequence has been written
     Hidden = 1,     // 终端界面运行中：写隐藏序列之前就进入此状态
+                    // terminal UI running: entered before the hide sequence is written
     Restoring = 2,  // 正在写显示序列：写完（并 fflush）之后才回到 Visible
+                    // writing the show sequence: back to Visible only after the write (and fflush) finishes
 };
 
 // 运行参数（测试可替换输出流）
+// Run options (tests can replace the output stream)
 struct RunOptions {
     bool headless = false;
     double duration_s = 0.0;      // > 0：运行这么久后自动停止
+                                  // > 0: stop automatically after running this long
     std::FILE* out = stdout;      // 画面 / 状态行 / 最终报告的输出（headless 时日志行也回显到这里）
+                                  // output for frames / status lines / the final report
+                                  // (in headless mode log lines are echoed here too)
     bool color = true;            // 终端界面与最终报告的 ANSI 颜色（main 在设置了 NO_COLOR 时关闭；headless 总是无色）
+                                  // ANSI colors of the terminal UI and the final report
+                                  // (main turns them off when NO_COLOR is set; headless never uses color)
     bool busy_poll = false;       // --busy-poll：没有数据时用 hft::cpuRelax() 自旋检查队列，而不是等待唤醒
+                                  // --busy-poll: with no data, spin checking the queues with hft::cpuRelax()
+                                  // instead of waiting for a wake-up
     // 与信号处理函数共享的状态（main 指向自己的全局原子量；为空则不使用）。处理函数在主线程上运行，
     // 只需保证这里的读写不与前后的输出重排（seq_cst）：
     // - cursor_state：见 CursorState。处理函数在停止进程（SIGTSTP）或强制退出之前，只要状态不是 Visible 就写
     //   显示序列（Restoring 时显示序列可能还没写出去，例如输出被 Ctrl+S 阻塞；多写一次无害）；SIGCONT 之后只在
     //   Hidden 时重新隐藏光标（Restoring 时不能再隐藏，否则会盖掉随后写出的显示序列）。
     // - redraw：处理函数（SIGCONT 之后）置位；下一帧渲染时取走，清屏后整屏重画。
+    // State shared with the signal handler (main points these at its own global atomics; null = unused).
+    // The handler runs on the main thread, so the loads and stores here only need to stay ordered with the
+    // output before and after them (seq_cst):
+    // - cursor_state: see CursorState. Before stopping the process (SIGTSTP) or force-exiting, the handler
+    //   writes the show sequence whenever the state is not Visible (in Restoring the show sequence may not
+    //   have gone out yet, e.g. when output is blocked by Ctrl+S; writing it once more is harmless); after
+    //   SIGCONT it re-hides the cursor only in Hidden (in Restoring it must not hide it again, or it would
+    //   override the show sequence written afterwards).
+    // - redraw: set by the handler (after SIGCONT); taken by the next frame render, which clears the screen
+    //   and redraws it in full.
     std::atomic<CursorState>* cursor_state = nullptr;
     std::atomic<bool>* redraw = nullptr;
 };
@@ -247,17 +311,59 @@ struct RunOptions {
 //   feed 线程里阻塞的系统调用不会被打断。
 // - feed 的日志回调写入线程安全的 Logger；FeedConfig::log_to_stderr 总是关闭（终端模式下 stderr 会破坏画面，
 //   headless 模式由 Logger 把同样的行回显到 out）。
+// Monitor:
+// - One MarketDataFeed + thread per enabled venue (id = index among the enabled venues, in the fixed order
+//   Binance, OKX, Bybit); for each venue the main thread holds a local OrderBook (label "<name>:<symbol>")
+//   and a set of queue latency statistics.
+// - Event loop (main thread only):
+//   1) Drain each feed's SPSC queue (at most kMaxDrainPerVenue per feed per round, so that a single feed
+//      cannot starve the other work): record the queue latency nowNs() - publish_ns, copy the snapshot
+//      straight from the queue slot into the local book, then immediately check every ordered venue pair
+//      involving that venue (event-driven: every book update is checked) and log new signals. The empty
+//      book a feed publishes on disconnect turns the affected pairs into "no data"; in addition, only
+//      venues whose feed status is LIVE take part in detection and spread logging, so a stale book
+//      produces no signal even if the empty book arrives late (see participates).
+//   2) One tick every refresh_ms: call checkHealth(nowNs()) on every feed (stall / connect-timeout
+//      recovery depends on it), render a frame in terminal mode, log the spreads of all ordered venue
+//      pairs every spread_log_interval ticks (headless mode does not render but counts ticks the same
+//      way, so the rate is the same), and flush the log. A late tick is not made up (the next one is
+//      counted from the current time).
+//   3) Headless mode prints one status line per second.
+//   4) When this round processed no snapshot, wait (by default) on WakeSignal: after each snapshot it
+//      enqueues, a feed calls notify() through the publish callback and the main thread wakes at once;
+//      otherwise it waits until the next timed task (tick / headless status line / duration) is due, at
+//      most kMaxIdleWaitNs. Signal handlers and test threads only set the stop flag and cannot wake the
+//      wait, so stop is noticed at most kMaxIdleWaitNs later.
+//      When idle it wakes only about 1000 / min(refresh_ms, 50) times per second, with CPU usage close
+//      to 0; with data, a snapshot's queue latency is mostly one thread wake-up (measured on a 4 vCPU KVM
+//      VM: p50 about 0.1 ms, p99 about 0.2-0.4 ms, depending on the kernel and the virtualization).
+//      --busy-poll (RunOptions::busy_poll): instead spin checking the queues with hft::cpuRelax(), never
+//      sleeping and needing no publish callback: queue latency drops to the microsecond level, at the
+//      cost of the main thread keeping one core fully busy (suits exclusive, CPU-pinned deployments).
+// - Stop: the stop flag (signal) or the duration elapsing → call stop() on all feeds (kicks blocked
+//   reads/writes / handshakes / backoff waits) and join them, then print the final report (stdout and
+//   the log).
+// - Feed threads are created with SIGINT/SIGTERM/SIGHUP/SIGTSTP/SIGCONT blocked: these signals are only
+//   delivered to the main thread, and blocking system calls in the feed threads are not interrupted.
+// - The feeds' log callback writes to the thread-safe Logger; FeedConfig::log_to_stderr is always off
+//   (in terminal mode stderr would corrupt the screen, and in headless mode the Logger echoes the same
+//   lines to out).
 class MonitorApp {
 public:
     static constexpr std::int64_t kMaxIdleWaitNs = 50000000;  // 空闲等待的上限（stop 标志最迟这么久之后被发现）
+                                                              // upper bound of an idle wait (the stop flag is
+                                                              // noticed at most this much later)
     static constexpr std::size_t kMaxDrainPerVenue = 256;
     static constexpr std::int64_t kStatusIntervalNs = 1000000000;  // headless 状态行间隔
+                                                                   // headless status line interval
 
     MonitorApp(const AppConfig& cfg, Logger& logger, RunOptions opt)
         : cfg_(cfg),
           logger_(logger),
           opt_(opt),
           enabled_(cfg_.enabledVenues()),  // 指向成员 cfg_ 的 venues（cfg_ 先初始化，之后不再修改）
+                                           // points into the venues of member cfg_ (cfg_ is initialized
+                                           // first and not modified afterwards)
           detector_(feeRates(cfg_, enabled_), cfg_.arbitrage.min_profit, cfg_.arbitrage.max_qty,
                     cfg_.arbitrage.max_levels) {
         if (opt_.out == nullptr) opt_.out = stdout;
@@ -273,6 +379,8 @@ public:
     }
 
     // 正常情况下 run() 已经停止 feed 并恢复光标；run() 因异常退出时由析构函数补做
+    // Normally run() has already stopped the feeds and restored the cursor; if run() exits through an
+    // exception, the destructor does it instead
     ~MonitorApp() {
         stopFeeds();
         restoreCursor();
@@ -282,6 +390,7 @@ public:
     MonitorApp& operator=(const MonitorApp&) = delete;
 
     // 一个已启用交易所的 FeedConfig（venue_id = 它在已启用交易所中的下标）
+    // FeedConfig for one enabled venue (venue_id = its index among the enabled venues)
     static FeedConfig feedConfigFor(const AppConfig& cfg, const VenueConfig& v, std::uint32_t venue_id) {
         FeedConfig f;
         f.exchange = v.exchange;
@@ -307,6 +416,9 @@ public:
 
     // 运行直到 stop 为 true 或 duration 到期；返回进程退出码（0 = 正常结束，1 = 没有启用的交易所 / 无法启动）。
     // 只能调用一次。
+    // Runs until stop is true or the duration elapses; returns the process exit code (0 = normal end,
+    // 1 = no venue enabled / cannot start).
+    // Can be called only once.
     int run(const std::atomic<bool>& stop) {
         if (feeds_.empty()) {
             const std::string msg = "No venue is enabled in the configuration, nothing to monitor";
@@ -323,6 +435,7 @@ public:
         start_ns_ = hft::nowNs();
         if (!opt_.headless) {
             setCursorState(CursorState::Hidden);  // 先改状态再隐藏（见 RunOptions::cursor_state）
+                                                  // change the state first, then hide (see RunOptions::cursor_state)
             cursor_hidden_ = true;
             writeOut(Display::kHideCursor);
         }
@@ -332,6 +445,7 @@ public:
     }
 
     // ---------------- 访问器（主线程 / 测试；run() 返回后读取）----------------
+    // ---------------- Accessors (main thread / tests; read after run() returns) ----------------
 
     std::size_t venueCount() const noexcept { return feeds_.size(); }
     const VenueConfig& venueConfig(std::size_t i) const { return *enabled_.at(i); }
@@ -344,6 +458,7 @@ public:
     std::uint64_t renders() const noexcept { return renders_; }
 
     // 当前各交易所的展示数据（指针指向本对象内部，有效期与本对象相同）
+    // Current display data of each venue (the pointers point into this object and share its lifetime)
     std::vector<VenueView> collectViews() const {
         std::vector<VenueView> views;
         views.reserve(feeds_.size());
@@ -355,6 +470,7 @@ public:
             v.status = f.status();
             v.stats = f.stats();
             // lastError() 在恢复之后仍保留：只在非 LIVE 时展示
+            // lastError() is kept after recovery: show it only when not LIVE
             if (v.status != FeedStatus::Live) v.last_error = f.lastError();
             v.processing = &f.getLatencyTracker();
             v.exchange = &f.getExchangeLatency();
@@ -378,12 +494,15 @@ private:
     }
 
     // 周期任务的下一次时刻：落后时不补跑，从当前时刻重新起算
+    // Next time of a periodic task: when behind, missed runs are not made up and timing restarts from now
     static std::int64_t nextDeadline(std::int64_t previous, std::int64_t period, std::int64_t now) noexcept {
         const std::int64_t next = previous + period;
         return next > now ? next : now + period;
     }
 
     // 事件循环（见类注释）：运行到 stop 为 true 或 duration 到期，返回结束原因
+    // Event loop (see the class comment): runs until stop is true or the duration elapses; returns the
+    // reason it ended
     const char* eventLoop(const std::atomic<bool>& stop) {
         const std::int64_t refresh_ns = static_cast<std::int64_t>(std::max(1, cfg_.display.refresh_ms)) * 1000000;
         const std::int64_t deadline = opt_.duration_s > 0.0
@@ -410,6 +529,8 @@ private:
                 continue;
             }
             // 没有数据：等到有 feed 发布快照，或下一个定时任务到期（最长 kMaxIdleWaitNs）
+            // No data: wait until a feed publishes a snapshot or the next timed task is due
+            // (at most kMaxIdleWaitNs)
             std::int64_t wake_at = std::min({next_tick, deadline, now + kMaxIdleWaitNs});
             if (opt_.headless) wake_at = std::min(wake_at, next_status);
             wake_.waitUntil([this] { return anyQueued(); }, wake_at);
@@ -418,6 +539,7 @@ private:
     }
 
     // 恢复光标，停止所有 feed 并报告进度（之后日志不再回显）
+    // Restore the cursor, stop all feeds and report progress (log lines are no longer echoed afterwards)
     void shutdown(const char* reason) {
         const double ran_s = static_cast<double>(hft::nowNs() - start_ns_) / 1e9;
         restoreCursor();
@@ -438,10 +560,14 @@ private:
     }
 
     // 终端模式结束（或异常退出）时显示光标并换行；不分配内存、不抛异常
+    // When terminal mode ends (or exits through an exception), show the cursor and write a newline;
+    // does not allocate memory or throw
     void restoreCursor() noexcept {
         if (!cursor_hidden_) return;
         cursor_hidden_ = false;
         setCursorState(CursorState::Restoring);  // 显示序列写完之后才是 Visible（见 RunOptions::cursor_state）
+                                                 // Visible only after the show sequence is written
+                                                 // (see RunOptions::cursor_state)
         std::fwrite(Display::kShowCursor, 1, sizeof(Display::kShowCursor) - 1, opt_.out);
         std::fputc('\n', opt_.out);
         std::fflush(opt_.out);
@@ -453,12 +579,15 @@ private:
     }
 
     // 一行进度信息：写日志并输出到 out（headless 时日志行本来就回显到 out，不再重复输出）
+    // One progress line: log it and write it to out (in headless mode log lines are already echoed to out,
+    // so it is not written twice)
     void announce(const std::string& line) {
         if (!opt_.headless) writeOut(line + "\n");
         logger_.log(line);
     }
 
     // 终端尺寸（out 不是终端时为 0 = 不限制）
+    // Terminal size (0 = unlimited when out is not a terminal)
     TermSize terminalSize() const {
         TermSize t;
         const int fd = ::fileno(opt_.out);
@@ -505,6 +634,11 @@ private:
     // 启动 feed 线程。线程创建期间屏蔽 SIGINT/SIGTERM/SIGHUP/SIGTSTP/SIGCONT：新线程继承信号掩码，这些信号
     // 因此只由主线程处理（处理函数与主线程共享光标状态，见 RunOptions::cursor_state）。
     // 发布回调（必须在 run() 之前设置）：快照入队后唤醒等待中的主循环；忙等模式不需要。
+    // Starts the feed threads. SIGINT/SIGTERM/SIGHUP/SIGTSTP/SIGCONT are blocked while the threads are
+    // created: new threads inherit the signal mask, so these signals are handled only by the main thread
+    // (the handlers share the cursor state with the main thread, see RunOptions::cursor_state).
+    // Publish callback (must be set before run()): wakes the waiting main loop after a snapshot is enqueued;
+    // not needed in busy-wait mode.
     bool startFeeds() {
         for (auto& f : feeds_) {
             f->setLogCallback([this](const std::string& line) { logger_.logFeed(line); });
@@ -538,6 +672,7 @@ private:
     }
 
     // 停止所有 feed 并等待线程结束（可重复调用）
+    // Stop all feeds and wait for the threads to finish (may be called repeatedly)
     void stopFeeds() noexcept {
         for (auto& f : feeds_) f->stop();
         for (std::thread& t : threads_) {
@@ -547,6 +682,8 @@ private:
     }
 
     // 是否有队列非空（消费端操作，只在主线程调用；等待之前的复查）
+    // Whether any queue is non-empty (a consumer-side operation, called only on the main thread; the
+    // re-check before waiting)
     bool anyQueued() {
         for (auto& f : feeds_) {
             if (f->queue().front() != nullptr) return true;
@@ -555,6 +692,7 @@ private:
     }
 
     // 排空所有队列；返回本轮是否处理了快照
+    // Drain all queues; returns whether this round processed a snapshot
     bool drainQueues() {
         bool any = false;
         for (std::size_t v = 0; v < feeds_.size(); ++v) {
@@ -572,6 +710,10 @@ private:
 
     // 应用一个快照（直接读队列槽位，不额外复制），检测涉及该交易所的所有有序交易所对并记录新信号。
     // 不参与检测的交易所（见 participates）用空簿代替：该交易所对按"无数据"处理（不出信号，has_data = false）。
+    // Applies one snapshot (read directly from the queue slot, without an extra copy), checks every ordered
+    // venue pair involving that venue and logs new signals.
+    // A venue that does not take part in detection (see participates) is replaced by an empty book: such a
+    // pair is treated as "no data" (no signal, has_data = false).
     void applySnapshot(std::size_t v, const BookSnapshot& s) {
         const std::int64_t queued = hft::nowNs() - s.publish_ns;
         queue_latency_[v]->recordNs(queued > 0 ? static_cast<std::uint64_t>(queued) : 0);
@@ -580,6 +722,7 @@ private:
         const std::size_t found = detector_.detectVenue(
             v, [this](std::size_t i) -> const OrderBook& { return participates(i) ? books_[i] : no_data_; });
         // 新信号是 getSignals() 的最后 found 条（found <= 2(N-1)，远小于 deque 上限）
+        // The new signals are the last found entries of getSignals() (found <= 2(N-1), far below the deque cap)
         const std::deque<ArbitrageSignal>& signals = detector_.getSignals();
         for (std::size_t k = signals.size() - found; k < signals.size(); ++k) logger_.logSignal(signals[k]);
     }
@@ -587,6 +730,12 @@ private:
     // 交易所 v 是否参与套利检测与价差日志：只有行情源状态为 LIVE 时才参与（簿还必须非空，由检测器判断）。
     // 不是 LIVE 时本地簿可能已经过期：例如主线程曾被阻塞，断线时发布的空簿还排在队列里、在过期的簿之后。
     // 状态在取出快照时读取：feed 先更新状态再发布，所以它至少与取出的快照一样新。
+    // Whether venue v takes part in arbitrage detection and spread logging: only while its feed status is
+    // LIVE (the book must also be non-empty, which the detector checks).
+    // When not LIVE the local book may already be stale: e.g. the main thread was blocked and the empty
+    // book published on disconnect is still in the queue, behind the stale book.
+    // The status is read when the snapshot is taken out: a feed updates its status before publishing, so
+    // the status is at least as new as the snapshot taken out.
     bool participates(std::size_t v) const noexcept { return feeds_[v]->status() == FeedStatus::Live; }
 
     void onTick(std::int64_t now) {
@@ -598,6 +747,8 @@ private:
     }
 
     // 所有有序交易所对（在 buy 买、在 sell 卖）的最优价差；无数据或有一方不是 LIVE 的交易所对跳过
+    // Best-price spread of every ordered venue pair (buy at buy, sell at sell); pairs with no data or where
+    // either venue is not LIVE are skipped
     void logSpreads() {
         const std::size_t n = books_.size();
         for (std::size_t buy = 0; buy < n; ++buy) {
@@ -615,6 +766,8 @@ private:
 
     void renderFrame(std::int64_t now) {
         // 进程被停止后又继续（SIGCONT）：停止期间 shell 可能改写了屏幕，这一帧先清屏再整屏重画
+        // The process was stopped and then continued (SIGCONT): the shell may have rewritten the screen
+        // meanwhile, so this frame clears the screen first and redraws it in full
         if (opt_.redraw != nullptr && opt_.redraw->exchange(false, std::memory_order_seq_cst)) frame_shown_ = false;
         const std::vector<VenueView> views = collectViews();
         FrameOptions fo;
@@ -624,6 +777,8 @@ private:
         fo.config_warnings = cfg_.warnings.size();
         const TermSize ts = terminalSize();
         fo.max_rows = ts.rows;  // present() 在最后一行之后不换行：帧可以占满全部行而不滚动
+                                // present() writes no newline after the last line:
+                                // the frame can fill all rows without scrolling
         const std::string frame = Display::renderFrame(views, detector_, fo);
         Display::present(frame, !frame_shown_, ts.cols > 0 ? static_cast<std::size_t>(ts.cols) : 0, opt_.out);
         frame_shown_ = true;
@@ -631,6 +786,7 @@ private:
     }
 
     // headless 状态行："[00:00:03] Binance LIVE 67000.10/67000.20 (812 msgs) | OKX ... | signals 4, net $1.23"
+    // Headless status line: "[00:00:03] Binance LIVE 67000.10/67000.20 (812 msgs) | OKX ... | signals 4, net $1.23"
     void printStatusLine(std::int64_t now) {
         std::string line = "[" + Display::formatDuration(static_cast<double>(now - start_ns_) / 1e9) + "]";
         for (std::size_t i = 0; i < feeds_.size(); ++i) {
@@ -660,14 +816,21 @@ private:
     Logger& logger_;
     RunOptions opt_;
     const std::vector<const VenueConfig*> enabled_;   // 已启用的交易所，指向 cfg_.venues（下标 = venue id）
+                                                      // enabled venues, pointing into cfg_.venues (index = venue id)
     ArbitrageDetector detector_;
     WakeSignal wake_;                                              // feed 线程 notify，主线程等待（见 run()）
+                                                                   // feed threads notify, main thread waits (see run())
     std::vector<std::unique_ptr<MarketDataFeed>> feeds_;
     std::vector<std::thread> threads_;
     std::vector<OrderBook> books_;                                 // 主线程的本地簿（下标 = venue id）
+                                                                   // the main thread's local books (index = venue id)
     const OrderBook no_data_;                                      // 不是 LIVE 的交易所在检测中的替身（空簿）
+                                                                   // stand-in for non-LIVE venues in detection
+                                                                   // (an empty book)
     std::vector<std::unique_ptr<LatencyTracker>> queue_latency_;   // 队列延迟：publish_ns → 主线程取出
+                                                                   // queue latency: publish_ns → taken by main thread
     std::vector<std::uint64_t> applied_;                           // 每个交易所已应用的快照数
+                                                                   // snapshots applied per venue
     std::int64_t start_ns_ = 0;
     std::uint64_t ticks_ = 0;
     std::uint64_t renders_ = 0;

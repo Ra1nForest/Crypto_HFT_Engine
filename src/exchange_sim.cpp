@@ -3,6 +3,12 @@
 // 多线程模拟交易所：G 个网关线程（做市商 / 吃单者，各自独立种子）经无锁 SPSC 队列驱动单个撮合引擎线程，
 // 测量往返延迟（命令发出 → 收到该命令的第一个事件）与吞吐量，结束时校验订单簿不变量与客户端/交易所状态一致性。
 // 用法：./build/exchange_sim [--orders N] [--gateways G] [--symbols S] [--seed X] [--pin] [--help]（其余选项见 --help）
+// Multi-threaded exchange simulator: G gateway threads (market makers / takers, each with its own seed)
+// drive a single matching engine thread through lock-free SPSC queues, measuring round-trip latency
+// (command sent → first event for that command received) and throughput; at the end it verifies the order
+// book invariants and that client and exchange state agree.
+// Usage: ./build/exchange_sim [--orders N] [--gateways G] [--symbols S] [--seed X] [--pin] [--help]
+// (see --help for the other options)
 //
 
 #include "hft/alloc_counter.h"
@@ -37,25 +43,35 @@ using Runner = EngineRunner<>;
 
 // ============================================================================
 // 命令行
+// Command line
 // ============================================================================
 
 constexpr std::uint64_t kAuto = UINT64_MAX;  // 取值由程序自动决定的选项
+                                             // option value chosen automatically by the program
 
 struct Options {
     std::uint64_t orders = 2'000'000;  // 全部网关发送的命令总数
+                                       // total commands sent by all gateways
     std::uint64_t gateways = 2;
     std::uint64_t symbols = 1;
     std::uint64_t seed = 1;
     std::uint64_t makers = kAuto;       // 做市网关数（自动：一半，向上取整）
+                                        // market-maker gateways (auto: half, rounded up)
     std::uint64_t window = 8;           // 每个网关的最大在途命令数
+                                        // max in-flight commands per gateway
     std::uint64_t levels = 10;          // 每个做市商在每个交易对每一侧报价的档数
+                                        // quote levels per side and symbol for each market maker
     std::uint64_t batch = 32;           // 引擎每轮每个入站队列最多处理的命令数
+                                        // max commands the engine handles per inbound queue per turn
     std::uint64_t yield_after = kAuto;  // 连续空转多少次后 yield（自动：见 --help）
+                                        // idle spins in a row before yield (auto: see --help)
     bool pin = false;
 };
 
 constexpr std::size_t kMaxSimGateways = 4096;  // 订单 id 编码用 16 位网关字段（见 makeOrderId）
+                                               // 16-bit gateway field in the order id (see makeOrderId)
 constexpr std::size_t kMaxSlots = 0xFFFF;      // 订单 id 编码用 16 位报价槽位字段（0xFFFF 留给吃单）
+                                               // 16-bit quote slot field in the order id (0xFFFF reserved for takers)
 
 void printUsage(std::FILE* out) {
     std::fprintf(out,
@@ -85,6 +101,7 @@ void printUsage(std::FILE* out) {
 using cli_util::parseUnsigned;
 
 // 带一个整数参数的选项：取值范围与出错时说明的要求
+// An option with one integer argument: its value range and the requirement stated on error
 struct NumericOption {
     const char* name;
     std::uint64_t Options::*field;
@@ -106,6 +123,7 @@ constexpr NumericOption kNumericOptions[] = {
 };
 
 // 返回 0 = 继续运行，1 = 已打印帮助（正常退出），2 = 参数错误
+// Returns 0 = keep running, 1 = help printed (normal exit), 2 = bad arguments
 int parseOptions(int argc, char** argv, Options& o) {
     auto bad = [](const std::string& msg) {
         std::fprintf(stderr, "exchange_sim: %s\n(try --help)\n", msg.c_str());
@@ -137,9 +155,11 @@ int parseOptions(int argc, char** argv, Options& o) {
 
 // ============================================================================
 // 工具
+// Utilities
 // ============================================================================
 
 // splitmix64：快速、可复现的伪随机数（每个线程各自一个实例）
+// splitmix64: fast, reproducible pseudo-random numbers (one instance per thread)
 class Rng {
 public:
     explicit Rng(std::uint64_t seed) noexcept : state_(seed) {}
@@ -150,6 +170,7 @@ public:
         return z ^ (z >> 31);
     }
     std::uint64_t below(std::uint64_t n) noexcept { return n == 0 ? 0 : next() % n; }  // 取模偏差可忽略
+                                                                                       // modulo bias is negligible
     std::int64_t range(std::int64_t lo, std::int64_t hi) noexcept {
         return lo + static_cast<std::int64_t>(below(static_cast<std::uint64_t>(hi - lo) + 1));
     }
@@ -200,6 +221,10 @@ std::string symbolName(std::size_t s) {
 
 // 订单 id 编码：[63:48] 网关 + 1，[47:32] 报价槽位（吃单为 0xFFFF），[31:0] 该网关的新订单计数。
 // 各网关的 id 空间互不相交；同一槽位的新订单 id 也各不相同（计数递增）。
+// Order id encoding: [63:48] gateway + 1, [47:32] quote slot (0xFFFF for taker orders), [31:0] that
+// gateway's new-order counter.
+// The id spaces of different gateways are disjoint; new order ids for the same slot all differ too (the
+// counter increases).
 OrderId makeOrderId(GatewayId g, std::size_t slot, std::uint64_t n) {
     return ((static_cast<OrderId>(g) + 1) << 48) | ((static_cast<OrderId>(slot) & 0xFFFF) << 32) |
            (n & 0xFFFF'FFFFULL);
@@ -208,6 +233,9 @@ OrderId makeOrderId(GatewayId g, std::size_t slot, std::uint64_t n) {
 // ============================================================================
 // 市场：每个交易对一条预先生成的中间价随机游走（只读，全部线程共享）。
 // 每个网关按自己的进度（已发命令数 / 配额）索引它，因此各网关看到的中间价同步移动、且与线程调度无关。
+// Market: one pre-generated random walk of the mid price per symbol (read-only, shared by all threads).
+// Each gateway indexes it by its own progress (commands sent / quota), so the mid price every gateway sees
+// moves in step and is independent of thread scheduling.
 // ============================================================================
 class Market {
 public:
@@ -222,6 +250,7 @@ public:
             Price mid = kInitialMid + static_cast<Price>(s) * 1000;
             for (std::size_t i = 0; i < kSteps; ++i) {
                 const std::uint64_t r = rng.below(8);  // 每步 1/8 上涨、1/8 下跌
+                                                       // each step: 1/8 up, 1/8 down
                 if (r == 0) ++mid;
                 else if (r == 1) --mid;
                 w[i] = std::max<Price>(mid, 1000);
@@ -245,6 +274,19 @@ private:
 // - Hybrid：只有一个网关时使用，75% 做市动作 + 25% 吃单动作（做市与吃单用不同账户，避免自成交保护）。
 // 流量控制：在途命令数不超过 window；每个命令的第一个事件（一定发回本网关、且按发送顺序到达）
 // 即为确认，用于测量往返延迟，并核对回显的 client_ts 与最早的在途命令一致。
+// Simulated traders (one per gateway thread)
+// - Maker: rests levels post-only quotes on each side of every symbol (mid ± half spread ± level); once the
+//   mid moves, a modify (cancel/replace) moves the quote to the new price; when the price has not changed it
+//   randomly cancels or reduces in place, producing realistic cancel/modify traffic.
+//   Each quote slot has at most one command in flight at a time; slot state is driven entirely by events
+//   (Accepted/Modified/Fill/Cancelled/Rejected).
+// - Taker: random-side, mostly small IOC limit orders (crossing the top of book by 0~2 ticks) and market
+//   orders.
+// - Hybrid: used when there is only one gateway, 75% market-making actions + 25% taker actions (making and
+//   taking use different accounts, to avoid self-trade prevention).
+// Flow control: at most window commands in flight; the first event of each command (always sent back to this
+// gateway, and arriving in send order) is its acknowledgement, used to measure the round-trip latency and to
+// check that the echoed client_ts matches the oldest in-flight command.
 // ============================================================================
 enum class Role : std::uint8_t { Maker, Taker, Hybrid };
 
@@ -259,10 +301,13 @@ const char* roleName(Role r) {
 
 struct QuoteSlot {
     OrderId id = 0;       // 该槽位当前（或最近一次）的订单 id；0 = 从未使用
+                          // the slot's current (or most recent) order id; 0 = never used
     Price price = 0;
     Qty remaining = 0;
     bool live = false;    // 交易所已确认挂在簿上
+                          // the exchange confirmed it rests in the book
     bool pending = false; // 有一条针对该槽位的在途命令
+                          // a command for this slot is in flight
 };
 
 struct TraderStats {
@@ -270,8 +315,11 @@ struct TraderStats {
     std::uint64_t acked = 0;
     std::uint64_t sent_by_type[3] = {};  // New / Cancel / Modify
     std::uint64_t quotes = 0;            // New 中的 post-only 报价
+                                         // post-only quotes among New
     std::uint64_t iocs = 0;              // New 中的 IOC 限价单
+                                         // IOC limit orders among New
     std::uint64_t markets = 0;           // New 中的市价单
+                                         // market orders among New
     std::uint64_t events_by_type[5] = {};
     std::uint64_t maker_fills = 0;
     std::uint64_t taker_fills = 0;
@@ -280,9 +328,14 @@ struct TraderStats {
     std::uint64_t reject_reasons[8] = {};
     std::uint64_t cancel_reasons[5] = {};
     std::uint64_t echo_mismatches = 0;   // 首个事件回显的 client_ts 与最早在途命令不符（恒应为 0）
+                                         // first event echoed a client_ts that differs from the oldest
+                                         // in-flight command (should always be 0)
     std::uint64_t stale_events = 0;      // 本网关订单 id 但不是任何槽位当前订单的事件（恒应为 0）
+                                         // events for an order id of this gateway that is not the
+                                         // current order of any slot (should always be 0)
 
     // 累加另一个网关的统计（汇总用）
+    // Add up another gateway's stats (for the totals)
     void add(const TraderStats& s) noexcept {
         sent += s.sent;
         acked += s.acked;
@@ -339,6 +392,7 @@ public:
     }
 
     // 网关线程主体
+    // Gateway thread body
     void run(StartGate& gate) {
         char name[16];
         std::snprintf(name, sizeof(name), "gw-%u", static_cast<unsigned>(id_));
@@ -349,12 +403,14 @@ public:
 
         std::uint32_t spins = 0;
         bool have = false;     // cmd 已生成但尚未成功入队（入站队列满时下一轮重试）
+                               // cmd built but not yet enqueued (retried next round when the inbound queue is full)
         EngineCommand cmd{};
         while (stats_.acked < quota_) {
             bool progress = drain();
             while (stats_.sent < quota_ && stats_.sent - stats_.acked < settings_.window) {
                 if (!have) {
                     if (!buildCommand(cmd)) break;  // 所有报价槽位都有在途命令：等确认
+                                                    // every quote slot has a command in flight: wait for acks
                     have = true;
                 }
                 cmd.client_ts = hft::rdtsc();
@@ -370,6 +426,8 @@ public:
         finish_ns_ = hft::nowNs();
         gate.done.fetch_add(1, std::memory_order_release);
         // 自己的命令都已确认，但其他网关的命令仍可能让本网关的报价成交：消费到引擎停止为止
+        // All of its own commands are acknowledged, but other gateways' commands can still fill this gateway's
+        // quotes: keep consuming until the engine stops
         while (!gate.stopped.load(std::memory_order_acquire)) {
             if (!drain()) idlePause(spins);
         }
@@ -378,6 +436,9 @@ public:
 
     // 引擎停止后核对客户端状态与交易所状态：每个"在簿"报价都在订单簿里且价格/剩余量/归属一致，
     // 每个"不在簿"报价都确实不在；没有遗留的在途命令。返回在簿报价数。
+    // After the engine stops, checks client state against exchange state: every "in the book" quote is in the
+    // order book with matching price/remaining quantity/owner, every "not in the book" quote really is not; no
+    // commands are left in flight. Returns the number of quotes in the book.
     bool verify(const Runner& runner, std::size_t& live, std::string* why) const {
         live = 0;
         for (std::size_t i = 0; i < slots_.size(); ++i) {
@@ -426,8 +487,10 @@ private:
     }
 
     // 当前中间价：按本网关的进度索引随机游走
+    // Current mid price: indexes the random walk by this gateway's progress
     Price midOf(SymbolId s) const noexcept {
         // sent < 2^40、kSteps < 2^15：乘积不会溢出 64 位
+        // sent < 2^40, kSteps < 2^15: the product cannot overflow 64 bits
         const std::size_t step = static_cast<std::size_t>(stats_.sent * (Market::kSteps - 1) / quota_);
         return market_.mid(s, step);
     }
@@ -448,6 +511,7 @@ private:
     }
 
     // 做市：从随机槽位开始找第一个可操作的槽位
+    // Market making: starting at a random slot, find the first actionable slot
     bool buildQuote(EngineCommand& out) {
         const std::size_t n = slots_.size();
         const std::size_t per_symbol = 2 * settings_.levels;
@@ -462,6 +526,7 @@ private:
             const Price target = targetPrice(s, side, level);
             const std::uint64_t seq = stats_.sent + 1;
             if (!q.live) {  // 空槽位：挂新报价
+                            // empty slot: rest a new quote
                 OrderRequest r;
                 r.id = makeOrderId(id_, idx, ++order_counter_);
                 r.account = maker_account_;
@@ -479,6 +544,7 @@ private:
                 return true;
             }
             if (q.price != target) {  // 中间价移动：改单挪到新价位（cancel/replace，同时刷新数量）
+                                      // mid moved: modify to the new price (cancel/replace, quantity refreshed too)
                 q.pending = true;
                 out = EngineCommand::modify(id_, seq, s, q.id, target, rng_.range(5, 50));
                 ++stats_.sent_by_type[2];
@@ -486,12 +552,14 @@ private:
             }
             const std::uint64_t roll = rng_.below(8);
             if (roll == 0) {  // 撤单（之后会在新价位重新报价）
+                              // cancel (it will quote again at the new price later)
                 q.pending = true;
                 out = EngineCommand::cancel(id_, seq, s, q.id);
                 ++stats_.sent_by_type[1];
                 return true;
             }
             if (roll == 1 && q.remaining > 1) {  // 原地减量（保留时间优先级）
+                                                 // reduce in place (keeps time priority)
                 q.pending = true;
                 out = EngineCommand::modify(id_, seq, s, q.id, q.price, rng_.range(1, q.remaining - 1));
                 ++stats_.sent_by_type[2];
@@ -502,6 +570,7 @@ private:
     }
 
     // 吃单：IOC 限价（越过对手最优价 0~2 tick）或市价单
+    // Taking: IOC limit (crossing the opposite best price by 0~2 ticks) or market order
     bool buildTake(EngineCommand& out) {
         const SymbolId s = static_cast<SymbolId>(rng_.below(settings_.symbols));
         const Price mid = midOf(s);
@@ -529,6 +598,8 @@ private:
     }
 
     // 本网关某个报价槽位的当前订单；不是（吃单、旧订单）则返回 nullptr
+    // If id is the current order of one of this gateway's quote slots, returns that slot; if not (taker
+    // orders, old orders), returns nullptr
     QuoteSlot* slotFor(OrderId id) noexcept {
         if ((id >> 48) != static_cast<OrderId>(id_) + 1) return nullptr;
         const std::size_t slot = static_cast<std::size_t>((id >> 32) & 0xFFFF);
@@ -556,10 +627,13 @@ private:
         if (type < 5) ++stats_.events_by_type[type];
         if (ev.gateway == id_ && ev.engine_seq != last_acked_seq_) {
             // 本网关下一条命令的第一个事件：确认 + 往返延迟
+            // First event of this gateway's next command: acknowledgement + round-trip latency
             const std::uint64_t now = hft::rdtsc();
             last_acked_seq_ = ev.engine_seq;
             if (ev.client_ts != sent_ts_[stats_.acked & ring_mask_]) ++stats_.echo_mismatches;
             // toNs 把差值按有符号数解释：跨核 TSC 的微小偏差得到小负数，钳制为 0
+            // toNs interprets the difference as signed: a tiny TSC skew across cores gives a small negative value,
+            // which is clamped to 0
             const std::int64_t ns = tsc_.toNs(now - ev.client_ts);
             latency_.record(ns <= 0 ? 0 : static_cast<std::uint64_t>(ns));
             ++stats_.acked;
@@ -580,6 +654,8 @@ private:
                 if (q != nullptr) {
                     q->pending = false;
                     // 新报价被拒（例如 PostOnlyWouldCross）；撤 / 改单 UnknownOrder：订单已先一步成交
+                    // New quote rejected (e.g. PostOnlyWouldCross); cancel / modify got UnknownOrder: the order had
+                    // already been filled
                     if (ev.rejected.request == RequestType::New || ev.rejected.reason == RejectReason::UnknownOrder)
                         q->live = false;
                 }
@@ -604,6 +680,7 @@ private:
                 if (q != nullptr) {
                     q->live = false;
                     if (ev.gateway == id_) q->pending = false;  // 对本网关撤单命令的回应
+                                                                // reply to this gateway's cancel command
                 }
                 break;
             }
@@ -632,6 +709,7 @@ private:
     const Price half_spread_;
     std::vector<QuoteSlot> slots_;      // [symbol][side][level]
     std::vector<std::uint64_t> sent_ts_;  // 在途命令的 client_ts（环形，容量 >= window）
+                                          // client_ts of the in-flight commands (ring, capacity >= window)
     std::uint64_t ring_mask_ = 0;
     std::uint64_t order_counter_ = 0;
     std::uint64_t last_acked_seq_ = 0;
@@ -643,6 +721,7 @@ private:
 
 // ============================================================================
 // 报告
+// Report
 // ============================================================================
 
 void printLatencyRow(const std::string& label, const char* role, const hft::LatencyHistogram& h) {
@@ -662,6 +741,7 @@ std::string rate(std::uint64_t n, double seconds) {
 }
 
 // "PostOnlyWouldCross 123, UnknownOrder 45"（只列非零项）
+// "PostOnlyWouldCross 123, UnknownOrder 45" (non-zero entries only)
 template <class Enum, std::size_t N>
 std::string breakdown(const std::uint64_t (&counts)[N]) {
     std::string s;
@@ -681,18 +761,24 @@ int main(int argc, char** argv) {
 
     const std::size_t G = opt.gateways;
     const std::size_t makers = G == 1 ? 1 : opt.makers != kAuto ? opt.makers : (G + 1) / 2;  // 单网关：hybrid
+                                                                                             // single gateway: hybrid
     const std::vector<int> cpus = allowedCpus();
     const std::uint32_t yield_after = opt.yield_after != kAuto ? static_cast<std::uint32_t>(opt.yield_after)
                                                                : (G + 1 <= cpus.size() ? 0u : 64u);
 
     // 预留容量：只有报价会挂单（吃单都是 IOC / 市价），每个交易对的活动订单不超过 做市网关数 x 2 x levels。
     // 留 4 倍余量并取 2 的幂（至少 4096），保证撮合热路径零分配（运行结束时报告实际分配次数）。
+    // Reserve capacity: only quotes rest (taker orders are all IOC / market), and live orders per symbol never
+    // exceed market-maker gateways x 2 x levels.
+    // Leave a 4x margin and round up to a power of two (at least 4096), keeping the matching hot path
+    // allocation-free (the actual number of allocations is reported at the end of the run).
     const std::size_t live_bound = makers * 2 * opt.levels;
     const std::size_t reserve = std::max<std::size_t>(4096, hft::nextPow2(4 * live_bound));
     const std::size_t inbound_capacity = std::max<std::size_t>(64, hft::nextPow2(2 * opt.window));
     const std::size_t outbound_capacity = 8192;
 
     hft::TscClock::instance();  // 校准 TSC（约 20 ms），在任何计时之前完成
+                                // calibrate the TSC (about 20 ms) before any timing
 
     EngineRunnerConfig cfg;
     cfg.gateways = G;
@@ -736,6 +822,7 @@ int main(int argc, char** argv) {
                     cpus.size());
 
     // ---- 运行 ----
+    // ---- Run ----
     runner.start();
     StartGate gate;
     std::vector<std::thread> threads;
@@ -746,11 +833,14 @@ int main(int argc, char** argv) {
     }
     while (gate.ready.load(std::memory_order_acquire) < G) std::this_thread::yield();
     const std::uint64_t allocations_before = hft::alloc_counter::total();  // 计数版全局 operator new（hft/alloc_counter.h）
+                                                                           // counting global operator new
+                                                                           // (hft/alloc_counter.h)
     const std::int64_t t0 = hft::nowNs();
     gate.go.store(true, std::memory_order_release);
     while (gate.done.load(std::memory_order_acquire) < G) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const std::uint64_t allocations = hft::alloc_counter::total() - allocations_before;
     runner.stop();  // 排空（此时没有在途命令）
+                    // drain (no commands are in flight at this point)
     gate.stopped.store(true, std::memory_order_release);
     for (std::thread& th : threads) th.join();
 
@@ -759,6 +849,7 @@ int main(int argc, char** argv) {
     const double seconds = static_cast<double>(t1 - t0) * 1e-9;
 
     // ---- 汇总 ----
+    // ---- Summary ----
     TraderStats total;
     hft::LatencyHistogram all_latency;
     for (const auto& t : traders) {
@@ -833,6 +924,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- 校验 ----
+    // ---- Checks ----
     std::printf("\nChecks\n");
     bool ok = true;
     auto check = [&ok](const char* what, bool pass, const std::string& detail = std::string()) {

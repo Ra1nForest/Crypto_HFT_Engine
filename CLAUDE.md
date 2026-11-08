@@ -113,8 +113,8 @@ wsl -- bash -c './build/wsl/crypto_hft_engine --headless --duration 20 2>&1 | ta
   - `orderbook_benchmark` and `parse_benchmark` are the v1 standalone re-implementations
     (map vs vector, stod vs from_chars) and never touch `include/`.
   - Numbers vary by about 20–50% on shared VMs: compare within one run.
-- No CI and no lint/format config. Compiler warnings, the test suites, sanitizer builds and the
-  mock demo are the checks.
+- No CI and no lint/format config. Compiler warnings, the test suites, sanitizer builds, the
+  mock demo and `tools/bilingual_comments.py check` are the checks.
 
 ## Architecture
 
@@ -271,8 +271,12 @@ N-venue generic (the detector accepts at most 16 venues).
   benchmarks have sections to extend) and before→after numbers in the commit message.
   Allocation-freedom is asserted in tests, so keep it.
 - Commits use conventional prefixes (`feat:`, `perf:`, `docs:`, `chore:`, `build:`, `test:`).
-- Code comments are in Simplified Chinese, and every header starts with the `//\n// name.h\n//
-  中文说明\n//` banner. README, docs, commit messages, program output, log lines and test names
-  are in English.
+- Code comments are bilingual. Each Simplified Chinese comment is followed by its English
+  translation at the same indentation. For a comment after code, the English goes on the next
+  line, starting at that comment's `//` column. Every header starts with the
+  `//\n// name.h\n// 中文说明\n// English description\n//` banner. When you add or change a
+  comment, write or update both languages. `python3 tools/bilingual_comments.py check $(git
+  ls-files '*.h' '*.cpp')` lists Chinese comments that have no English line after them.
+- README, docs, commit messages, program output, log lines and test names are in English.
 - Naming: classes `PascalCase`, methods `camelCase`, members `trailing_underscore_`, constants
   `kName`. Plain structs may use snake_case fields.

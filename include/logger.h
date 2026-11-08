@@ -1,6 +1,8 @@
 //
 // logger.h
 // 日志模块（线程安全）：按日期写日志文件，记录启动信息、行情源连接事件、套利信号、价差、延迟统计与最终报告。
+// Logging module (thread-safe): writes log files by date, recording startup information, feed connection
+// events, arbitrage signals, spreads, latency statistics and the final report.
 //
 
 #pragma once
@@ -35,9 +37,23 @@
 //   （主循环每个 tick，即每 refresh_ms 调用一次），避免高频信号时每行一次系统调用。
 // - 可选的控制台回显（setEcho，用于 --headless）：INFO / WARN / FEED / SIGNAL 行同时写到给定的 FILE*，
 //   整行一次 fwrite，与其他线程整行写 stdout 的输出不会交错在一行内。
+// File logger:
+// - Log file <log_dir>/arb_<YYYY-MM-DD>.log (the start date), written in append mode; the directory is
+//   created if it does not exist (mkdir 0755).
+// - Thread-safe: every write happens under the same mutex, so connection events from the feed threads
+//   (logFeed) and the main thread's signal logs never interleave within a line.
+// - Each line is "<YYYY-MM-DD HH:MM:SS.mmm> [TAG] message"; control characters in a message (newline, ESC
+//   etc.) are replaced by spaces, and a message is always a single line.
+// - Flush policy: INFO / WARN / FEED are flushed immediately (rare and important for troubleshooting);
+//   SIGNAL / SPREAD / PERF wait for the caller's periodic flush() (called by the main loop every tick,
+//   i.e. once per refresh_ms), avoiding one system call per line when signals are frequent.
+// - Optional console echo (setEcho, used for --headless): INFO / WARN / FEED / SIGNAL lines are also
+//   written to the given FILE*, each whole line with one fwrite, so they do not interleave within a line
+//   with output that other threads write to stdout as whole lines.
 class Logger {
 public:
     // log_dir：日志目录；announce：是否在 stdout 打印 "[Logger] Log file: <path>"
+    // log_dir: the log directory; announce: whether to print "[Logger] Log file: <path>" to stdout
     explicit Logger(const std::string& log_dir = "logs", bool announce = true) {
         if (::mkdir(log_dir.c_str(), 0755) != 0 && errno != EEXIST) {
             std::cerr << "[Logger] Cannot create log directory " << log_dir << ": " << std::strerror(errno)
@@ -55,6 +71,7 @@ public:
     }
 
     // 析构时写入停止信息
+    // Writes the stop message on destruction
     ~Logger() {
         if (file_.is_open()) {
             log(std::string("=== ") + kAppVersion + " Stopped ===");
@@ -69,21 +86,26 @@ public:
     const std::string& path() const noexcept { return path_; }
 
     // 控制台回显目标（nullptr 关闭）
+    // Console echo target (nullptr turns it off)
     void setEcho(std::FILE* out) {
         std::lock_guard<std::mutex> lock(mutex_);
         echo_ = out;
     }
 
     // 通用文本日志
+    // General text log
     void log(const std::string& message) { write("INFO", message, true, true); }
 
     // 告警（如配置告警）
+    // Warning (e.g. config warnings)
     void warn(const std::string& message) { write("WARN", message, true, true); }
 
     // 行情源连接事件（feed 线程上的日志回调，参数已是 "[name] message"）
+    // Feed connection event (the log callback on a feed thread; the argument is already "[name] message")
     void logFeed(const std::string& message) { write("FEED", message, true, true); }
 
     // 套利信号
+    // Arbitrage signal
     void logSignal(const ArbitrageSignal& s) {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(4);
@@ -95,6 +117,7 @@ public:
     }
 
     // 价差：exchange_a 的卖一与 exchange_b 的买一（在 a 买、在 b 卖），diff = bid_b - ask_a
+    // Spread: exchange_a's best ask and exchange_b's best bid (buy on a, sell on b), diff = bid_b - ask_a
     void logSpread(const std::string& exchange_a, double ask_a, const std::string& exchange_b, double bid_b,
                    double diff) {
         std::ostringstream ss;
@@ -105,6 +128,8 @@ public:
     }
 
     // 最终报告：每个交易所的处理 / 队列 / 交易所延迟与连接统计，每个有序交易所对的信号汇总，以及总计
+    // Final report: each venue's processing / queue / exchange latency and connection statistics, the
+    // signal summary of every ordered venue pair, and the totals
     void logFinalReport(const std::vector<VenueView>& venues, const ArbitrageDetector& detector) {
         write("INFO", "=== Final Report ===", false, false);
         for (const VenueView& v : venues) {
@@ -147,6 +172,7 @@ public:
     }
 
     // 强制刷新缓冲区
+    // Forces the buffer to be flushed
     void flush() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_.is_open()) file_.flush();
@@ -154,6 +180,8 @@ public:
 
 private:
     // 写一行：清洗在锁外完成；时间戳在锁内读取，保证文件中各行（来自不同线程）的时间戳单调不减
+    // Writes one line: sanitizing is done outside the lock; the timestamp is taken inside the lock, which
+    // keeps the timestamps of the lines in the file (from different threads) monotonically non-decreasing
     void write(const char* tag, const std::string& message, bool echo, bool flush_now) {
         const std::string clean = text_util::sanitize(message);
         std::lock_guard<std::mutex> lock(mutex_);
@@ -187,6 +215,7 @@ private:
     };
 
     // 当前本地时间（localtime_r：线程安全）
+    // Current local time (localtime_r: thread-safe)
     static Stamp now() {
         const auto tp = std::chrono::system_clock::now();
         const std::time_t t = std::chrono::system_clock::to_time_t(tp);
@@ -203,6 +232,7 @@ private:
 
     std::string path_;
     std::mutex mutex_;          // 保护 file_ 与 echo_
+                                // guards file_ and echo_
     std::ofstream file_;
     std::FILE* echo_ = nullptr;
 };

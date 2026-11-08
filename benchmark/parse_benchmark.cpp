@@ -1,6 +1,7 @@
 //
 // parse_benchmark.cpp
 // 对比 std::stod 与 std::from_chars 的字符串转浮点性能。
+// Compares the string-to-floating-point performance of std::stod and std::from_chars.
 //
 
 #include <charconv>
@@ -20,6 +21,10 @@ constexpr int kWarmup = 100000;
 
 // 一轮：把 40 对价格/数量字符串解析成 double 并累加乘积。强制内联：预热与计时两个循环都调用它，
 // 不内联时每轮多一次函数调用，测到的就不再是旧版逐行展开的循环
+// One round: parses 40 price/quantity string pairs into doubles and accumulates the products. Forced
+// inline: both the warm-up and the timed loops call it, and without inlining every round would make one
+// extra function call, so the measurement would no longer be the loop the old version spelled out line by
+// line
 template <class Parse>
 __attribute__((always_inline)) inline void parseSnapshot(const std::vector<std::string>& prices,
                                                          const std::vector<std::string>& qtys, Parse& parse,
@@ -34,10 +39,12 @@ __attribute__((always_inline)) inline void parseSnapshot(const std::vector<std::
 }
 
 // 预热（避免首次调用带来的噪声）后正式计时
+// Warm up (to avoid noise from the first calls), then time for real
 template <class Parse>
 void runBenchmark(const char* title, const std::vector<std::string>& prices, const std::vector<std::string>& qtys,
                   Parse parse) {
     volatile double sink = 0.0;  // 防止编译器优化掉计算
+                                 // keeps the compiler from optimizing the computation away
     for (int i = 0; i < kWarmup; ++i) parseSnapshot(prices, qtys, parse, sink);
     const auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < kIterations; ++i) parseSnapshot(prices, qtys, parse, sink);
@@ -65,6 +72,7 @@ int main() {
     std::cout << std::endl;
 
     // 生成模拟的价格字符串（类似交易所返回的格式）
+    // Generate simulated price strings (in a format like what exchanges return)
     std::mt19937 gen(42);
     std::uniform_real_distribution<> price_dist(68000.0, 72000.0);
     std::uniform_real_distribution<> qty_dist(0.0001, 5.0);
@@ -79,9 +87,11 @@ int main() {
     }
 
     // 模拟实际代码：string_view → string → stod（每次转换都要构造一个 std::string）
+    // Mimics the real code: string_view → string → stod (every conversion constructs a std::string)
     runBenchmark("std::stod (with std::string allocation)", price_strings, qty_strings,
                  [](std::string_view sv) { return std::stod(std::string(sv)); });
     // 直接在原缓冲区上解析，零分配
+    // Parses directly in the original buffer, zero allocations
     runBenchmark("std::from_chars (zero allocation)", price_strings, qty_strings, [](std::string_view sv) {
         double v = 0.0;
         std::from_chars(sv.data(), sv.data() + sv.size(), v);

@@ -3,21 +3,35 @@
 # run_mock_demo.sh
 # 离线端到端演示：后台启动模拟交易所（build/mock_exchange），等它三个端口都开始监听后，用 tools/mock_config.json
 # 运行监控程序（build/crypto_hft_engine）一段时间，结束后停止模拟交易所并打印它的汇总。
+# Offline end-to-end demo: start the mock exchange (build/mock_exchange) in the background, wait until all
+# three of its ports are listening, run the monitor (build/crypto_hft_engine) with tools/mock_config.json
+# for a while, then stop the mock exchange and print its summary.
 #
 # 用法（任意目录均可，脚本会切换到仓库根目录）：
+# Usage (from any directory; the script changes to the repository root):
 #   tools/run_mock_demo.sh [SECONDS] [--headless | --tui] [--fee-rate F] [--seed N] [--drop-rate P] [--build-dir DIR]
 # 示例：
+# Examples:
 #   tools/run_mock_demo.sh 60                    # 交互终端里显示 TUI，运行 60 s
+#                                                  TUI in an interactive terminal, runs for 60 s
 #   tools/run_mock_demo.sh 30 --fee-rate 0.001   # 收 0.1% 手续费：只有大错位时才出现套利信号
+#                                                  0.1% fee: arbitrage signals only on large dislocations
 #   tools/run_mock_demo.sh 20 --headless         # 无 TUI，每秒一行状态（stdout 不是终端时自动启用）
+#                                                  no TUI, one status line per second
+#                                                  (automatic when stdout is not a terminal)
 #   tools/run_mock_demo.sh 30 --drop-rate 0.02   # 故障注入：随机丢推送，监控程序显示缺口与重同步；
 #                                                  持续丢包时 Binance 偶尔重连（每会话的 REST 快照额度用完）
+#                                                  fault injection: drops random pushes, the monitor shows
+#                                                  gaps and resyncs; with sustained drops Binance sometimes
+#                                                  reconnects (its per-session REST snapshot budget runs out)
 # Ctrl+C：监控程序与模拟交易所都收到 SIGINT，各自正常退出并打印汇总。
+# Ctrl+C: the monitor and the mock exchange both get SIGINT, exit normally and print their summaries.
 #
 
 set -euo pipefail
 
 # 端口与 tools/mock_config.json 一致（修改其一时两边一起改）
+# The ports match tools/mock_config.json (change both together)
 readonly BINANCE_PORT=19443
 readonly OKX_PORT=18443
 readonly BYBIT_PORT=18444
@@ -82,6 +96,8 @@ if ! [[ "$seed" =~ ^[0-9]+$ ]]; then
 fi
 
 # 监控程序按当前目录解析相对路径（配置、logs/）：切到仓库根目录
+# The monitor resolves relative paths (config, logs/) against the current directory: change to the
+# repository root
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mock_bin="$build_dir/mock_exchange"
 monitor_bin="$build_dir/crypto_hft_engine"
@@ -94,6 +110,8 @@ done
 
 config=tools/mock_config.json
 # CA 证书路径以配置文件的 connection.ca_file 为准：模拟交易所把证书写到这里，监控程序从这里加载
+# The CA certificate path comes from the config's connection.ca_file: the mock exchange writes the
+# certificate there and the monitor loads it from there
 ca_file=$(sed -n 's/.*"ca_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config")
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/mock_demo.XXXXXX")
@@ -128,16 +146,23 @@ cleanup() {
 }
 trap cleanup EXIT
 # Ctrl+C 同时发给前台的监控程序（它自己正常退出）；脚本只记下来，随后照常收尾
+# Ctrl+C also reaches the monitor in the foreground (it exits normally by itself); the script only
+# records it and then cleans up as usual
 trap 'interrupted=yes' INT TERM
 
 # 1. 后台启动模拟交易所（比监控程序多运行一段时间，正常情况下由本脚本结束它）。
 #    它自己安装 SIGINT/SIGTERM 处理函数，所以后台任务默认忽略 SIGINT 的继承设置不影响 stop_mock。
+# 1. Start the mock exchange in the background (it runs longer than the monitor; normally this script ends it).
+#    It installs its own SIGINT/SIGTERM handlers, so background jobs inheriting "ignore SIGINT" does not
+#    affect stop_mock.
 "$mock_bin" --binance-port "$BINANCE_PORT" --okx-port "$OKX_PORT" --bybit-port "$BYBIT_PORT" \
     --ca-out "$ca_file" --seed "$seed" --drop-rate "$drop_rate" --duration $((duration + 120)) --status-interval 5 --verbose \
     > "$mock_log" 2>&1 &
 mock_pid=$!
 
 # 2. 等它打印 ready（三个端口都已监听、CA 证书已写好）；进程提前退出（如端口被占用）则报错
+# 2. Wait until it prints ready (all three ports listening, CA certificate written); fail if the process
+#    exits early (for example, a port is already in use)
 ready=no
 for _ in $(seq 1 300); do
     [[ "$interrupted" == yes ]] && exit 130
@@ -158,6 +183,9 @@ grep '^  ' "$mock_log" || true
 
 # 3. 运行监控程序。--foreground：监控程序留在终端的前台进程组里，能收到 Ctrl+C；
 #    timeout 只是保险（监控程序按 --duration 自己结束，SIGINT 时同样打印最终报告）。
+# 3. Run the monitor. --foreground: the monitor stays in the terminal's foreground process group, so it gets
+#    Ctrl+C; timeout is only a safety net (the monitor ends by itself after --duration and also prints the
+#    final report on SIGINT).
 monitor_args=(--config "$config" --duration "$duration")
 if [[ "$headless" == yes || ( "$headless" == auto && ! -t 1 ) ]]; then
     monitor_args+=(--headless)
@@ -169,6 +197,7 @@ monitor_status=$?
 set -e
 
 # 4. 停止模拟交易所并打印它的汇总
+# 4. Stop the mock exchange and print its summary
 stop_mock
 echo
 echo "run_mock_demo: mock exchange summary (full log: $mock_log):"

@@ -3,9 +3,15 @@
 // 撮合引擎运行器测试：命令/事件 POD 布局、单网关事件流、跨网关路由（成交双方、STP、会话隔离、重复 id）、
 // 多交易对、未知交易对、非法命令、序号断号、背压（极小出站队列）、stop() 排空、重启、绑核、零分配，
 // 以及多网关线程并发 + 单线程回放的差分测试（逐网关事件流逐条相等）。
+// Matching engine runner tests: command/event POD layout, single-gateway event flow, cross-gateway routing
+// (both sides of a trade, STP, session isolation, duplicate ids), multiple symbols, unknown symbols, invalid
+// commands, sequence gaps, back-pressure (tiny outbound queue), stop() draining, restart, CPU pinning, zero
+// allocations, and a differential test of concurrent gateway threads + single-threaded replay (per-gateway
+// event streams equal event by event).
 //
 
 // 启用 hft 头文件中的调试断言：必须在包含任何 hft 头文件之前定义
+// Enable the debug asserts in the hft headers: must be defined before any hft header is included
 #define HFT_ENABLE_ASSERTS 1
 
 #include "hft/alloc_counter.h"
@@ -39,11 +45,14 @@
 #endif
 
 // 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
+// Heap allocation counting: see hft/alloc_counter.h (counting global operator new/delete; this is the only
+// translation unit of this program that includes it)
 namespace {
 std::uint64_t heapAllocations() { return hft::alloc_counter::total(); }
 }  // namespace
 
 // Sanitizer 构建下缩小并发测试规模（TSan 慢 5~15 倍）
+// Scale down the concurrent tests in sanitizer builds (TSan is 5~15 times slower)
 #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
 #define HFT_TEST_SANITIZED 1
 #elif defined(__has_feature)
@@ -63,6 +72,8 @@ namespace {
 constexpr bool kSanitized = HFT_TEST_SANITIZED != 0;
 
 // 并发测试的规模：sanitizer 构建减半；环境变量 HFT_TEST_SCALE=k（正整数）再放大 k 倍，用于长时间浸泡测试
+// Size of the concurrent tests: halved in sanitizer builds; the environment variable HFT_TEST_SCALE=k (a
+// positive integer) further multiplies it by k, for long soak tests
 std::size_t scaled(std::size_t n) {
     static const std::size_t factor = [] {
         const char* env = std::getenv("HFT_TEST_SCALE");
@@ -75,6 +86,7 @@ std::size_t scaled(std::size_t n) {
 
 // ============================================================================
 // 事件描述、期望事件构造、事件流比较
+// Event descriptions, expected-event construction, event stream comparison
 // ============================================================================
 
 std::string describe(const EngineEvent& e) {
@@ -110,6 +122,8 @@ std::string describe(const EngineEvent& e) {
 }
 
 // 期望事件的公共头：引擎序号、原命令时间戳、发送网关、交易对
+// Common header of expected events: engine sequence number, original command timestamp, sending gateway,
+// symbol
 struct Hdr {
     std::uint64_t seq;
     std::uint64_t ts;
@@ -189,8 +203,11 @@ bool checkStream(const std::vector<EngineEvent>& actual, const std::vector<Engin
 }
 
 // CHECK_STREAM(driver.drain(0), evAccepted(...), ...)：网关收到的完整事件序列必须逐条相等
+// CHECK_STREAM(driver.drain(0), evAccepted(...), ...): the complete event sequence received by the gateway
+// must be equal event by event
 #define CHECK_STREAM(actual, ...) checkStream((actual), std::vector<EngineEvent>{__VA_ARGS__}, __FILE__, __LINE__)
 // CHECK_SILENT(driver.drain(1))：该网关没有收到任何事件
+// CHECK_SILENT(driver.drain(1)): the gateway received no events at all
 #define CHECK_SILENT(actual) checkStream((actual), std::vector<EngineEvent>{}, __FILE__, __LINE__)
 
 bool sameCommand(const EngineCommand& a, const EngineCommand& b) {
@@ -202,6 +219,8 @@ bool sameCommand(const EngineCommand& a, const EngineCommand& b) {
 
 // ============================================================================
 // 线程工具：看门狗（死锁时直接中止，而不是让 ctest 挂到超时）、自旋等待
+// Thread utilities: watchdog (aborts outright on a deadlock instead of letting ctest hang until its
+// timeout), spin waiting
 // ============================================================================
 
 class Watchdog {
@@ -239,6 +258,7 @@ private:
 std::chrono::seconds watchdogLimit() { return std::chrono::seconds(kSanitized ? 900 : 180); }
 
 // 自旋等待一次：cpuRelax，每 64 次 yield 一次（测试线程数常多于 CPU 数）
+// One spin-wait step: cpuRelax, with a yield every 64 times (tests often have more threads than CPUs)
 void spinPause(std::uint32_t& spins) {
     if (++spins >= 64) {
         spins = 0;
@@ -256,6 +276,7 @@ EngineRunnerConfig testConfig(std::size_t gateways, std::size_t inbound = 256, s
     c.outbound_capacity = outbound;
     c.batch = batch;
     c.idle_spins_before_yield = 64;  // 测试线程数常多于 CPU 数
+                                     // tests often have more threads than CPUs
     return c;
 }
 
@@ -264,6 +285,10 @@ std::string symbolName(std::size_t s) { return "SYM" + std::to_string(s); }
 // ============================================================================
 // 同步驱动：测试线程扮演全部网关，每次发一条命令并等待引擎处理完（之后读取各网关收到的事件）。
 // 运行器必须是新建的、只有本驱动发送命令（引擎序号 == 已发送命令数）。
+// Synchronous driver: the test thread plays all gateways, sending one command at a time and waiting until
+// the engine has processed it (afterwards it reads the events each gateway received).
+// The runner must be freshly created, and only this driver may send commands (engine sequence number ==
+// number of commands sent).
 // ============================================================================
 template <class Runner>
 class SyncDriver {
@@ -271,6 +296,8 @@ public:
     explicit SyncDriver(Runner& runner) : runner_(runner), seq_(runner.gatewayCount(), 0) {}
 
     // 以网关 g 的身份发送（自动填写网关序号与唯一的 client_ts），返回其事件的公共头
+    // Sends as gateway g (filling in the gateway sequence number and a unique client_ts automatically) and
+    // returns the common header of its events
     Hdr send(GatewayId g, const EngineCommand& command) {
         EngineCommand c = command;
         c.seq = ++seq_[g];
@@ -299,6 +326,7 @@ public:
     }
 
     // 取走网关 g 当前收到的全部事件
+    // Takes all events that gateway g has received so far
     std::vector<EngineEvent> drain(GatewayId g) {
         std::vector<EngineEvent> out;
         EngineEvent e{};
@@ -316,6 +344,8 @@ private:
 
 // ============================================================================
 // 命令日志：引擎线程按处理顺序记下每条命令（外部存储，运行器析构后仍可读取）
+// Command journal: the engine thread records every command in processing order (external storage, still
+// readable after the runner is destroyed)
 // ============================================================================
 struct JournalEntry {
     std::uint64_t engine_seq;
@@ -332,6 +362,10 @@ struct RecordingJournal {
 // 并发驱动：每个网关一个线程，发送预先生成的命令流，同时持续消费自己的事件队列
 // （等待入站空位时也消费，避免"入站满 + 出站满"死锁）。全部发完后控制线程调用 stop()（排空），
 // 网关线程在 stop() 期间继续消费，最后收尾。
+// Concurrent driver: one thread per gateway sends a pre-generated command stream while continuously
+// consuming its own event queue (also while waiting for inbound space, to avoid an
+// "inbound full + outbound full" deadlock). Once everything is sent, the control thread calls stop()
+// (draining); the gateway threads keep consuming during stop() and finally wrap up.
 // ============================================================================
 struct GatewayScript {
     std::vector<EngineCommand> commands;
@@ -340,6 +374,7 @@ struct GatewayScript {
 
 struct DriveOptions {
     bool slow_consumer = false;  // 每消费 64 个事件睡 20 µs：制造出站队列满（背压）
+                                 // sleep 20 µs per 64 events consumed: forces a full outbound queue (back-pressure)
 };
 
 template <class Runner>
@@ -379,6 +414,7 @@ void driveConcurrently(Runner& runner, std::vector<GatewayScript>& scripts, cons
                 if (!drain()) spinPause(spins);
             }
             drain();  // 引擎线程已退出：剩下的事件都已可见
+                      // the engine thread has exited: all remaining events are visible
         });
     }
     while (finished_sending.load(std::memory_order_acquire) < n) std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -390,6 +426,10 @@ void driveConcurrently(Runner& runner, std::vector<GatewayScript>& scripts, cons
 // ============================================================================
 // 回放模型：按引擎记录的处理顺序，在单线程 MatchingEngine 上重放同样的命令，并用独立实现的路由规则
 // （std::map 归属表 + 每条命令后直接向订单簿查询订单是否仍在簿上）推出每个网关应收到的事件流。
+// Replay model: replays the same commands on a single-threaded MatchingEngine in the processing order the
+// engine recorded, and derives the event stream each gateway should receive with independently implemented
+// routing rules (a std::map owner map + after each command, asking the order book directly whether the
+// order is still in the book).
 // ============================================================================
 struct RawEvent {
     SymbolId symbol;
@@ -419,6 +459,8 @@ public:
     }
 
     // 重放一条命令；内部不一致（maker 找不到所属网关）时返回 false 并写明原因
+    // Replays one command; on an internal inconsistency (no owning gateway found for a maker) returns false and
+    // states the reason
     bool apply(std::uint64_t engine_seq, GatewayId g, const EngineCommand& cmd, std::string* why) {
         auto hdr = [&](SymbolId symbol) { return Hdr{engine_seq, cmd.client_ts, g, symbol}; };
         recorder_.events.clear();
@@ -433,6 +475,7 @@ public:
                 if (known) {
                     const auto it = owners_.find(Key{s, cmd.order_id});
                     if (it != owners_.end() && it->second != g) {  // 会话隔离：别人的订单
+                                                                   // session isolation: someone else's order
                         expected_[g].push_back(evRejected(hdr(s), cmd.order_id, cmd.type, RejectReason::UnknownOrder));
                         ++foreign_;
                         return true;
@@ -447,6 +490,7 @@ public:
                 return true;
         }
         bool touched_own = false;  // 命令自身的订单被接受 / 改单生效 / 被撤
+                                   // the command's own order was accepted / modified / cancelled
         for (const RawEvent& r : recorder_.events) {
             const mt::Event& ev = r.event;
             switch (ev.kind) {
@@ -495,6 +539,8 @@ public:
         }
         if (touched_own) {
             // 订单最终是否挂在簿上：直接问订单簿（与运行器从事件推导的归属互相独立）
+            // Whether the order ends up resting in the book: ask the order book directly (independent of the
+            // ownership that the runner derives from events)
             if (engine_.book(s).findOrder(cmd.order_id)) owners_[Key{s, cmd.order_id}] = g;
             else owners_.erase(Key{s, cmd.order_id});
         }
@@ -508,6 +554,8 @@ public:
     std::uint64_t trades() const { return trades_; }
 
     // 归属表恰好覆盖全部挂单（订单簿查询接口逐档展开）
+    // The owner map covers exactly the resting orders (expanded level by level through the order book's
+    // query interface)
     bool ownersCoverBooks(std::string* why) const {
         std::size_t resting = 0;
         for (SymbolId s = 0; s < engine_.symbolCount(); ++s) {
@@ -547,6 +595,13 @@ private:
 // 自己的订单），按命令随机选交易对；可选极少量未知交易对与非法命令类型。
 // colliding：各网关共用 id 空间 [1, 4096]（大量跨网关重复 id、撤/改别人的订单）；
 // 否则各网关 id 加不同偏移（边界 id 0 / UINT64_MAX 保持原样，仍会偶尔碰撞）。
+// Random command stream: one RandomCommandGenerator per (gateway, symbol) (each tracks its own orders, so
+// cancels/modifies mostly hit its own orders), with a random symbol per command; optionally a tiny share
+// of unknown symbols and invalid command types.
+// colliding: all gateways share the id space [1, 4096] (many cross-gateway duplicate ids, cancels/modifies
+// of other gateways' orders);
+// otherwise each gateway's ids get a different offset (the boundary ids 0 / UINT64_MAX stay unchanged and
+// still collide occasionally).
 // ============================================================================
 struct ScriptOptions {
     std::size_t symbols = 1;
@@ -565,6 +620,8 @@ std::uint64_t mix64(std::uint64_t x) {
 }
 
 // 每条命令唯一的 client_ts 标记：高位是网关，低位是该网关内的序号
+// Unique client_ts token of every command: the high bits are the gateway, the low bits the sequence number
+// within that gateway
 std::uint64_t tokenOf(std::size_t g, std::size_t i) { return (static_cast<std::uint64_t>(g + 1) << 40) | (i + 1); }
 
 std::vector<EngineCommand> makeScript(const ScriptOptions& opt, GatewayId g) {
@@ -611,6 +668,8 @@ std::vector<EngineCommand> makeScript(const ScriptOptions& opt, GatewayId g) {
 
 // ============================================================================
 // 差分场景：并发运行 → 校验命令日志与事件重建出的处理顺序 → 单线程回放 → 逐网关事件流比较 → 终态比较
+// Differential scenario: concurrent run → check the command journal and the processing order rebuilt from
+// events → single-threaded replay → per-gateway event stream comparison → final state comparison
 // ============================================================================
 struct Scenario {
     const char* name;
@@ -664,6 +723,8 @@ ScenarioResult runScenario(const Scenario& sc, std::uint64_t seed) {
     result.stats = runner.stats();
 
     // ---- 1. 命令日志：引擎序号连续；每个网关的命令按发送顺序（FIFO）被处理，内容逐字段不变 ----
+    // ---- 1. Command journal: engine sequence numbers are contiguous; each gateway's commands are processed in
+    // sending order (FIFO), with every field unchanged ----
     REQUIRE_EQ(journal.size(), total);
     std::vector<std::size_t> next(G, 0);
     std::vector<std::vector<std::uint64_t>> journal_seqs(G);
@@ -680,6 +741,8 @@ ScenarioResult runScenario(const Scenario& sc, std::uint64_t seed) {
     }
 
     // ---- 2. 仅凭事件重建处理顺序：每条命令都至少有一个发回本网关的事件，且按发送顺序到达 ----
+    // ---- 2. Rebuild the processing order from events alone: every command has at least one event sent back
+    // to its own gateway, arriving in sending order ----
     for (std::size_t g = 0; g < G; ++g) {
         std::vector<std::uint64_t> firsts;
         for (const EngineEvent& ev : scripts[g].received) {
@@ -691,6 +754,7 @@ ScenarioResult runScenario(const Scenario& sc, std::uint64_t seed) {
     }
 
     // ---- 3. 按日志顺序在单线程引擎上回放，逐网关比较事件流 ----
+    // ---- 3. Replay in journal order on a single-threaded engine and compare the event streams per gateway ----
     ReplayModel replay(G, sc.symbols, 1 << 14);
     for (const JournalEntry& e : journal) {
         std::string why;
@@ -703,6 +767,8 @@ ScenarioResult runScenario(const Scenario& sc, std::uint64_t seed) {
     }
 
     // ---- 4. 终态：订单簿逐项相同；运行器不变量（含归属表 == 挂单）；归属与回放模型一致 ----
+    // ---- 4. Final state: the order books are identical item by item; runner invariants (including
+    // owner map == resting orders); ownership agrees with the replay model ----
     for (SymbolId s = 0; s < sc.symbols; ++s) {
         std::string why;
         if (!mt::sameState(runner.engine().book(s), replay.engine().book(s), &why))
@@ -722,6 +788,7 @@ ScenarioResult runScenario(const Scenario& sc, std::uint64_t seed) {
     }
 
     // ---- 5. 统计 ----
+    // ---- 5. Statistics ----
     CHECK_EQ(result.stats.commands, static_cast<std::uint64_t>(total));
     CHECK_EQ(result.stats.events, result.total_events);
     CHECK_EQ(result.stats.sequence_gaps, 0u);
@@ -749,6 +816,7 @@ std::size_t firstAllowedCpu() {
 
 // ============================================================================
 // 命令 / 事件 POD
+// Command / event PODs
 // ============================================================================
 
 TEST_CASE("runner: commands and events are one-cache-line PODs") {
@@ -795,6 +863,7 @@ TEST_CASE("runner: event equality compares the header and only the active payloa
     const EngineEvent a = evRejected(h, 9, RequestType::Cancel, RejectReason::UnknownOrder);
     EngineEvent b = a;
     // 改动非活动载荷的字节（拒单载荷只有 2 字节）：仍相等
+    // Changing bytes of the inactive payload (the reject payload is only 2 bytes): still equal
     unsigned char junk[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     std::memcpy(reinterpret_cast<unsigned char*>(&b) + 48, junk, sizeof(junk));
     CHECK(a == b);
@@ -820,6 +889,7 @@ TEST_CASE("runner: event equality compares the header and only the active payloa
 
 // ============================================================================
 // 确定性路由（同步驱动）
+// Deterministic routing (synchronous driver)
 // ============================================================================
 
 TEST_CASE("runner: single gateway event flow echoes sequence, timestamp and gateway") {
@@ -836,12 +906,15 @@ TEST_CASE("runner: single gateway event flow echoes sequence, timestamp and gate
     const OrderRequest b2 = mt::buy(2, 101, 3).account(2);
     h = d.submit(0, 0, b2);
     // 同一网关两侧：先 maker 的 Fill，后 taker 的 Fill
+    // Both sides on the same gateway: the maker's Fill first, then the taker's Fill
     CHECK_STREAM(d.drain(0), evAccepted(h, b2), evFill(h, 1, Liquidity::Maker, 1, 101, 3, 2),
                  evFill(h, 2, Liquidity::Taker, 1, 101, 3, 0));
 
     h = d.modify(0, 0, 1, 103, 4);  // 改价：失去时间优先级，不穿价，静默挂单
+                                    // reprice: loses time priority, does not cross, rests silently
     CHECK_STREAM(d.drain(0), evModified(h, 1, 103, 4));
     h = d.modify(0, 0, 1, 103, 2);  // 原地减量
+                                    // in-place quantity decrease
     CHECK_STREAM(d.drain(0), evModified(h, 1, 103, 2));
     CHECK_EQ(runner.processedCommands(), 4u);
 
@@ -852,9 +925,11 @@ TEST_CASE("runner: single gateway event flow echoes sequence, timestamp and gate
 
     const OrderRequest m3 = mt::marketBuy(3, 2).account(0);
     h = d.submit(0, 0, m3);  // 空簿上的市价单
+                             // market order on an empty book
     CHECK_STREAM(d.drain(0), evAccepted(h, m3), evCancelled(h, 3, 2, CancelReason::MarketRemainder));
 
     const OrderRequest bad = mt::buy(4, 0, 1);  // 非法价格
+                                                // invalid price
     h = d.submit(0, 0, bad);
     CHECK_STREAM(d.drain(0), evRejected(h, 4, RequestType::New, RejectReason::InvalidPrice));
 
@@ -885,6 +960,8 @@ TEST_CASE("runner: trades are reported to both the maker's and the taker's gatew
     const OrderRequest t = mt::buy(20, 100, 6).account(3);
     const Hdr ht = d.submit(2, 0, t);
     // maker 收到的 Fill 带 taker 命令的引擎序号、时间戳与网关
+    // The Fill the maker receives carries the engine sequence number, timestamp and gateway of the taker's
+    // command
     CHECK_STREAM(d.drain(0), evFill(ht, 10, Liquidity::Maker, 1, 100, 4, 0));
     CHECK_STREAM(d.drain(1), evFill(ht, 11, Liquidity::Maker, 2, 100, 2, 2));
     CHECK_STREAM(d.drain(2), evAccepted(ht, t), evFill(ht, 20, Liquidity::Taker, 1, 100, 4, 2),
@@ -892,8 +969,10 @@ TEST_CASE("runner: trades are reported to both the maker's and the taker's gatew
 
     runner.stop();
     CHECK(!runner.ownerOf(0, 10).has_value());  // 完全成交：移出归属表
+                                                // fully filled: removed from the owner map
     CHECK(runner.ownerOf(0, 11) == std::optional<GatewayId>(1));
     CHECK(!runner.ownerOf(0, 20).has_value());  // 完全成交的 taker 从未挂单
+                                                // a fully filled taker never rested
     std::string why;
     CHECK(runner.checkInvariants(&why));
 }
@@ -904,8 +983,11 @@ TEST_CASE("runner: self-trade prevention cancels are routed to the maker's gatew
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
     constexpr AccountId kShared = 7;  // 同一账户经由两个网关下单
+                                      // the same account places orders through two gateways
 
     // CancelMaker：跨网关撤掉 maker；taker 继续撮合，无对手后挂单
+    // CancelMaker: cancels the maker across gateways; the taker keeps matching and rests once no counterparty
+    // is left
     const OrderRequest s1 = mt::sell(1, 100, 5).account(kShared);
     Hdr h = d.submit(0, 0, s1);
     CHECK_STREAM(d.drain(0), evAccepted(h, s1));
@@ -915,6 +997,7 @@ TEST_CASE("runner: self-trade prevention cancels are routed to the maker's gatew
     CHECK_STREAM(d.drain(1), evAccepted(h, b2));
 
     // CancelBoth，maker 与 taker 同属网关 1：两条撤单都发给网关 1
+    // CancelBoth with maker and taker both on gateway 1: both cancels go to gateway 1
     const OrderRequest s3 = mt::sell(3, 100, 1).account(kShared).stp(StpMode::CancelBoth);
     h = d.submit(1, 0, s3);
     CHECK_STREAM(d.drain(1), evAccepted(h, s3), evCancelled(h, 2, 3, CancelReason::SelfTradePrevention),
@@ -922,6 +1005,7 @@ TEST_CASE("runner: self-trade prevention cancels are routed to the maker's gatew
     CHECK_SILENT(d.drain(0));
 
     // CancelBoth 跨网关：maker 的撤单发给网关 0，taker 的撤单发给网关 1
+    // CancelBoth across gateways: the maker's cancel goes to gateway 0, the taker's cancel to gateway 1
     const OrderRequest s4 = mt::sell(4, 105, 2).account(kShared);
     h = d.submit(0, 0, s4);
     CHECK_STREAM(d.drain(0), evAccepted(h, s4));
@@ -931,6 +1015,7 @@ TEST_CASE("runner: self-trade prevention cancels are routed to the maker's gatew
     CHECK_STREAM(d.drain(1), evAccepted(h, b5), evCancelled(h, 5, 1, CancelReason::SelfTradePrevention));
 
     // CancelTaker：只有 taker 被撤，maker 原封不动、仍属网关 0
+    // CancelTaker: only the taker is cancelled; the maker stays untouched and still belongs to gateway 0
     const OrderRequest s6 = mt::sell(6, 110, 2).account(kShared);
     h = d.submit(0, 0, s6);
     CHECK_STREAM(d.drain(0), evAccepted(h, s6));
@@ -964,21 +1049,26 @@ TEST_CASE("runner: a gateway cannot cancel or modify another gateway's order") {
     h = d.modify(1, 0, 1, 98, 1);
     CHECK_STREAM(d.drain(1), evRejected(h, 1, RequestType::Modify, RejectReason::UnknownOrder));
     CHECK_SILENT(d.drain(0));  // 订单所有者什么都没收到
+                               // the order's owner received nothing
     CHECK_EQ(runner.stats().foreign_rejects, 2u);
 
     // 重复 id：由引擎拒绝，回给发送方（不算会话隔离拒单）
+    // Duplicate id: rejected by the engine and returned to the sender (not counted as a session isolation
+    // reject)
     const OrderRequest dup = mt::buy(1, 98, 1);
     h = d.submit(1, 0, dup);
     CHECK_STREAM(d.drain(1), evRejected(h, 1, RequestType::New, RejectReason::DuplicateOrderId));
     CHECK_EQ(runner.stats().foreign_rejects, 2u);
 
     // 所有者自己可以改单 / 撤单
+    // The owner itself can modify / cancel
     h = d.modify(0, 0, 1, 99, 4);
     CHECK_STREAM(d.drain(0), evModified(h, 1, 99, 4));
     h = d.cancel(0, 0, 1);
     CHECK_STREAM(d.drain(0), evCancelled(h, 1, 4, CancelReason::UserRequested));
 
     // id 释放后被网关 1 复用：现在轮到网关 0 动不了它
+    // After the id is released, gateway 1 reuses it: now it is gateway 0 that cannot touch it
     const OrderRequest s1 = mt::sell(1, 105, 2);
     h = d.submit(1, 0, s1);
     CHECK_STREAM(d.drain(1), evAccepted(h, s1));
@@ -988,6 +1078,7 @@ TEST_CASE("runner: a gateway cannot cancel or modify another gateway's order") {
     CHECK_STREAM(d.drain(1), evCancelled(h, 1, 2, CancelReason::UserRequested));
 
     // 不存在的订单：引擎自己的 UnknownOrder（不计入会话隔离）
+    // Nonexistent order: the engine's own UnknownOrder (not counted as session isolation)
     h = d.cancel(0, 0, 12345);
     CHECK_STREAM(d.drain(0), evRejected(h, 12345, RequestType::Cancel, RejectReason::UnknownOrder));
     runner.stop();
@@ -1010,18 +1101,23 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     d.drain(1);
 
     Hdr h = d.modify(0, 0, 1, 101, 5);  // 改价穿价：作为 taker 成交 3，剩余 2 挂在 101
+                                        // crossing reprice: fills 3 as taker, the remaining 2 rest at 101
     CHECK_STREAM(d.drain(0), evModified(h, 1, 101, 5), evFill(h, 1, Liquidity::Taker, 1, 101, 3, 2));
     CHECK_STREAM(d.drain(1), evFill(h, 2, Liquidity::Maker, 1, 101, 3, 0));
 
     const OrderRequest s3 = mt::sell(3, 101, 2).account(2);
     h = d.submit(1, 0, s3);  // 吃掉改单后挂着的剩余
+                             // takes the remainder left resting after the modify
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 2, 101, 2, 0));
     CHECK_STREAM(d.drain(1), evAccepted(h, s3), evFill(h, 3, Liquidity::Taker, 2, 101, 2, 0));
 
     h = d.modify(0, 0, 1, 101, 1);  // 已完全成交：引擎的 UnknownOrder
+                                    // already fully filled: the engine's UnknownOrder
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Modify, RejectReason::UnknownOrder));
 
     // 改单后作为 taker 完全成交：订单离开订单簿，归属同步删除
+    // Fully filled as a taker after a modify: the order leaves the order book, and its ownership is deleted
+    // along with it
     const OrderRequest s4 = mt::sell(4, 102, 1).account(2);
     const OrderRequest b5 = mt::buy(5, 100, 1);
     d.submit(1, 0, s4);
@@ -1033,6 +1129,7 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     CHECK_STREAM(d.drain(1), evFill(h, 4, Liquidity::Maker, 3, 102, 1, 0));
 
     // 改单后被 STP 撤销（CancelTaker）：订单同样离开订单簿
+    // Cancelled by STP (CancelTaker) after a modify: the order leaves the order book as well
     const OrderRequest s6 = mt::sell(6, 104, 1).account(9);
     const OrderRequest b7 = mt::buy(7, 100, 2).account(9).stp(StpMode::CancelTaker);
     d.submit(1, 0, s6);
@@ -1054,6 +1151,8 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
 
 TEST_CASE("runner: requests that would push a level total past INT64_MAX are rejected to their sender") {
     // 一个网关的合法大单不能让价位总量溢出、进而让其他网关的 FOK 被误撤
+    // A valid large order from one gateway must not overflow the level total and thereby cause another
+    // gateway's FOK to be cancelled by mistake
     EngineRunner<> runner(testConfig(2));
     runner.addSymbol("AAA", 0, 64);
     runner.start();
@@ -1067,6 +1166,8 @@ TEST_CASE("runner: requests that would push a level total past INT64_MAX are rej
     CHECK_STREAM(d.drain(0), evRejected(h, 2, RequestType::New, RejectReason::InvalidQuantity));
 
     // 网关 1 的 FOK（不启用 STP 与 CancelMaker）照常成交；maker 一侧的 Fill 发给网关 0
+    // Gateway 1's FOK orders (one without STP, one with CancelMaker) fill as usual; the maker-side Fills go
+    // to gateway 0
     const OrderRequest f3 = mt::buy(3, 100, 10).account(9).fok();
     h = d.submit(1, 0, f3);
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 1, 100, 10, kP62 - 10));
@@ -1077,6 +1178,8 @@ TEST_CASE("runner: requests that would push a level total past INT64_MAX are rej
     CHECK_STREAM(d.drain(1), evAccepted(h, f4), evFill(h, 4, Liquidity::Taker, 2, 100, 10, 0));
 
     // 改单加量同样受限：被拒的改单不改变订单与归属；恰好到上限的改单生效
+    // Quantity-increasing modifies are bounded too: a rejected modify changes neither the order nor its
+    // ownership; a modify that lands exactly on the bound takes effect
     const OrderRequest s5 = mt::sell(5, 100, 1);
     h = d.submit(0, 0, s5);
     CHECK_STREAM(d.drain(0), evAccepted(h, s5));
@@ -1105,6 +1208,7 @@ TEST_CASE("runner: multi-symbol routing keeps books and owners separate") {
     SyncDriver<EngineRunner<>> d(runner);
 
     // 同一个订单 id 在两个交易对上分属不同网关
+    // The same order id belongs to different gateways on two symbols
     const OrderRequest a1 = mt::sell(1, 100, 5);
     const OrderRequest b1 = mt::sell(1, 200, 5);
     Hdr h = d.submit(0, A, a1);
@@ -1120,13 +1224,16 @@ TEST_CASE("runner: multi-symbol routing keeps books and owners separate") {
 
     const OrderRequest tb = mt::buy(7, 200, 3);
     h = d.submit(2, B, tb);  // 成交 id 按交易对各自从 1 开始
+                             // trade ids start from 1 separately per symbol
     CHECK_SILENT(d.drain(0));
     CHECK_STREAM(d.drain(1), evFill(h, 1, Liquidity::Maker, 1, 200, 3, 2));
     CHECK_STREAM(d.drain(2), evAccepted(h, tb), evFill(h, 7, Liquidity::Taker, 1, 200, 3, 0));
 
     h = d.cancel(0, B, 1);  // B 上的 1 属于网关 1
+                            // 1 on B belongs to gateway 1
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Cancel, RejectReason::UnknownOrder));
     h = d.cancel(0, A, 1);  // A 上的 1 已成交
+                            // 1 on A has already been filled
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Cancel, RejectReason::UnknownOrder));
     h = d.cancel(1, B, 1);
     CHECK_STREAM(d.drain(1), evCancelled(h, 1, 2, CancelReason::UserRequested));
@@ -1153,6 +1260,7 @@ TEST_CASE("runner: unknown symbols are rejected to the sender without side effec
     h = d.modify(0, 0xFFFF'FFFFu, 1, 100, 1);
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Modify, RejectReason::UnknownSymbol));
     CHECK_EQ(h.sym, 0xFFFF'FFFFu);  // 事件回显命令里的交易对 id
+                                    // the event echoes the symbol id from the command
     runner.stop();
     CHECK(!runner.ownerOf(2, 1).has_value());
     CHECK(!runner.ownerOf(0xFFFF'FFFFu, 1).has_value());
@@ -1181,6 +1289,8 @@ TEST_CASE("runner: the inbound queue index is the authoritative gateway") {
     runner.start();
     const OrderRequest r = mt::buy(1, 100, 1);
     EngineCommand c = EngineCommand::newOrder(0, 1, 0, r, 77);  // 声称来自网关 0，实际经由网关 1 的队列
+                                                                // claims to be from gateway 0, but actually
+                                                                // arrives through gateway 1's queue
     while (!runner.inbound(1).tryPush(c)) std::this_thread::yield();
     while (runner.processedCommands() < 1) std::this_thread::yield();
     EngineEvent e{};
@@ -1192,8 +1302,11 @@ TEST_CASE("runner: the inbound queue index is the authoritative gateway") {
     CHECK(runner.ownerOf(0, 1) == std::optional<GatewayId>(1));
     REQUIRE_EQ(journal.size(), 1u);
     CHECK_EQ(journal[0].gateway, GatewayId{1});         // 日志记录权威发送方
+                                                        // the journal records the authoritative sender
     CHECK_EQ(journal[0].command.gateway, GatewayId{0});  // 命令内容原样保留
+                                                         // the command content is kept as is
     CHECK_EQ(runner.stats().sequence_gaps, 0u);          // 序号按入站队列（网关 1）计
+                                                         // sequence numbers count per inbound queue (gateway 1)
 }
 
 TEST_CASE("runner: gateway sequence gaps are counted but commands are still processed") {
@@ -1201,6 +1314,7 @@ TEST_CASE("runner: gateway sequence gaps are counted but commands are still proc
     runner.addSymbol("AAA");
     runner.start();
     const std::uint64_t seqs[] = {1, 2, 4, 5, 5, 6};  // 3 缺失，5 重复
+                                                      // 3 missing, 5 duplicated
     std::uint64_t n = 0;
     for (std::uint64_t s : seqs) {
         EngineCommand c = EngineCommand::cancel(0, s, 0, 1000 + s);
@@ -1208,6 +1322,7 @@ TEST_CASE("runner: gateway sequence gaps are counted but commands are still proc
         ++n;
     }
     EngineCommand other = EngineCommand::cancel(1, 1, 0, 1);  // 另一个网关独立计数
+                                                              // another gateway counts independently
     while (!runner.inbound(1).tryPush(other)) std::this_thread::yield();
     ++n;
     while (runner.processedCommands() < n) std::this_thread::yield();
@@ -1222,6 +1337,7 @@ TEST_CASE("runner: gateway sequence gaps are counted but commands are still proc
 
 // ============================================================================
 // 生命周期：stop() 排空、空闲停止、重启、析构即停止、配置校验、绑核
+// Lifecycle: stop() draining, idle stop, restart, stop on destruction, configuration validation, CPU pinning
 // ============================================================================
 
 TEST_CASE("runner: stop() drains every inbound queue before the engine exits") {
@@ -1231,6 +1347,8 @@ TEST_CASE("runner: stop() drains every inbound queue before the engine exits") {
     EngineRunner<> runner(testConfig(kGateways, 4096, 4096, 5));
     runner.addSymbol("AAA", 0, 1 << 14);
     // 引擎启动前就把命令全部入队（全是买单、互不成交，每条恰好产生一个 Accepted）
+    // Enqueue every command before the engine starts (all buys that do not trade with each other, each
+    // producing exactly one Accepted)
     for (std::size_t g = 0; g < kGateways; ++g) {
         for (std::size_t i = 0; i < kPerGateway; ++i) {
             const OrderId id = (g + 1) * 100'000 + i;
@@ -1241,6 +1359,7 @@ TEST_CASE("runner: stop() drains every inbound queue before the engine exits") {
     }
     runner.start();
     runner.stop();  // 引擎线程很可能在处理第一条命令之前就看到了停止标志
+                    // the engine thread most likely sees the stop flag before processing the first command
     CHECK(!runner.running());
     const EngineRunnerStats st = runner.stats();
     CHECK_EQ(st.commands, kGateways * kPerGateway);
@@ -1263,6 +1382,7 @@ TEST_CASE("runner: stop() drains every inbound queue before the engine exits") {
     std::string why;
     CHECK(runner.checkInvariants(&why));
     runner.stop();  // 幂等
+                    // idempotent
 }
 
 TEST_CASE("runner: stop() while gateways are still producing drains what was submitted") {
@@ -1275,6 +1395,8 @@ TEST_CASE("runner: stop() while gateways are still producing drains what was sub
         scripts[g].commands = makeScript(so, static_cast<GatewayId>(g));
     }
     // 大入站队列：网关很快就全部入队，引擎多半还积压着大量命令时 stop() 就被调用了
+    // Large inbound queues: the gateways enqueue everything quickly, so stop() gets called while the engine
+    // most likely still has a large backlog of commands
     EngineRunner<> runner(testConfig(2, 1 << 15, 256, 16));
     runner.addSymbol(symbolName(0), 0, 1 << 14);
     driveConcurrently(runner, scripts, DriveOptions{});
@@ -1289,6 +1411,7 @@ TEST_CASE("runner: stop with idle queues, restart, and engine sequence continuit
     runner.start();
     CHECK(runner.running());
     CHECK_THROWS(runner.start());  // 已在运行
+                                   // already running
     CHECK_THROWS(runner.addSymbol("BBB"));
     runner.stop();
     CHECK(!runner.running());
@@ -1302,9 +1425,11 @@ TEST_CASE("runner: stop with idle queues, restart, and engine sequence continuit
     runner.stop();
 
     runner.addSymbol("BBB");  // 停止期间可以继续添加交易对
+                              // symbols can still be added while stopped
     runner.start();
     const OrderRequest s2 = mt::sell(2, 100, 1);
     h = d.submit(0, 0, s2);  // 状态与引擎序号都延续
+                             // both the state and the engine sequence number carry over
     CHECK_EQ(h.seq, 2u);
     CHECK_STREAM(d.drain(0), evAccepted(h, s2), evFill(h, 1, Liquidity::Maker, 1, 100, 1, 2),
                  evFill(h, 2, Liquidity::Taker, 1, 100, 1, 0));
@@ -1328,6 +1453,7 @@ TEST_CASE("runner: destroying a running runner drains pending commands") {
         }
         runner.start();
     }  // 析构 = stop()：排空后才退出
+       // destruction = stop(): exits only after draining
     REQUIRE_EQ(journal.size(), 500u);
     for (std::size_t i = 0; i < journal.size(); ++i) CHECK_EQ(journal[i].engine_seq, i + 1);
 }
@@ -1348,6 +1474,7 @@ TEST_CASE("runner: configuration is validated") {
     CHECK_THROWS(runner.outbound(5));
     runner.addSymbol("AAA");
     CHECK_THROWS(runner.addSymbol("AAA"));  // 重复名称：运行器不变
+                                            // duplicate name: the runner is unchanged
     CHECK_EQ(runner.symbolCount(), 1u);
     CHECK_EQ(runner.engine().symbolCount(), 1u);
     std::string why;
@@ -1366,11 +1493,13 @@ TEST_CASE("runner: optional CPU pinning of the engine thread") {
         SyncDriver<EngineRunner<>> d(runner);
         d.submit(0, 0, mt::buy(1, 10, 1));
         CHECK(runner.pinned());  // 收到事件之后读取：绑核结果对本线程可见
+                                 // read after receiving the event: the pinning result is visible to this thread
         runner.stop();
     }
     {
         EngineRunnerConfig c = testConfig(1);
         c.engine_cpu = 1 << 20;  // 不存在的 CPU：绑核失败，但运行器照常工作
+                                 // nonexistent CPU: pinning fails, but the runner works as usual
         EngineRunner<> runner(c);
         runner.addSymbol("AAA");
         runner.start();
@@ -1385,6 +1514,8 @@ TEST_CASE("runner: optional CPU pinning of the engine thread") {
 
 // ============================================================================
 // 零分配：预留容量之后，引擎线程处理命令（含成交、撤单、改单、拒单）不调用全局 operator new
+// Zero allocations: once capacity is reserved, the engine thread processes commands (including fills,
+// cancels, modifies and rejects) without calling the global operator new
 // ============================================================================
 
 TEST_CASE("runner: the engine thread does not allocate once capacity is reserved") {
@@ -1441,12 +1572,15 @@ TEST_CASE("runner: the engine thread does not allocate once capacity is reserved
     CHECK_EQ(runner.stats().commands, total);
     CHECK_EQ(runner.stats().events, events);
     CHECK_GT(fills, 100u);  // 负载里确实有成交
+                            // the workload really contains trades
     std::string why;
     CHECK(runner.checkInvariants(&why));
 }
 
 // ============================================================================
 // 并发差分：G 个网关线程并发 → 引擎处理顺序 → 单线程回放，逐网关事件流逐条相等
+// Concurrent differential: G concurrent gateway threads → engine processing order → single-threaded
+// replay, with per-gateway event streams equal event by event
 // ============================================================================
 
 namespace {
@@ -1480,6 +1614,7 @@ TEST_CASE("runner: concurrent gateways match a single-threaded replay of the eng
         }
     }
     // 负载确实覆盖了成交、跨网关会话隔离与背压
+    // The workload really covered trades, cross-gateway session isolation and back-pressure
     CHECK_GT(trades, 1000u);
     CHECK_GT(foreign, 10u);
     CHECK_GT(outbound_full, 0u);
@@ -1490,10 +1625,13 @@ TEST_CASE("runner: concurrent gateways match a single-threaded replay of the eng
 
 TEST_CASE("runner: back-pressure with a tiny outbound queue loses nothing and does not deadlock") {
     // 出站容量 2 + 慢消费者 + 极小入站队列：引擎经常因出站满而自旋，网关经常因入站满而等待
+    // Outbound capacity 2 + slow consumers + tiny inbound queues: the engine often spins because outbound is
+    // full, and the gateways often wait because inbound is full
     const Scenario sc{"back-pressure", 3, 1, 4000, 2, 2, 4, true, true, 0.0, 0.0};
     const ScenarioResult r = runScenario(sc, 99);
     CHECK_GT(r.stats.outbound_full, 0u);
     CHECK_GT(r.total_events, r.stats.commands);  // 有成交：事件数多于命令数
+                                                 // there are trades: more events than commands
 }
 
 int main(int argc, char** argv) { return hft_test::runAll(argc, argv); }

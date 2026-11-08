@@ -2,6 +2,10 @@
 // naive_order_book.h
 // 第二个独立预言机：全部挂单放在一个无序 vector 中，每次线性扫描求价格-时间优先级。
 // 数据结构与参考模型完全不同，用来交叉验证参考模型本身（参考模型是差分测试的标准答案）。
+// Second independent oracle: all resting orders live in one unordered vector, and price-time priority is
+// found by a linear scan every time.
+// Its data structures are completely different from the reference model's; it cross-validates the
+// reference model itself (the reference model is the ground truth of the differential tests).
 //
 
 #pragma once
@@ -30,6 +34,19 @@ namespace hft::matching::test {
 // - 档位总量上限（kMaxLevelQty）不用"上限减去现有总量"，而是把目标价位上其他挂单逐单加到请求数量上、
 //   检测加法溢出；改单时按 id 排除订单自己，而不是减去它原来的数量
 // 接口与 ReferenceOrderBook / LimitOrderBook 相同（docs/MATCHING_ENGINE.md）。仅用于测试，性能无关紧要。
+// Implementation choices that deliberately differ from the reference model:
+// - The resting orders are a single std::vector<Resting>, with no level structure and no index; time
+//   priority uses a globally increasing arrival sequence number seq
+// - The best maker, the depth, the levels etc. are all computed on the fly by linear scans + sorting
+// - The FOK pre-check does not implement a separate "walk and sum"; instead it dry-runs the real
+//   matching loop on a copy of the resting orders (discarding the events) to see whether the order fills
+//   completely — this also verifies that the spec's description "the pre-check walks in matching order"
+//   agrees with the matching loop itself
+// - The level total bound (kMaxLevelQty) does not use "bound minus existing total"; instead it adds the
+//   other resting orders at the target price one by one to the requested quantity and detects addition
+//   overflow; a modify excludes the order itself by id instead of subtracting its original quantity
+// Same interface as ReferenceOrderBook / LimitOrderBook (docs/MATCHING_ENGINE.md). For tests only;
+// performance does not matter.
 template <class Listener>
 class NaiveOrderBook {
 public:
@@ -51,6 +68,7 @@ public:
                               req.price, req.stp};
         if (req.tif == TimeInForce::FOK) {
             // 在副本上空跑撮合：只有完全成交且未被 STP 终止才算可成交
+            // Dry-run the matching on a copy: only a complete fill not terminated by STP counts as fillable
             std::vector<Resting> scratch = orders_;
             DiscardEvents sink;
             TradeId scratch_trade_id = last_trade_id_;
@@ -71,6 +89,7 @@ public:
             listener_.onCancelled(req.id, left, CancelReason::IocRemainder);
         } else {
             // 限价 GTC（FOK 能走到这里说明预检通过，剩余必为 0）
+            // Limit GTC (an FOK that gets here has passed the pre-check, so its remainder must be 0)
             insert(OrderInfo{req.id, req.account, req.side, req.price, left, req.post_only, req.stp});
         }
     }
@@ -90,6 +109,8 @@ public:
         if (new_price <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidPrice);
         OrderInfo info = orders_[i].info;
         // 改价或加量会把订单重新挂到 new_price：挂上去之后该档总量不得越界（原地减量不受限）
+        // A reprice or quantity increase re-rests the order at new_price: once it rests there, that level's
+        // total must stay within the bound (an in-place decrease is not limited)
         const bool in_place = new_price == info.price && new_qty <= info.remaining;
         if (!in_place && exceedsLevelBound(info.side, new_price, id, new_qty))
             return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
@@ -97,6 +118,7 @@ public:
             return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
         if (in_place) {
             orders_[i].info.remaining = new_qty;  // 原地修改：seq 不变，保留时间优先级
+                                                  // in-place modify: seq unchanged, time priority kept
             listener_.onModified(id, new_price, new_qty);
             return;
         }
@@ -109,9 +131,11 @@ public:
         info.price = new_price;
         info.remaining = left;
         insert(info);  // 新的 seq：排到队尾
+                       // new seq: goes to the back of the queue
     }
 
     // ---- 查询 ----
+    // ---- Queries ----
     std::optional<Price> bestBid() const { return bestPrice(Side::Buy); }
     std::optional<Price> bestAsk() const { return bestPrice(Side::Sell); }
 
@@ -194,6 +218,7 @@ private:
     struct Resting {
         OrderInfo info;
         std::uint64_t seq;  // 到达序号：越小越早
+                            // arrival sequence number: smaller = earlier
     };
 
     struct TakerSpec {
@@ -202,6 +227,7 @@ private:
         Side side;
         bool market;
         Price limit;  // 市价单不使用
+                      // unused for market orders
         StpMode stp;
     };
 
@@ -215,6 +241,7 @@ private:
     static Side other(Side side) { return side == Side::Buy ? Side::Sell : Side::Buy; }
 
     // 同侧两单 a 是否排在 b 前面：价格优先，其次到达顺序
+    // Whether order a ranks ahead of order b on the same side: price first, then arrival order
     static bool ahead(const Resting& a, const Resting& b) {
         if (a.info.price != b.info.price)
             return a.info.side == Side::Buy ? a.info.price > b.info.price : a.info.price < b.info.price;
@@ -231,6 +258,7 @@ private:
     }
 
     // 某侧排第一的订单下标；该侧为空返回 kNone
+    // Index of the first-ranked order on a side; kNone if that side is empty
     static std::size_t topOf(const std::vector<Resting>& book, Side side) {
         std::size_t best = kNone;
         for (std::size_t i = 0; i < book.size(); ++i) {
@@ -241,6 +269,8 @@ private:
     }
 
     // 撮合：taker 吃 book 中对手方的挂单。返回 false 表示被 STP 终止（CancelTaker/CancelBoth）。
+    // Matching: the taker takes the opposite side's resting orders in book. Returns false if terminated by
+    // STP (CancelTaker/CancelBoth).
     template <class Sink>
     static bool sweep(std::vector<Resting>& book, Sink& sink, TradeId& last_trade_id,
                       const TakerSpec& taker, Qty& left) {
@@ -306,6 +336,7 @@ private:
         if (max_orders_ != 0 && limit_gtc && orders_.size() >= max_orders_)
             return RejectReason::CapacityExceeded;
         // 只有限价 GTC 会挂单；新单的 id 不在簿上，没有需要排除的订单
+        // Only limit GTC orders rest; a new order's id is not in the book, so there is no order to exclude
         if (limit_gtc && exceedsLevelBound(r.side, r.price, std::nullopt, r.qty)) return RejectReason::InvalidQuantity;
         if (r.post_only && wouldCross(r.side, r.price)) return RejectReason::PostOnlyWouldCross;
         return std::nullopt;
@@ -313,6 +344,8 @@ private:
 
     // 档位总量上限：把 (side, price) 上除 exclude 之外的挂单逐单加到 qty 上，结果是否超过 kMaxLevelQty
     // （任何一步加法溢出都算超过）
+    // Level total bound: adds each resting order at (side, price), except exclude, to qty one at a time and
+    // tells whether the result exceeds kMaxLevelQty (an overflow in any of the additions counts as exceeding)
     bool exceedsLevelBound(Side side, Price price, std::optional<OrderId> exclude, Qty qty) const {
         Qty total = qty;
         for (const Resting& r : orders_) {
@@ -323,6 +356,8 @@ private:
     }
 
     // 查询时累加档位总量：上限规则保证结果不超过 kMaxLevelQty；加法溢出说明本模型自身有错，直接中止
+    // Accumulates a level total for queries: the bound rules guarantee the result does not exceed
+    // kMaxLevelQty; an addition overflow means this model itself is wrong, so abort immediately
     static Qty addToLevel(Qty total, Qty qty) {
         Qty sum = 0;
         if (__builtin_add_overflow(total, qty, &sum) || sum > kMaxLevelQty) {

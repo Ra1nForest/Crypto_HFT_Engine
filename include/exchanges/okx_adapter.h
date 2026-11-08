@@ -1,6 +1,8 @@
 //
 // okx_adapter.h
 // OKX 深度适配器：books5/bbo-tbt 全量推送直接替换；books（400 档增量）按 seqId/prevSeqId 衔接并校验 CRC32 checksum。
+// OKX depth adapter: books5/bbo-tbt full pushes replace the book directly; books (400-level incremental
+// updates) is chained by seqId/prevSeqId and verified against the CRC32 checksum.
 //
 
 #pragma once
@@ -41,6 +43,42 @@
 // - 退订帧：订阅 JSON 中 "op":"subscribe" 改为 "op":"unsubscribe"；推导不出时（或没有订阅消息）重同步改为 reconnect。
 // - 应用每条更新（含快照）后若簿交叉 → crossed_books++，按缺口方式重同步（全量推送频道只清空等待下一次推送）。
 // - 重同步之后若持续收到增量却迟迟没有新快照（超过 kMaxUnsyncedUpdates 条），要求重连。
+// Message types:
+// - Plain text "pong" → ignored; {"event":"subscribe"/"unsubscribe"/...} → ignored;
+//   {"event":"error","code":..,"msg":..} → error (a subscription problem, no reconnect);
+//   {"event":"notice",..} (service upgrade notice) → reconnect.
+// - Pushes without an action field (books5 / bbo-tbt):
+//   {"arg":{"channel":"books5",..},"data":[{"asks":..,"bids":..,"ts":"ms"}]}
+//   → replace the whole book, synced, exchange_ts_ms = data[0].ts. These two channels carry no checksum,
+//   so the original-string tables are not maintained (every push replaces the whole book, so maintaining
+//   them would only mean needlessly clearing and refilling two 2048-bucket tables); should a push carry a
+//   checksum after all, it is verified as usual.
+// - books incremental updates: "action":"snapshot" → replace the whole book, seq = seqId, synced;
+//   "action":"update" → ignored while unsynced;
+//   prevSeqId != the previous message's seqId → gap (gaps++, resyncs++, clear, unsynced,
+//   send = {unsubscribe, subscribe});
+//   otherwise upsert level by level (size "0" deletes), seq = seqId. Heartbeat updates (empty bids/asks
+//   and prevSeqId == seqId) pass the chain check but do not change the book;
+//   a sequence reset (seqId < prevSeqId) is accepted as long as prevSeqId chains.
+// - checksum (when verify_checksum is on and the message carries the field): take the top 25 levels and
+//   concatenate them interleaved as bid0px:bid0sz:ask0px:ask0sz:bid1px:...; when one side has fewer than
+//   25 levels, continue with the remaining levels of the other side; join with ':' and compare the CRC32,
+//   as a signed int32, with checksum.
+//   The concatenation uses the **original strings** received for each level (one
+//   hft::FlatHashMap<price bit pattern, LevelText> per side, updated on every level change; maintained
+//   only on the incremental channel or when the entry itself carries a checksum).
+//   Mismatch after an update → checksum_failures++, resync as for a gap.
+//   Safety valve: a freshly received **snapshot** that itself fails verification means our way of
+//   concatenating (not the data) is wrong → set error ("checksum verification disabled: ..."), turn
+//   verification off for the rest of the adapter's lifetime, and keep running.
+//   A level string longer than LevelText::kMaxLen bytes (cannot be stored verbatim) turns verification
+//   off as well.
+// - Unsubscribe frame: the subscribe JSON with "op":"subscribe" changed to "op":"unsubscribe"; when that
+//   cannot be derived (or there is no subscribe message), the resync becomes a reconnect.
+// - A crossed book after applying any update (snapshots included) → crossed_books++, resync as for a gap
+//   (full-push channels only clear and wait for the next push).
+// - If incremental updates keep arriving after a resync but no new snapshot comes for a long time (more
+//   than kMaxUnsyncedUpdates of them), request a reconnect.
 class OkxAdapter final : public ExchangeAdapter {
 public:
     static constexpr std::size_t kChecksumLevels = 25;
@@ -59,10 +97,14 @@ public:
     int pingIntervalMs() const override { return 20000; }
 
     // ---------------- 诊断（测试用） ----------------
+    // ---------------- Diagnostics (for tests) ----------------
     bool checksumEnabled() const noexcept { return verify_; }
     std::int64_t lastSeqId() const noexcept { return seq_; }
     // 当前簿的校验串（与计算 checksum 用的完全一致）。不维护原始字符串时返回空串：
     // 校验关闭之后，以及全量推送频道（books5 / bbo-tbt，推送不带 checksum）
+    // Checksum string of the current book (exactly the one the checksum is computed from). Returns an empty
+    // string when the original strings are not maintained: after verification is turned off, and on the
+    // full-push channels (books5 / bbo-tbt, whose pushes carry no checksum)
     std::string checksumString() const {
         char buf[kChecksumBufSize];
         std::size_t len = 0;
@@ -70,6 +112,7 @@ public:
         return std::string(buf, len);
     }
     // 原始字符串表的条目数（维护时与簿的档位数一致；不维护时为 0）
+    // Entry count of the original-string table (equals the book's level count when maintained; 0 otherwise)
     std::size_t textEntries(BookSide side) const noexcept {
         return side == BookSide::Bid ? bid_text_.size() : ask_text_.size();
     }
@@ -79,8 +122,13 @@ private:
 
     // 一档的校验串片段 "价格:数量"（原始字符串原样拼好，定长数组存放在哈希表内，无额外分配）。
     // 预先拼好并按定长整体复制（memcpy 常量长度会被内联成几条向量指令），比每档两次变长 memcpy 快得多。
+    // Checksum-string fragment of one level, "price:quantity" (the original strings joined verbatim, kept in
+    // a fixed-size array inside the hash map, no extra allocation).
+    // Joined in advance and copied whole at a fixed length (a constant-length memcpy is inlined into a few
+    // vector instructions), much faster than two variable-length memcpy calls per level.
     struct LevelText {
         static constexpr std::size_t kMaxLen = 32;                  // 价格或数量字符串的最大长度
+                                                                    // maximum length of a price or quantity string
         static constexpr std::size_t kCapacity = 2 * kMaxLen + 1;   // "px:sz"
         std::uint8_t len = 0;
         char text[kCapacity];
@@ -88,9 +136,11 @@ private:
     using TextMap = hft::FlatHashMap<std::uint64_t, LevelText>;
 
     // 校验串缓冲区：25 档 x 2 侧 x ("px:sz" + ':')，末尾留出整块复制的余量
+    // Checksum-string buffer: 25 levels x 2 sides x ("px:sz" + ':'), plus slack at the end for the block copy
     static constexpr std::size_t kChecksumBufSize = kChecksumLevels * 2 * (LevelText::kCapacity + 1) + LevelText::kCapacity;
 
     // 顶层字段
+    // Top-level fields
     enum : unsigned {
         kEvent = 1u << 0,
         kArg = 1u << 1,
@@ -101,6 +151,7 @@ private:
         kChannel = 1u << 6,
     };
     // data[i] 的字段
+    // Fields of data[i]
     enum : unsigned {
         kBids = 1u << 0,
         kAsks = 1u << 1,
@@ -116,6 +167,7 @@ private:
     };
 
     // data 数组中的一项；档位存放在 bids_/asks_ 的 [begin, end) 区间
+    // One element of the data array; its levels are stored in the [begin, end) ranges of bids_/asks_
     struct Entry {
         unsigned seen = 0;
         std::size_t bid_begin = 0, bid_end = 0, ask_begin = 0, ask_end = 0;
@@ -123,6 +175,8 @@ private:
     };
 
     // 价格的 64 位键：double 的二进制位（价格均为正的有限值，相同字符串解析出相同的位模式）
+    // 64-bit key of a price: the bits of the double (prices are all positive and finite, and identical
+    // strings parse to identical bit patterns)
     static std::uint64_t priceKey(double price) noexcept {
         std::uint64_t k = 0;
         std::memcpy(&k, &price, sizeof(k));
@@ -130,9 +184,12 @@ private:
     }
 
     // ---------------- 解析 ----------------
+    // ---------------- Parsing ----------------
 
     // 单遍解析整条消息（data 的条目写入 entries_，档位写入 bids_ / asks_）；
     // JSON 错误、根不是对象、尾随内容、重复的关键字段都返回 false
+    // Parses the whole message in a single pass (data entries go into entries_, levels into bids_ / asks_);
+    // a JSON error, a root that is not an object, trailing content or a duplicated key field returns false
     bool parse(std::string_view payload, Msg& m) {
         using namespace adapter_detail;
         entries_.clear();
@@ -147,6 +204,7 @@ private:
             const std::string_view key = field.escaped_key();
             od::value& v = field.value();
             bool ok = true;  // connId 等无关字段不读取
+                             // irrelevant fields such as connId are not read
             if (key == "event") ok = firstSeen(m.seen, kEvent) && readString(v, m.event);
             else if (key == "arg") ok = firstSeen(m.seen, kArg) && parseArg(v, m);
             else if (key == "action") ok = firstSeen(m.seen, kAction) && readString(v, m.action);
@@ -173,6 +231,9 @@ private:
 
     // data 数组。已知是其他频道（OKX 总是先发 arg）：data 的形状可能完全不同（如 K 线是数组的数组），
     // 不解析，迭代器自动跳过
+    // The data array. If the channel is already known to be another one (OKX always sends arg first), data
+    // may have a completely different shape (e.g. candlesticks are arrays of arrays): it is not parsed, and
+    // the iterator skips it automatically
     bool parseData(adapter_detail::od::value& v, const Msg& m) {
         using namespace adapter_detail;
         if ((m.seen & kChannel) != 0 && !isBookChannel(m.channel)) return true;
@@ -190,6 +251,7 @@ private:
                 const std::string_view key = field.escaped_key();
                 od::value& fv = field.value();
                 bool ok = true;  // instId 等
+                                 // instId etc.
                 if (key == "bids") ok = firstSeen(e.seen, kBids) && parseLevels(fv, bids_);
                 else if (key == "asks") ok = firstSeen(e.seen, kAsks) && parseLevels(fv, asks_);
                 else if (key == "ts") ok = firstSeen(e.seen, kTs) && readInt(fv, e.ts);
@@ -210,6 +272,7 @@ private:
     }
 
     // ---------------- 处理 ----------------
+    // ---------------- Handling ----------------
 
     void handleMessage(std::string_view payload, AdapterResult& out) override {
         if (payload == "pong") {
@@ -221,14 +284,17 @@ private:
         if ((m.seen & kEvent) != 0) return handleEvent(m, out);
         if ((m.seen & kData) == 0) {
             ++stats_.ignored;  // 既不是事件也不是推送的合法 JSON
+                               // valid JSON that is neither an event nor a push
             return;
         }
         if ((m.seen & kChannel) == 0) return malformed(out, "data push without arg.channel", payload.size());
         if (!isBookChannel(m.channel)) {
             ++stats_.ignored;  // 同一连接上订阅的其他频道
+                               // another channel subscribed on the same connection
             return;
         }
         unsigned common = ~0u;  // 每个条目都带的字段
+                                // fields present in every entry
         for (const Entry& e : entries_) common &= e.seen;
         if ((common & (kBids | kAsks)) != (kBids | kAsks)) {
             return malformed(out, "book entry without bids/asks", payload.size());
@@ -262,14 +328,21 @@ private:
             out.error = adapter_detail::concat({"OKX notice ", m.code, ": ", m.text, " (reconnecting)"});
         }
         // subscribe / unsubscribe / channel-conn-count / login 等：忽略
+        // subscribe / unsubscribe / channel-conn-count / login etc.: ignored
     }
 
     // 全量快照（books 的 snapshot，或 books5/bbo-tbt 的每次推送）。返回是否继续处理同一消息的后续条目。
+    // Full snapshot (the books snapshot, or every push of books5/bbo-tbt). Returns whether to continue with
+    // the remaining entries of the same message.
     bool applySnapshot(const Entry& e, AdapterResult& out) {
         // 原始字符串只在用得上时维护：增量频道（之后的 update 要用它们校验），或本条目自带 checksum
+        // The original strings are maintained only when needed: on the incremental channel (later updates are
+        // verified with them), or when this entry itself carries a checksum
         const bool keep_texts = incremental_ || (e.seen & kChecksum) != 0;
         if (keep_texts) checkTextsFit(e, out);
         // 表为空时 clear() 是 O(1)；不维护字符串时也要清，丢掉之前 books 快照留下的条目
+        // clear() is O(1) when the table is empty; clear even when the strings are not maintained, to drop the
+        // entries left over from an earlier books snapshot
         bid_text_.clear();
         ask_text_.clear();
         if (keep_texts) setTexts(e);
@@ -295,6 +368,7 @@ private:
     }
 
     // 增量更新。返回是否继续处理同一消息的后续条目。
+    // Incremental update. Returns whether to continue with the remaining entries of the same message.
     bool applyUpdate(const Entry& e, AdapterResult& out) {
         if (!synced_) {
             ignoreUnsynced(out);
@@ -309,6 +383,8 @@ private:
         }
         checkTextsFit(e, out);
         // 原始字符串表按消息顺序逐档同步（同价以后者为准）；簿批量排序 + 归并
+        // The original-string tables are synced level by level in message order (the later one wins for the same
+        // price); the book uses a batched sort + merge
         setTexts(e);
         const bool changed = updateBook(bids_.data() + e.bid_begin, e.bid_end - e.bid_begin,
                                         asks_.data() + e.ask_begin, e.ask_end - e.ask_begin);
@@ -316,6 +392,7 @@ private:
         book_.setUpdateId(seq_ > 0 ? static_cast<std::uint64_t>(seq_) : 0);
         if (e.bid_begin == e.bid_end && e.ask_begin == e.ask_end) {
             ++stats_.ignored;  // 心跳：衔接检查通过，簿不变
+                               // heartbeat: passed the chain check, book unchanged
         } else {
             ++stats_.deltas;
         }
@@ -337,18 +414,25 @@ private:
     }
 
     // 校验开启且条目带 checksum 时核对当前簿（判断内联，计算在 checksumMatches 里）
+    // Checks the current book when verification is on and the entry carries a checksum (the condition is
+    // inlined, the computation lives in checksumMatches)
     bool checksumOk(const Entry& e, std::int32_t& computed) {
         return !verify_ || (e.seen & kChecksum) == 0 || checksumMatches(e, computed);
     }
 
     // 核对 e.checksum 与当前簿；不符（或某档缺少原始字符串）时 checksum_failures++ 并返回 false，
     // computed 为算出的值（拼不出校验串时为 0）
+    // Checks e.checksum against the current book; on a mismatch (or a level without original strings),
+    // checksum_failures++ and returns false; computed receives the computed value (0 when the checksum
+    // string cannot be built)
     bool checksumMatches(const Entry& e, std::int32_t& computed) {
         char buf[kChecksumBufSize];
         std::size_t len = 0;
         if (buildChecksumString(buf, len)) {
             computed = hft::toSignedCrc(hft::crc32(buf, len));
             // 文档规定 checksum 是有符号 32 位整数；为稳妥起见也接受同一 CRC 的无符号写法（比较低 32 位）
+            // The documentation specifies checksum as a signed 32-bit integer; to be safe, the unsigned spelling of
+            // the same CRC is accepted too (the low 32 bits are compared)
             if (e.checksum >= std::numeric_limits<std::int32_t>::min() &&
                 e.checksum <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) &&
                 static_cast<std::uint32_t>(computed) == static_cast<std::uint32_t>(e.checksum)) {
@@ -360,6 +444,8 @@ private:
     }
 
     // 校验开启时同步条目中每档的原始字符串（数量 0 删除），按消息顺序（同价以后者为准）
+    // When verification is on, syncs the original strings of every level in the entry (quantity 0 deletes),
+    // in message order (for the same price the later one wins)
     void setTexts(const Entry& e) {
         if (!verify_) return;
         for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setText(bid_text_, bids_[i]);
@@ -373,6 +459,7 @@ private:
             return;
         }
         LevelText& t = texts[key];  // 引用只在本函数内使用（之后才有下一次修改）
+                                    // the reference is used only in this function, before the next modification
         std::memcpy(t.text, l.px.data(), l.px.size());
         t.text[l.px.size()] = ':';
         std::memcpy(t.text + l.px.size() + 1, l.sz.data(), l.sz.size());
@@ -380,6 +467,7 @@ private:
     }
 
     // 安全阀：条目中有字符串长到无法原样存进 LevelText 时关闭校验
+    // Safety valve: turns verification off when a string in the entry is too long to store verbatim in LevelText
     void checkTextsFit(const Entry& e, AdapterResult& out) {
         const auto fits = [](const RawLevel& l) {
             return l.px.size() <= LevelText::kMaxLen && l.sz.size() <= LevelText::kMaxLen;
@@ -393,6 +481,7 @@ private:
     }
 
     // 拼接校验串；某档缺少原始字符串（内部不一致）时返回 false
+    // Builds the checksum string; returns false when a level lacks its original strings (internal inconsistency)
     bool buildChecksumString(char* buf, std::size_t& len) const noexcept {
         const std::vector<PriceLevel>& bids = book_.getBids();
         const std::vector<PriceLevel>& asks = book_.getAsks();
@@ -404,6 +493,8 @@ private:
             if (t == nullptr) return false;
             if (pos != 0) buf[pos++] = ':';
             std::memcpy(buf + pos, t->text, LevelText::kCapacity);  // 定长整块复制，只推进实际长度
+                                                                    // fixed-size block copy;
+                                                                    // advance only by the actual length
             pos += t->len;
             return true;
         };
@@ -417,6 +508,7 @@ private:
     }
 
     // 安全阀：关闭校验并释放原始字符串表
+    // Safety valve: turns verification off and releases the original-string tables
     void disableChecksum(AdapterResult& out, const std::string& why) {
         verify_ = false;
         bid_text_.clear();
@@ -425,6 +517,8 @@ private:
     }
 
     // 裁剪簿时同步删除被裁掉档位的原始字符串（簿在上限之内时两个循环都不执行）
+    // When the book is trimmed, also deletes the original strings of the trimmed levels (neither loop runs
+    // while the book is within the cap)
     void trimBook() override {
         if (verify_) {
             const std::size_t limit = adapter_detail::kMaxBookLevels;
@@ -437,6 +531,8 @@ private:
     }
 
     // 重同步：清空簿；增量频道发送 unsubscribe + subscribe（推导不出退订帧时要求重连），全量频道等待下一次推送
+    // Resync: clears the book; the incremental channel sends unsubscribe + subscribe (requesting a reconnect
+    // when the unsubscribe frame cannot be derived), full-push channels wait for the next push
     void resync(AdapterResult& out, const char* why) {
         ++stats_.resyncs;
         if (why != nullptr) out.error = std::string("OKX: ") + why + ", resyncing";
@@ -451,9 +547,17 @@ private:
     }
 
     bool verify_;                       // checksum 校验是否开启（安全阀触发后永久关闭）
+                                        // whether checksum verification is on (the safety valve turns it off for good)
     TextMap bid_text_;                  // 买盘每档原始字符串
+                                        // original strings of each bid level
     TextMap ask_text_;                  // 卖盘每档原始字符串
+                                        // original strings of each ask level
     std::vector<Entry> entries_;        // 当前消息的 data 条目
+                                        // data entries of the current message
     std::int64_t seq_ = 0;              // 最近一条已应用消息的 seqId
+                                        // seqId of the last applied message
     bool incremental_ = false;          // 当前消息是否来自带 action 的增量频道（每条订单簿消息都先设置；决定重同步方式）
+                                        // whether the current message comes from the incremental channel
+                                        // with an action field (set first for every order book message;
+                                        // decides how to resync)
 };

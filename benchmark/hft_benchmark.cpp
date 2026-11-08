@@ -6,6 +6,13 @@
 // 用法：./build/hft_benchmark [--quick] [--pin]
 //   --quick  规模缩小 10 倍（冒烟运行）
 //   --pin    把两个基准线程分别绑定到 CPU 0 / 1
+// Benchmark of the HFT core library. Note: this program directly includes and tests the real headers under
+// include/hft/ (not separately written copies), comparing the lock-free SPSC queue vs std::mutex + std::deque,
+// ObjectPool vs new/delete, FlatHashMap vs std::unordered_map (plus single-probe compound operations), and
+// LatencyHistogram vs the old "copy + sort the samples" percentile statistics.
+// Usage: ./build/hft_benchmark [--quick] [--pin]
+//   --quick  10x smaller scale (smoke run)
+//   --pin    pin the two benchmark threads to CPU 0 / 1 respectively
 //
 
 #include "hft/common.h"
@@ -33,12 +40,15 @@
 namespace {
 
 // 防止编译器把被测代码当作无用代码删除（同 Google Benchmark 的 DoNotOptimize）
+// Keeps the compiler from deleting the code under test as dead code (like Google Benchmark's DoNotOptimize)
 template <class T>
 inline void doNotOptimize(const T& value) {
     __asm__ __volatile__("" : : "r,m"(value) : "memory");
 }
 
 // 忙等：先自旋，长时间等不到再让出 CPU（共享机器上避免两个线程互相饿死）
+// Busy wait: spin first, and yield the CPU if the wait drags on (keeps the two threads from starving each
+// other on shared machines)
 inline void spinWait(unsigned& spins) {
     if (++spins < 4096) {
         hft::cpuRelax();
@@ -61,6 +71,7 @@ void printSpeedup(const char* what, double baseline_ns, double ours_ns) {
 }
 
 // 对照组：互斥锁 + std::deque 的有界队列（接口与 SpscQueue 的 tryPush/tryPop 一致）
+// Baseline: a bounded mutex + std::deque queue (same tryPush/tryPop interface as SpscQueue)
 template <class T>
 class MutexQueue {
 public:
@@ -87,6 +98,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // 1. 队列吞吐：一个生产者线程、一个消费者线程，传递 items 个 uint64
+// 1. Queue throughput: one producer thread, one consumer thread, passing items uint64 values
 // ---------------------------------------------------------------------------
 template <class Queue>
 double queueThroughputNsPerItem(Queue& q, std::uint64_t items, bool pin) {
@@ -128,6 +140,8 @@ double queueThroughputNsPerItem(Queue& q, std::uint64_t items, bool pin) {
 }
 
 // 往返延迟：主线程推入 TSC 时间戳，回声线程原样送回，主线程记录 RTT
+// Round-trip latency: the main thread pushes a TSC timestamp, the echo thread sends it back as is, and the
+// main thread records the RTT
 template <class Queue>
 void queuePingPong(Queue& to_echo, Queue& from_echo, std::uint64_t rounds, bool pin, hft::LatencyHistogram& rtt) {
     std::thread echo([&] {
@@ -152,6 +166,7 @@ void queuePingPong(Queue& to_echo, Queue& from_echo, std::uint64_t rounds, bool 
             while (!from_echo.tryPop(v)) spinWait(spins);
             const std::int64_t ns = clock.toNs(hft::rdtscp() - v);
             if (i >= rounds / 10) rtt.record(ns > 0 ? static_cast<std::uint64_t>(ns) : 0);  // 前 10% 预热
+                                                                                            // first 10% is warm-up
         }
     });
     pinger.join();
@@ -196,6 +211,7 @@ void benchQueues(std::uint64_t scale, bool pin) {
 
 // ---------------------------------------------------------------------------
 // 2. 对象池 vs new/delete（64 字节的类订单对象）
+// 2. Object pool vs new/delete (64-byte order-like objects)
 // ---------------------------------------------------------------------------
 struct BenchOrder {
     std::uint64_t id, account, price, qty, timestamp;
@@ -229,6 +245,8 @@ void benchPool(std::uint64_t scale) {
         heap_lifo = nsSince(t0) / static_cast<double>(n);
     }
     // 随机工作集：10 万个存活对象，每次随机销毁一个再创建一个（malloc 的碎片化场景）
+    // Random working set: 100,000 live objects; each step destroys a random one and creates a new one (the
+    // malloc fragmentation scenario)
     const std::size_t live_count = 100'000;
     std::vector<std::uint32_t> picks(1u << 20);
     std::mt19937_64 rng(42);
@@ -271,6 +289,7 @@ void benchPool(std::uint64_t scale) {
 
 // ---------------------------------------------------------------------------
 // 3. FlatHashMap vs std::unordered_map（订单 id 索引场景）
+// 3. FlatHashMap vs std::unordered_map (order id index scenario)
 // ---------------------------------------------------------------------------
 template <class Map>
 struct MapOps;
@@ -298,6 +317,7 @@ struct MapResult {
     double mixed = 1e30, find_hit = 1e30, find_miss = 1e30, insert = 1e30, erase = 1e30;
 
     // 逐项保留更快的一次
+    // Keep the faster run for each item
     void keepBest(const MapResult& r) {
         mixed = std::min(mixed, r.mixed);
         find_hit = std::min(find_hit, r.find_hit);
@@ -312,11 +332,14 @@ MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random
     using Ops = MapOps<Map>;
     MapResult r;
     const std::uint64_t window = 100'000;  // 存活订单数
+                                           // number of live orders
     const std::uint64_t iters = 4'000'000 / scale;
     std::mt19937_64 rng(7);
     std::vector<std::uint32_t> offsets(1u << 20);
     for (auto& o : offsets) o = static_cast<std::uint32_t>(rng() % window);
     // 混合负载：每轮插入一个新 id，命中查找一次、未命中查找一次，撤销最老的订单（滑动窗口）
+    // Mixed workload: each round inserts a new id, does one hit lookup and one miss lookup, and cancels the
+    // oldest order (sliding window)
     {
         Map m;
         m.reserve(window * 2);
@@ -338,6 +361,7 @@ MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random
         doNotOptimize(sink);
     }
     // 单项操作：100 万个随机 64 位键
+    // Single operations: 1M random 64-bit keys
     const std::size_t n = static_cast<std::size_t>(1'000'000 / scale);
     {
         Map m;
@@ -357,6 +381,7 @@ MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random
         const std::int64_t t2 = hft::nowNs();
         for (std::size_t i = 0; i < n; ++i) {
             const auto* p = Ops::find(m, random_keys[n + i]);  // 不在表中的键
+                                                               // keys not in the table
             sink += p != nullptr ? 1 : 0;
         }
         r.find_miss = nsSince(t2) / static_cast<double>(n);
@@ -372,6 +397,13 @@ MapResult benchMap(std::uint64_t scale, const std::vector<std::uint64_t>& random
 // 先建表（不计时）再计时。挂单：contains 查重 + insert（两次探测） vs 插入占位值查重并预留、再经指针填写（一次）；
 // 撤单：find 取值 + erase（两次探测） vs extract（一次） vs find + eraseAt（一次）。删除顺序与插入顺序无关。
 // 值类型是指针（与订单索引相同），也让这一节的实例化与第 3 节的 <uint64, uint64> 互不影响内联决策
+// Single-probe compound operations (the matching engine's order index id -> order pointer, as used to rest /
+// cancel orders): n random keys, the table reserved to n, built first (untimed) and then timed. Rest: contains
+// duplicate check + insert (two probes) vs inserting a placeholder value that checks for a duplicate and
+// reserves, then filling in through the pointer (one); cancel: find for the value + erase (two probes) vs
+// extract (one) vs find + eraseAt (one). The deletion order is independent of the insertion order.
+// The value type is a pointer (as in the order index), which also keeps this section's instantiations and
+// section 3's <uint64, uint64> from affecting each other's inlining decisions
 using ProbeMap = hft::FlatHashMap<std::uint64_t, const std::uint64_t*>;
 
 template <class Add>
@@ -448,6 +480,7 @@ void benchMaps(std::uint64_t scale) {
     printHeader("[3] hft::FlatHashMap vs std::unordered_map (uint64 keys)");
     std::mt19937_64 rng(99);
     std::vector<std::uint64_t> keys(1u << 21);  // 前一半插入，后一半用作未命中查找
+                                                // first half inserted, second half used for miss lookups
     for (auto& k : keys) k = rng();
     MapResult flat, std_map;
     for (int run = 0; run < 2; ++run) {
@@ -473,6 +506,7 @@ void benchMaps(std::uint64_t scale) {
 
 // ---------------------------------------------------------------------------
 // 4. LatencyHistogram vs 旧 LatencyTracker 的"复制 10000 个样本 + 排序"求分位数
+// 4. LatencyHistogram vs the old LatencyTracker's "copy 10000 samples + sort" percentiles
 // ---------------------------------------------------------------------------
 void benchHistogram(std::uint64_t scale) {
     printHeader("[4] hft::LatencyHistogram vs old sorted-reservoir percentile");
@@ -493,6 +527,8 @@ void benchHistogram(std::uint64_t scale) {
     const double pct_ns = nsSince(t1) / calls;
 
     // 旧实现：std::vector<long> 采样池（10000 个），每次求分位数复制并排序
+    // Old implementation: a std::vector<long> sample reservoir (10000 entries), copied and sorted for every
+    // percentile query
     std::vector<long> reservoir(10'000);
     for (std::size_t i = 0; i < reservoir.size(); ++i) reservoir[i] = static_cast<long>(values[i] / 1000);
     const int old_calls = static_cast<int>(2'000 / scale) + 1;

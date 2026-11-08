@@ -2,12 +2,19 @@
 // test_feed_integration.cpp
 // 行情连接管理器集成测试：进程内 TLS 模拟交易所（tools/mock_exchange_server.h）驱动真实的 MarketDataFeed，
 // 覆盖 Binance 增量同步、OKX 校验和与缺口重订阅、Bybit 心跳、断线退避重连、停顿踢断、stop 的及时性与证书校验。
+// Integration tests for the market data connection manager: an in-process TLS mock exchange
+// (tools/mock_exchange_server.h) drives the real MarketDataFeed, covering Binance incremental sync, OKX
+// checksums and gap resubscription, Bybit heartbeats, reconnect with backoff after a disconnect, stall kicks,
+// stop promptness and certificate verification.
 //
 
 // 启用库内调试断言（必须在包含任何 hft 头文件之前定义）
+// Enable the library's debug asserts (must be defined before including any hft header)
 #define HFT_ENABLE_ASSERTS
 
 #include "hft/alloc_counter.h"  // 计数版全局 operator new：验证 feed 线程稳态下每条消息零堆分配
+                                // counting global operator new: verifies zero heap allocations per message
+                                // on the feed thread in steady state
 #include "test_framework.h"
 
 #include "hft/crc32.h"
@@ -48,19 +55,33 @@
 // 多地址主机（本机没有可用的 IPv6，无法用真实的双栈地址）；其他名字交给真正的 getaddrinfo。
 // connect 替换：测试可以让下一次 connect() 停在系统调用之前——正是"套接字已登记、连接尚未发起"的窗口；
 // 也可以记录发往某个端口的每次 connect() 的时刻（见 ConnectTrace）。
+// getaddrinfo replacement: "dual.test" resolves to two 127.0.0.1 endpoints (each with its own port, service
+// is ignored), simulating a multi-address host whose first address is unreachable (this machine has no usable
+// IPv6, so real dual-stack addresses cannot be used); other names go to the real getaddrinfo.
+// connect replacement: a test can make the next connect() park right before the system call, exactly in the
+// "socket registered, connection not yet started" window; it can also record the time of every connect() to
+// a given port (see ConnectTrace).
 // ============================================================================
 
 namespace {
 std::atomic<int> g_dual_first_port{0};   // 0 = 不替换 "dual.test"
+                                         // 0 = do not replace "dual.test"
 std::atomic<int> g_dual_second_port{0};
 std::atomic<bool> g_connect_park{false};     // 下一次 connect() 停住
+                                             // the next connect() parks
 std::atomic<bool> g_connect_parked{false};   // 已经停在系统调用之前
+                                             // already parked before the system call
 std::atomic<bool> g_connect_release{false};  // 放行
+                                             // release
 std::atomic<int> g_connect_trace_port{0};    // 非 0：记录发往这个端口的每次 connect() 的 nowNs()
+                                             // non-zero: record the nowNs() of every connect() to this port
 std::mutex g_connect_trace_mutex;            // 保护 g_connect_trace_ns
+                                             // guards g_connect_trace_ns
 std::vector<std::int64_t> g_connect_trace_ns;
 
 // 与 glibc 相同：addrinfo 与它的 sockaddr 在同一块内存里（freeaddrinfo 只释放 addrinfo 本身）
+// Same as glibc: the addrinfo and its sockaddr live in one memory block (freeaddrinfo frees only the
+// addrinfo itself)
 addrinfo* loopbackAddrinfo(int port, addrinfo* next) {
     void* block = std::calloc(1, sizeof(addrinfo) + sizeof(sockaddr_in));
     if (block == nullptr) return nullptr;
@@ -140,6 +161,7 @@ bool contains(const std::string& s, const std::string& part) { return s.find(par
 
 // ---------------------------------------------------------------------------
 // 报文构造
+// Message construction
 // ---------------------------------------------------------------------------
 
 std::string levelsJson(const Levels& levels, bool okx_style) {
@@ -154,6 +176,7 @@ std::string levelsJson(const Levels& levels, bool okx_style) {
 }
 
 // 十分位整数价格 -> 字符串（650001 -> "65000.1"），保证字符串精确
+// Integer price in tenths -> string (650001 -> "65000.1"), guaranteeing an exact string
 std::string tenths(int v) { return std::to_string(v / 10) + "." + std::to_string(v % 10); }
 
 std::string binanceDiff(std::uint64_t first, std::uint64_t last, const Levels& bids, const Levels& asks,
@@ -164,12 +187,14 @@ std::string binanceDiff(std::uint64_t first, std::uint64_t last, const Levels& b
 }
 
 // REST 深度快照与 depth20 部分深度推送的形状相同
+// The REST depth snapshot has the same shape as the depth20 partial depth message
 std::string binanceDepth(std::uint64_t last_update_id, const Levels& bids, const Levels& asks) {
     return R"({"lastUpdateId":)" + std::to_string(last_update_id) + R"(,"bids":)" + levelsJson(bids, false) +
            R"(,"asks":)" + levelsJson(asks, false) + "}";
 }
 
 // 单档 depth20 推送（买一 65000.00，卖一 65000.01）
+// Single-level depth20 message (best bid 65000.00, best ask 65000.01)
 std::string binanceTop(std::uint64_t last_update_id) {
     return binanceDepth(last_update_id, {{"65000.00", "1.0"}}, {{"65000.01", "0.5"}});
 }
@@ -181,6 +206,7 @@ std::string okxBooks5(const Levels& bids, const Levels& asks, std::int64_t ts_ms
 }
 
 // 简单的单档 books5 推送（买一 65000 + i，卖一 65001 + i）
+// Simple single-level books5 message (best bid 65000 + i, best ask 65001 + i)
 std::string simpleBook(int i, std::int64_t ts_ms = 1700000000000) {
     return okxBooks5({{std::to_string(65000 + i) + ".0", "1.5"}}, {{std::to_string(65001 + i) + ".0", "2.5"}}, ts_ms);
 }
@@ -194,6 +220,8 @@ std::string okxBooks(const char* action, const Levels& bids, const Levels& asks,
 }
 
 // 测试自己的 OKX 订单簿模型：保存原始字符串，按文档规则（前 25 档交错拼接）计算校验和
+// The test's own OKX order book model: keeps the original strings and computes the checksum by the
+// documented rule (top 25 levels, interleaved and concatenated)
 struct OkxModel {
     std::map<double, std::pair<std::string, std::string>, std::greater<double>> bids;
     std::map<double, std::pair<std::string, std::string>> asks;
@@ -237,9 +265,12 @@ std::string bybitBook(const char* type, const Levels& bids, const Levels& asks, 
 
 // ---------------------------------------------------------------------------
 // 测试辅助
+// Test helpers
 // ---------------------------------------------------------------------------
 
 // feed 的日志事件（带时间戳）。必须声明在 FeedRunner 之前（回调在 feed 线程上调用）。
+// The feed's log events (with timestamps). Must be declared before FeedRunner (the callback is called on
+// the feed thread).
 class EventLog {
 public:
     struct Event {
@@ -255,6 +286,7 @@ public:
     }
 
     // 第一个包含 part 的事件的时刻（没有时为 0）
+    // Time of the first event that contains part (0 if there is none)
     std::int64_t firstTime(const std::string& part) const {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const Event& e : events_) {
@@ -264,6 +296,8 @@ public:
     }
 
     // 事件中是否按顺序（不必相邻）出现这些子串；失败时打印全部事件
+    // Whether these substrings appear among the events in order (not necessarily adjacent); prints every
+    // event on failure
     bool inOrder(std::initializer_list<const char*> parts) const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = parts.begin();
@@ -277,6 +311,7 @@ public:
     }
 
     // 依次宣布的重连等待："reconnecting in N ms" -> N，"reconnecting now" -> 0
+    // The reconnect waits announced in turn: "reconnecting in N ms" -> N, "reconnecting now" -> 0
     std::vector<Event> reconnects(std::vector<int>& delays_ms) const {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<Event> out;
@@ -304,6 +339,8 @@ private:
 
 // 在独立线程上运行 feed；析构时 stop + join（必须声明在 MockExchangeServer 之后）。
 // 日志回调与发布回调在线程启动之前设置，不会漏掉最早的事件。
+// Runs the feed on its own thread; stop + join on destruction (must be declared after MockExchangeServer).
+// The log and publish callbacks are set before the thread starts, so the earliest events are not missed.
 struct FeedRunner {
     MarketDataFeed feed;
     std::thread thread;
@@ -320,6 +357,7 @@ struct FeedRunner {
     FeedRunner& operator=(const FeedRunner&) = delete;
 
     // 返回 stop() 到 run() 返回（join）所用的毫秒数
+    // Returns the milliseconds from stop() until run() returns (join)
     double stop() {
         const std::int64_t t0 = hft::nowNs();
         feed.stop();
@@ -329,6 +367,8 @@ struct FeedRunner {
 };
 
 // 指向模拟服务器的基础配置：tls_verify + ca_file = 服务器证书；短退避；关闭应用层心跳与 stderr 输出
+// Base config pointing at the mock server: tls_verify + ca_file = the server certificate; short backoff;
+// application-level heartbeats and stderr output disabled
 FeedConfig baseConfig(Exchange exchange, MockExchangeServer& server) {
     FeedConfig c;
     c.exchange = exchange;
@@ -353,6 +393,7 @@ FeedConfig baseConfig(Exchange exchange, MockExchangeServer& server) {
 }
 
 // Binance 增量深度：REST 快照也从模拟服务器拉取
+// Binance diff depth: the REST snapshot is also fetched from the mock server
 FeedConfig binanceDiffConfig(MockExchangeServer& server) {
     FeedConfig c = baseConfig(Exchange::BINANCE, server);
     c.path = kBinanceDiffPath;
@@ -363,6 +404,7 @@ FeedConfig binanceDiffConfig(MockExchangeServer& server) {
 }
 
 // 指向一个连不上的本机端口的 OKX 配置（不校验证书，其余为默认值）
+// OKX config pointing at an unreachable local port (no certificate verification, defaults otherwise)
 FeedConfig unreachableConfig(unsigned short port) {
     FeedConfig c;
     c.exchange = Exchange::OKX;
@@ -375,6 +417,7 @@ FeedConfig unreachableConfig(unsigned short port) {
 }
 
 // 消费者：把队列中的快照全部取出并保存（只在测试线程调用）
+// Consumer: pops every snapshot from the queue and keeps it (called on the test thread only)
 struct SnapshotLog {
     std::vector<BookSnapshot> all;
     std::vector<std::int64_t> pop_ns;
@@ -398,6 +441,8 @@ struct SnapshotLog {
 };
 
 // 等待 pred 成立，期间像主线程的刷新循环一样每 10 ms 调用一次 checkHealth（停顿 / 连接超时看门狗照常工作）
+// Waits until pred holds, calling checkHealth every 10 ms meanwhile like the main thread's refresh loop
+// (the stall / connect-timeout watchdogs work as usual)
 template <class Pred>
 bool waitChecking(MarketDataFeed& feed, Pred&& pred, int timeout_ms) {
     return waitFor(
@@ -409,6 +454,7 @@ bool waitChecking(MarketDataFeed& feed, Pred&& pred, int timeout_ms) {
 }
 
 // duration_ms 内每 10 ms 调用一次 checkHealth
+// Calls checkHealth every 10 ms for duration_ms
 void runHealthChecks(MarketDataFeed& feed, int duration_ms) {
     const std::int64_t t0 = hft::nowNs();
     while (ms(hft::nowNs() - t0) < duration_ms) {
@@ -421,6 +467,13 @@ void runHealthChecks(MarketDataFeed& feed, int duration_ms) {
 // 服务器一直在监听，所以第 i 次 connect 就是服务器接受的第 i 个连接（HttpRequestInfo::connection）。
 // REST 请求的间隔要按客户端发起连接的时刻量：feed 保证的是请求开始时刻的间隔，而服务器解析到请求的时刻还隔着
 // 各自的 TCP 接受与 TLS 握手（负载下相差几十毫秒），服务器接受连接的时刻也带着接受线程的调度延迟。
+// Records every connect() to the server's port while the object is alive (client-side times, in the order
+// they were made). The feed is the only client in the tests and the server is always listening, so the i-th
+// connect is the i-th connection the server accepts (HttpRequestInfo::connection).
+// REST request spacing has to be measured by when the client started each connection: the feed guarantees
+// spacing between request start times, while the time the server parses a request also includes that
+// request's own TCP accept and TLS handshake (tens of milliseconds of difference under load), and the time
+// the server accepts a connection also carries the accept thread's scheduling delay.
 class ConnectTrace {
 public:
     explicit ConnectTrace(const MockExchangeServer& server) {
@@ -434,6 +487,7 @@ public:
     ConnectTrace& operator=(const ConnectTrace&) = delete;
 
     // 第 k 个与第 k - 1 个 REST 请求的连接发起时刻之差（毫秒）
+    // Difference between the connection start times of REST requests k and k - 1 (milliseconds)
     double requestGapMs(const std::vector<HttpRequestInfo>& reqs, std::size_t k) const {
         std::lock_guard<std::mutex> lock(g_connect_trace_mutex);
         REQUIRE(k >= 1 && k < reqs.size());
@@ -443,6 +497,8 @@ public:
 };
 
 // 让下一次 connect() 停在系统调用之前（套接字已登记、连接尚未发起），直到 g_connect_release
+// Makes the next connect() park before the system call (socket registered, connection not yet started)
+// until g_connect_release
 void parkNextConnect() {
     g_connect_parked.store(false);
     g_connect_release.store(false);
@@ -450,12 +506,15 @@ void parkNextConnect() {
 }
 
 // 状态观察者：后台线程每 100 µs 采样一次 status()，记录每次变化
+// Status watcher: a background thread samples status() every 100 µs and records every change
 class StatusWatcher {
 public:
     explicit StatusWatcher(const MarketDataFeed& feed) : feed_(feed), thread_([this] { loop(); }) {}
     ~StatusWatcher() { stopWatching(); }
 
     // 停止采样；join 之后再采一次，保证调用者此刻看到的状态也被记录
+    // Stops sampling; samples once more after the join, so the status the caller sees right now is also
+    // recorded
     void stopWatching() {
         done_.store(true);
         if (thread_.joinable()) thread_.join();
@@ -468,6 +527,7 @@ public:
     }
 
     // 采样序列中是否按顺序（不必相邻）出现 expected
+    // Whether expected appears in the sampled sequence in order (not necessarily adjacent)
     bool sawInOrder(std::initializer_list<FeedStatus> expected) const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = expected.begin();
@@ -500,6 +560,9 @@ private:
 
 // 在 127.0.0.1 上监听、从不 accept 的端口。blackhole：backlog 0 且全连接队列已被占满，新的 connect() 停在
 // SYN_SENT；否则队列足够长，内核替它完成三次握手，connect() 立即成功。
+// A port on 127.0.0.1 that listens but never accepts. blackhole: backlog 0 and the accept queue already
+// full, so a new connect() stays in SYN_SENT; otherwise the queue is long enough, the kernel completes the
+// three-way handshake for it and connect() succeeds immediately.
 class Listener {
 public:
     explicit Listener(bool blackhole) {
@@ -514,6 +577,7 @@ public:
         port_ = ntohs(addr.sin_port);
         if (!blackhole || !ok_) return;
         for (int i = 0; i < 4; ++i) {  // 占满队列（backlog 0 时内核允许 1 个已完成连接）
+                                       // fill the queue (with backlog 0 the kernel allows 1 completed connection)
             const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             if (fd < 0) break;
             ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
@@ -538,6 +602,8 @@ private:
 };
 
 // 作用域内 "dual.test" 解析为 [127.0.0.1:first, 127.0.0.1:second]（见文件开头的 getaddrinfo 替换）
+// While in scope, "dual.test" resolves to [127.0.0.1:first, 127.0.0.1:second] (see the getaddrinfo
+// replacement at the top of the file)
 struct DualHost {
     DualHost(unsigned short first, unsigned short second) {
         g_dual_second_port.store(second);
@@ -552,6 +618,8 @@ struct DualHost {
 };
 
 // "dual.test" = [黑洞地址, 模拟服务器]；服务器证书的 SAN 同时包含 "dual.test"（tls_verify 照常开启）
+// "dual.test" = [blackhole address, mock server]; the server certificate's SAN also contains "dual.test"
+// (tls_verify stays on as usual)
 struct BlackholeThenServer {
     static mock_exchange::ServerOptions options() {
         mock_exchange::ServerOptions opt;
@@ -565,6 +633,7 @@ struct BlackholeThenServer {
 };
 
 // AF_UNIX 套接字对，析构时关闭（已手动关闭的一端置为 -1）
+// AF_UNIX socket pair, closed on destruction (an end that was closed by hand is set to -1)
 struct SocketPair {
     int fd[2] = {-1, -1};
     SocketPair() { REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0); }
@@ -578,6 +647,8 @@ struct SocketPair {
 };
 
 // 脚本：之后只应答心跳——每收到一个 ping 文本帧回一个 pong（pong 为空时不回应），直到客户端断开
+// Script: from then on, only answer heartbeats, replying with one pong to every ping text frame (no reply
+// when pong is empty), until the client disconnects
 void answerPings(WsSession& ws, const std::string& ping, const std::string& pong) {
     std::size_t seen = 0;
     while (ws.clientConnected()) {
@@ -590,6 +661,7 @@ void answerPings(WsSession& ws, const std::string& ping, const std::string& pong
 }
 
 // 第一个会话：三本簿，然后服务器关闭
+// First session: three books, then the server closes
 void threeBooksThenClose(WsSession& ws) {
     for (int i = 0; i < 3; ++i) ws.send(simpleBook(i));
     ws.sleepMs(50);
@@ -597,6 +669,7 @@ void threeBooksThenClose(WsSession& ws) {
 }
 
 // frames 中等于 text 的帧的到达时刻
+// Arrival times of the frames in frames that equal text
 std::vector<std::int64_t> timesOf(const std::vector<std::string>& frames, const std::vector<std::int64_t>& times,
                                   const std::string& text) {
     std::vector<std::int64_t> out;
@@ -608,6 +681,9 @@ std::vector<std::int64_t> timesOf(const std::vector<std::string>& frames, const 
 
 // 检查 feed 宣布的重连等待序列：第 i 次等待 ∈ [0.8, 1.2] x expected[i]（钳制到 max_ms；0 = 立即重连），
 // 且第 i+1 个 TCP 连接确实在宣布之后至少等待了这么久才到达（每次尝试恰好产生一个连接）
+// Checks the sequence of reconnect waits announced by the feed: the i-th wait ∈ [0.8, 1.2] x expected[i]
+// (clamped to max_ms; 0 = immediate reconnect), and the (i+1)-th TCP connection really arrives at least that
+// long after the announcement (each attempt produces exactly one connection)
 void checkAnnouncedBackoff(const EventLog& events, const MockExchangeServer& server, std::vector<int> expected,
                            int max_ms) {
     std::vector<int> delays;
@@ -630,6 +706,7 @@ void checkAnnouncedBackoff(const EventLog& events, const MockExchangeServer& ser
 
 // ===========================================================================
 // 构件单元测试
+// Component unit tests
 // ===========================================================================
 
 TEST_CASE("feed: backoff delay is min(max, initial * 2^attempt) with +-20% jitter, clamped to [1, max]") {
@@ -642,10 +719,14 @@ TEST_CASE("feed: backoff delay is min(max, initial * 2^attempt) with +-20% jitte
     CHECK_EQ(MarketDataFeed::backoffDelayMs(0, 500, 30000, -1.0), 400);
     CHECK_EQ(MarketDataFeed::backoffDelayMs(2, 500, 30000, 0.5), 2200);
     CHECK_EQ(MarketDataFeed::backoffDelayMs(10, 500, 30000, 1.0), 30000);   // 钳制到 max
+                                                                            // clamped to max
     CHECK_EQ(MarketDataFeed::backoffDelayMs(10, 500, 30000, -1.0), 24000);
     CHECK_EQ(MarketDataFeed::backoffDelayMs(0, 0, 0, 0.0), 1);              // 非法参数也给出 >= 1 的值
+                                                                            // invalid arguments still yield >= 1
     CHECK_EQ(MarketDataFeed::backoffDelayMs(3, 100, 50, 0.0), 100);         // max < initial 时按 initial
+                                                                            // max < initial: use initial
     CHECK_EQ(MarketDataFeed::backoffDelayMs(0, 500, 30000, 7.0), 600);      // 抖动参数钳制到 [-1, 1]
+                                                                            // jitter argument clamped to [-1, 1]
 }
 
 TEST_CASE("feed: feedStatusName covers every status") {
@@ -663,6 +744,7 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
     CHECK_EQ(reg.size(), std::size_t{1});
 
     // 阻塞在 recv 中的线程被踢断后立即返回 0（EOF）
+    // A thread blocked in recv returns 0 (EOF) right after the kick
     std::atomic<long> got{-2};
     std::thread reader([&] {
         char c;
@@ -677,14 +759,17 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
     CHECK(reg.interrupted());
     CHECK_EQ(static_cast<int>(reg.reason()), static_cast<int>(hft::net::KickReason::Stall));
     CHECK(!reg.kick(hft::net::KickReason::Stall));  // 同一会话不重复踢
+                                                    // no second kick in the same session
 
     // 踢断状态下新登记失败，且该套接字被立即 shutdown
+    // While kicked, a new registration fails and that socket is shut down immediately
     SocketPair sv2;
     CHECK_EQ(reg.add(sv2.fd[0]), hft::net::SocketRegistry::Token{0});
     char c = 0;
     CHECK_EQ(::recv(sv2.fd[0], &c, 1, 0), static_cast<ssize_t>(0));
 
     // rearm 之后恢复正常
+    // Back to normal after rearm
     reg.remove(t);
     CHECK_EQ(reg.size(), std::size_t{0});
     reg.rearm();
@@ -694,6 +779,7 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
     CHECK(t3 != 0);
 
     // close：永久停止，原因为 Stop，rearm 无效
+    // close: stops permanently with reason Stop, and rearm has no effect
     reg.close();
     CHECK_EQ(static_cast<int>(reg.reason()), static_cast<int>(hft::net::KickReason::Stop));
     CHECK_EQ(::recv(sv3.fd[0], &c, 1, 0), static_cast<ssize_t>(0));
@@ -706,22 +792,28 @@ TEST_CASE("registry: kick shuts down registered sockets, add after kick fails, r
 
 TEST_CASE("registry: kicking after the original fd was closed and its number reused never touches the new socket") {
     // Beast 在收到 close 帧时会在 teardown 中自行关闭套接字；登记表持有 fd 副本，fd 号被复用也不会误踢
+    // Beast closes the socket itself during teardown when it receives a close frame; the registry holds a copy
+    // of the fd, so even a reused fd number is never kicked by mistake
     hft::net::SocketRegistry reg;
     SocketPair a;
     const int old_fd = a.fd[0];
     const hft::net::SocketRegistry::Token t = reg.add(old_fd);
     REQUIRE(t != 0);
     ::close(old_fd);  // 原 fd 被"别人"关闭
+                      // the original fd is closed by "someone else"
     a.fd[0] = -1;
     SocketPair b;
     CHECK(b.fd[0] == old_fd || b.fd[1] == old_fd);  // 内核总是分配最小的空闲 fd 号
+                                                    // the kernel always hands out the lowest free fd number
     CHECK(reg.kick(hft::net::KickReason::Stall));
     // 新套接字不受影响：仍可双向收发
+    // The new socket is unaffected: it can still send and receive in both directions
     CHECK_EQ(::send(b.fd[0], "x", 1, MSG_NOSIGNAL), static_cast<ssize_t>(1));
     char c = 0;
     CHECK_EQ(::recv(b.fd[1], &c, 1, 0), static_cast<ssize_t>(1));
     CHECK_EQ(c, 'x');
     // 被踢的是旧套接字：对端读到 EOF
+    // The old socket is the one that was kicked: its peer reads EOF
     CHECK_EQ(::recv(a.fd[1], &c, 1, 0), static_cast<ssize_t>(0));
     reg.remove(t);
 }
@@ -729,6 +821,9 @@ TEST_CASE("registry: kicking after the original fd was closed and its number reu
 TEST_CASE("net: a kick landing between socket registration and connect() still aborts the connect (200 trials)") {
     // Linux 上对尚未发起连接的套接字 shutdown 是空操作：踢断若只靠 shutdown，落在这个窗口里就会丢失，
     // connect 随后在 SYN_SENT 里一直等到内核放弃（约 2 分钟）。每次试验在登记出现的瞬间踢断（close / kick 交替）。
+    // On Linux, shutdown on a socket that has not started connecting is a no-op: a kick that relies on shutdown
+    // alone is lost if it lands in this window, and connect then waits in SYN_SENT until the kernel gives up
+    // (about 2 minutes). Each trial kicks the moment the registration appears (alternating close / kick).
     Listener hole(true);
     REQUIRE(hole.ok());
     hft::net::Resolver resolver;
@@ -759,6 +854,7 @@ TEST_CASE("net: a kick landing between socket registration and connect() still a
         if (!waitFor([&] { return done.load(); }, 250)) {
             ++lost;
             reg.close();  // 救援：套接字此时已在 SYN_SENT，再 shutdown 一次就能让它返回
+                          // rescue: the socket is in SYN_SENT by now, so one more shutdown makes it return
         }
         worker.join();
         worst_ms = std::max(worst_ms, ms(hft::nowNs() - t0));
@@ -794,6 +890,7 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
         const boost::system::error_code ec = hft::net::connectSocket(sock, endpoints, reg, registration, opt);
         took = ms(hft::nowNs() - t0);
         CHECK_EQ(registration.attached(), !ec);  // 失败时套接字已注销、已关闭
+                                                 // on failure the socket is already deregistered and closed
         CHECK_EQ(sock.is_open(), !ec);
         boost::system::error_code ignored;
         if (!ec) connected = sock.remote_endpoint(ignored);
@@ -801,6 +898,8 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
         return ec;
     };
     // [黑洞, 好]：第一个地址用满自己的时限 max(1000, 1500 / 2) = 1000 ms，然后连上第二个；游标指向连上的地址
+    // [blackhole, good]: the first address uses up its own deadline max(1000, 1500 / 2) = 1000 ms, then the
+    // second one connects; the cursor points at the connected address
     std::size_t cursor = 0;
     boost::system::error_code ec = attempt(1500, cursor);
     CHECK(!ec);
@@ -809,11 +908,14 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
     CHECK_GE(took, 990.0);
     CHECK_LT(took, 1400.0);
     // 游标 = 1：直接从好地址开始，立即连上，游标不变
+    // cursor = 1: starts right at the good address, connects immediately, cursor unchanged
     ec = attempt(1500, cursor);
     CHECK(!ec);
     CHECK_EQ(cursor, std::size_t{1});
     CHECK_LT(took, 200.0);
     // 总时限比单个地址的下限还短：第一个地址用完全部时限，返回 timed_out，游标指向下一个（没来得及试的）地址
+    // Total deadline shorter than the per-address floor: the first address uses up the whole deadline,
+    // timed_out is returned, and the cursor points at the next (untried) address
     cursor = 0;
     ec = attempt(300, cursor);
     CHECK(ec == boost::asio::error::timed_out);
@@ -822,6 +924,8 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
     CHECK_LT(took, 700.0);
     // 没有时限：从 2 % 2 = 0（黑洞）开始，一直停在 SYN_SENT 里，直到 200 ms 后被踢断：及时返回 operation_aborted，
     // 游标指向下一个地址
+    // No deadline: starts at 2 % 2 = 0 (blackhole) and sits in SYN_SENT until kicked after 200 ms: returns
+    // operation_aborted promptly, and the cursor points at the next address
     cursor = 2;
     std::thread kicker([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -832,7 +936,9 @@ TEST_CASE("net: connectSocket gives every address its own deadline, falls throug
     CHECK(ec == boost::asio::error::operation_aborted);
     CHECK_EQ(cursor, std::size_t{1});
     CHECK_GE(took, 190.0);  // 踢断之前一直在等
+                            // kept waiting until the kick
     CHECK_LT(took, 700.0);  // 踢断之后 500 ms 之内返回
+                            // returns within 500 ms of the kick
     CHECK_EQ(reg.size(), std::size_t{0});
 }
 
@@ -870,6 +976,7 @@ TEST_CASE("mock: generated certificate verifies for 127.0.0.1 and localhost; the
     CHECK(!r.ok);
     CHECK(contains(r.error, "exceeds 1024 bytes"));
     CHECK_EQ(reg.size(), std::size_t{0});  // 每次请求结束都已注销
+                                           // every request deregisters when it ends
 
     const std::vector<HttpRequestInfo> reqs = server.httpRequests();
     REQUIRE_EQ(reqs.size(), std::size_t{4});
@@ -879,12 +986,14 @@ TEST_CASE("mock: generated certificate verifies for 127.0.0.1 and localhost; the
     CHECK(server.errors().empty());
 
     // 不信任该证书的客户端：清晰的校验错误
+    // A client that does not trust the certificate: a clear verification error
     auto system_only = hft::net::makeClientContext(hft::net::TlsOptions{true, ""});
     rq.target = "/a";
     r = hft::net::httpsGet(ioc, *system_only, resolver, reg, rq);
     CHECK(!r.ok);
     CHECK(contains(r.error, "certificate verification failed"));
     // 不存在的 CA 文件：makeClientContext 抛出带文件名的错误
+    // Nonexistent CA file: makeClientContext throws an error that names the file
     bool threw = false;
     try {
         hft::net::makeClientContext(hft::net::TlsOptions{true, "/nonexistent/ca.pem"});
@@ -898,18 +1007,23 @@ TEST_CASE("feed: handler memory recycles blocks per size class and only touches 
     using feed_detail::HandlerMemory;
     HandlerMemory mem;
     void* a = mem.allocate(100);  // 128 字节级别：新块
+                                  // 128-byte class: new block
     void* b = mem.allocate(300);  // 512 字节级别：新块
+                                  // 512-byte class: new block
     CHECK_EQ(mem.heapAllocations(), 2u);
     mem.deallocate(a, 100);
     mem.deallocate(b, 300);
     CHECK(mem.allocate(90) == a);   // 同一级别的空闲块
+                                    // free block of the same class
     CHECK(mem.allocate(400) == b);
     void* e = mem.allocate(50);     // 该级别已空：新块
+                                    // that class is empty: new block
     CHECK_EQ(mem.heapAllocations(), 3u);
     mem.deallocate(a, 90);
     mem.deallocate(b, 400);
     mem.deallocate(e, 50);
     // 稳态：反复申请 / 释放同几种大小不再访问全局堆
+    // Steady state: repeatedly allocating / freeing the same few sizes no longer touches the global heap
     for (int i = 0; i < 1000; ++i) {
         void* x = mem.allocate(120);
         void* y = mem.allocate(380);
@@ -920,6 +1034,7 @@ TEST_CASE("feed: handler memory recycles blocks per size class and only touches 
     }
     CHECK_EQ(mem.heapAllocations(), 3u);
     // 超过最大级别的请求直接走全局堆，释放时归还（不缓存）
+    // Requests above the largest class go straight to the global heap and are given back on release (not cached)
     constexpr std::size_t kHuge = (HandlerMemory::kMinBlock << (HandlerMemory::kClasses - 1)) + 1;
     for (int i = 0; i < 2; ++i) mem.deallocate(mem.allocate(kHuge), kHuge);
     CHECK_EQ(mem.heapAllocations(), 5u);
@@ -929,16 +1044,20 @@ TEST_CASE("feed: handler memory recycles blocks per size class and only touches 
     CHECK_EQ(p[3], 7);
     alloc.deallocate(p, 4);
     CHECK_EQ(mem.heapAllocations(), 5u);  // 16 字节来自 128 字节级别的空闲块
+                                          // the 16 bytes come from a free block of the 128-byte class
     CHECK(alloc == feed_detail::HandlerAllocator<double>(mem));
 }
 
 // ===========================================================================
 // 协议端到端
+// Protocols end to end
 // ===========================================================================
 
 TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, refetch, buffered events, gap resync)") {
     MockExchangeServer server;
     // 第 1 次 GET：快照太旧（L=90 < 第一条缓冲事件的 U=101）；第 2 次：L=105；缺口重同步后第 3 次：L=145
+    // 1st GET: snapshot too old (L=90 < U=101 of the first buffered event); 2nd: L=105; 3rd, after the gap
+    // resync: L=145
     server.setHttpHandler([](const HttpRequestInfo& info) {
         if (info.target != kBinanceSnapshotPath) return HttpReply{404, "{}", "application/json", 0};
         if (info.index == 0) return HttpReply{200, binanceDepth(90, {{"64000.00", "1.0"}}, {{"66000.00", "1.0"}})};
@@ -951,11 +1070,13 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     server.setWebSocketScript([](WsSession& ws) {
         ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {{"65001.00", "0.00000000"}}));
         // 下面两条在客户端拉取 REST 快照期间留在内核缓冲区里
+        // The next two stay in the kernel buffer while the client fetches the REST snapshot
         ws.send(binanceDiff(111, 120, {{"64998.00", "4.0"}}, {}));
         ws.send(binanceDiff(121, 130, {{"64999.00", "0"}}, {{"65003.00", "1.0"}}));
         ws.waitUntil([&ws] { return ws.server().httpRequestCount() >= 2; }, 5000);
         ws.sleepMs(50);
         ws.send(binanceDiff(141, 150, {{"65100.00", "2.0"}}, {}));  // 缺口：本地 130，U = 141
+                                                                    // gap: local 130, U = 141
         ws.waitUntil([&ws] { return ws.server().httpRequestCount() >= 3; }, 5000);
         ws.send(binanceDiff(151, 160, {}, {{"65102.00", "5.0"}}));
     });
@@ -976,6 +1097,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         CHECK_EQ(log.all[i].venue, 3u);
     }
     // REST 快照 L=105 + 回放 e1(101..110)：买 65000.00 -> 1.5，卖 65001.00 删除
+    // REST snapshot L=105 + replay of e1(101..110): bid 65000.00 -> 1.5, ask 65001.00 deleted
     const BookSnapshot& first = log.all[0];
     REQUIRE_EQ(first.bid_count, 2u);
     REQUIRE_EQ(first.ask_count, 1u);
@@ -983,6 +1105,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     CHECK_EQ(first.bids[0].quantity, 1.5);
     CHECK_EQ(first.asks[0].price, 65002.0);
     // e3 之后：买 [65000.00 x1.5, 64998.00 x4]，卖 [65002 x3, 65003 x1]
+    // After e3: bids [65000.00 x1.5, 64998.00 x4], asks [65002 x3, 65003 x1]
     const BookSnapshot& third = log.all[2];
     REQUIRE_EQ(third.bid_count, 2u);
     REQUIRE_EQ(third.ask_count, 2u);
@@ -990,6 +1113,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     CHECK_EQ(third.bids[1].quantity, 4.0);
     CHECK_EQ(third.asks[1].price, 65003.0);
     CHECK_EQ(log.all[3].bid_count + log.all[3].ask_count, 0u);  // 缺口：先发布空簿
+                                                                // gap: an empty book is published first
     const BookSnapshot& last = log.all.back();
     REQUIRE_EQ(last.bid_count, 1u);
     REQUIRE_EQ(last.ask_count, 2u);
@@ -998,6 +1122,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     CHECK_EQ(last.exchange_ts_ms, std::int64_t{1700000000000});
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 不应再有多余的 GET
+                                                                  // no extra GET should follow
     const std::vector<HttpRequestInfo> reqs = server.httpRequests();
     REQUIRE_EQ(reqs.size(), std::size_t{3});
     for (const HttpRequestInfo& r : reqs) {
@@ -1005,6 +1130,8 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
         CHECK_EQ(r.user_agent, std::string("crypto_hft_engine/2.0"));
     }
     // 两次快照请求（开始时刻）之间至少相隔 rest_min_interval_ms（20 ms，-20% 抖动下至少 16 ms）
+    // Two snapshot requests (their start times) are at least rest_min_interval_ms apart (20 ms; at least 16 ms
+    // under -20% jitter)
     CHECK_GE(trace.requestGapMs(reqs, 1), 15.0);
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.messages, 5u);
@@ -1013,6 +1140,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
     CHECK_EQ(s.resyncs, 1u);
     CHECK_EQ(s.parse_errors, 0u);
     CHECK(waitFor([&] { return runner.feed.stats().published == 6; }, 2000));  // 计数在 tryPush 之后才更新
+                                                                               // the count updates only after tryPush
     CHECK_EQ(s.reconnects, 0u);
     CHECK_EQ(s.connect_failures, 0u);
     CHECK(contains(runner.feed.lastError(), "gap"));
@@ -1023,6 +1151,7 @@ TEST_CASE("feed: Binance diff depth syncs end to end (too-old REST snapshot, ref
 TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each resubscribe (unsubscribe, subscribe)") {
     MockExchangeServer server;
     // 三本簿：每本 30 档，价格用十分位整数生成，字符串精确
+    // Three books: 30 levels each, prices generated from integer tenths, so the strings are exact
     auto makeBook = [](int base_tenths) {
         Levels bids, asks;
         for (int i = 0; i < 30; ++i) {
@@ -1032,7 +1161,11 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
         return std::make_pair(bids, asks);
     };
     auto expected = std::make_shared<OkxModel>();  // 脚本线程写；测试线程在 server.stop()（join）之后读
+                                                   // written by the script thread; the test thread reads it
+                                                   // after server.stop() (join)
     // 脚本只按值捕获：测试中途失败时局部变量先于服务器析构，脚本线程不能引用它们
+    // The script captures by value only: if the test fails midway the locals are destroyed before the server,
+    // so the script thread must not reference them
     server.setWebSocketScript([makeBook, expected](WsSession& ws) {
         ws.expectText(kOkxBooksSub);
         OkxModel m;
@@ -1046,6 +1179,7 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
         m.apply(u2b, u2a);
         ws.send(okxBooks("update", u2b, u2a, 1001, 1002, m.checksum()));
         ws.send(okxBooks("update", {{tenths(649990), "1.0"}}, {}, 1005, 1006, 0));  // 缺口
+                                                                                    // gap
         ws.expectText(kOkxBooksUnsub);
         ws.expectText(kOkxBooksSub);
         OkxModel m2;
@@ -1055,6 +1189,7 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
         Levels bad_b{{tenths(651000), "7.7"}};
         m2.apply(bad_b, {});
         ws.send(okxBooks("update", bad_b, {}, 2000, 2001, m2.checksum() ^ 0x1234));  // 校验和错误
+                                                                                     // bad checksum
         ws.expectText(kOkxBooksUnsub);
         ws.expectText(kOkxBooksSub);
         OkxModel m3;
@@ -1064,6 +1199,8 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
         Levels u5b{{tenths(652000), "0"}}, u5a{{tenths(652001), "0.5"}};
         m3.apply(u5b, u5a);
         *expected = m3;  // 先写模型再发最后一条：测试看到 3001 时模型已就绪（之后还会 join）
+                         // model written before the last message is sent: the model is ready when the
+                         // test sees 3001 (a join also follows later)
         ws.send(okxBooks("update", u5b, u5a, 3000, 3001, m3.checksum()));
     });
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
@@ -1090,8 +1227,10 @@ TEST_CASE("feed: OKX books with checksums; seq gap and checksum mismatch each re
     CHECK(contains(runner.feed.lastError(), "checksum mismatch"));
     runner.stop();
     server.stop();  // 脚本线程结束：expected 可以安全读取
+                    // the script thread has finished: expected is safe to read
     CHECK(server.errors().empty());
     // 最终发布的前 20 档与测试模型一致
+    // The top 20 levels of the final publish match the test model
     const BookSnapshot& last = log.all.back();
     REQUIRE_EQ(last.bid_count, 20u);
     REQUIRE_EQ(last.ask_count, 20u);
@@ -1117,6 +1256,8 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
         int i = 0;
         std::size_t pongs = 0;
         // 每 10 ms 一条 delta，直到收到 3 个 ping（最多 3 s）；每个 ping 回一个 pong（适配器忽略 pong）
+        // One delta every 10 ms until 3 pings have been received (3 s at most); every ping gets a pong (the
+        // adapter ignores pongs)
         while (ws.countReceived(kBybitPing) < 3 && i < 300) {
             ++i;
             ws.sleepMs(10);
@@ -1146,6 +1287,7 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     const std::vector<std::string> frames = server.framesReceived(0);
     const std::vector<std::int64_t> times = server.frameTimesNs(0);
     const std::int64_t window_end_ns = hft::nowNs();  // 上面这些 ping 都在此刻之前发出
+                                                      // all the pings above were sent before this moment
     REQUIRE(!frames.empty());
     REQUIRE_EQ(times.size(), frames.size());
     CHECK_EQ(frames[0], std::string(kBybitSub));
@@ -1157,7 +1299,11 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     }
     CHECK_GE(pings, std::size_t{3});
     CHECK_GE(n, 3);  // 数据一直在来（每 10 ms 一条）：心跳由周期规则（每 40 ms）发出，不依赖空闲
+                     // data keeps coming (one every 10 ms): heartbeats come from the periodic rule
+                     // (every 40 ms), not from idleness
     // 心跳不会比间隔更频繁：会话开始（"connected" 日志）之后的窗口内最多 window / 40 ms 个
+    // Heartbeats are never more frequent than the interval: at most window / 40 ms of them in the window after
+    // the session starts (the "connected" log line)
     const std::int64_t connected_ns = events.firstTime("[Bybit] connected to");
     REQUIRE(connected_ns != 0);
     CHECK_LE(static_cast<double>(pings), ms(window_end_ns - connected_ns) / 40.0 + 1.0);
@@ -1173,9 +1319,11 @@ TEST_CASE("feed: Bybit snapshot and deltas; periodic {\"op\":\"ping\"} frames at
     CHECK_EQ(s.parse_errors, 0u);
     CHECK(waitFor([&] { return runner.feed.stats().published == static_cast<std::uint64_t>(n + 1); }, 2000));
     // 消息数 = 订阅回执 + 快照 + n 个 delta + pong（最后一个 pong 可能还在路上）
+    // Messages = subscribe ack + snapshot + n deltas + pongs (the last pong may still be in flight)
     const std::uint64_t expected_messages = static_cast<std::uint64_t>(n + 2 + pongs_sent->load());
     CHECK(waitFor([&] { return runner.feed.stats().messages == expected_messages; }, 2000));
     CHECK_EQ(runner.feed.getExchangeLatency().count(), static_cast<std::uint64_t>(n + 1));  // 带 ts 的消息
+                                                                                            // messages with ts
     CHECK(server.errors().empty());
 }
 
@@ -1196,20 +1344,29 @@ TEST_CASE("feed: Binance depth20 partial book stream goes LIVE on the first mess
     CHECK_EQ(runner.feed.status(), FeedStatus::Live);
     CHECK_EQ(server.httpRequestCount(), std::size_t{0});
     CHECK_EQ(log.all[0].exchange_ts_ms, std::int64_t{0});  // depth20 推送没有时间戳
+                                                           // depth20 messages carry no timestamp
     CHECK_EQ(runner.feed.getExchangeLatency().count(), 0u);
 }
 
 // ---------------------------------------------------------------------------
 // 心跳：安静的连接也按空闲时间发心跳；回应刷新停顿看门狗；没有回应时看门狗照常踢断
+// Heartbeats: a quiet connection also sends heartbeats by idle time; replies refresh the stall watchdog;
+// without replies the watchdog kicks as usual
 // ---------------------------------------------------------------------------
 
 TEST_CASE("feed: an idle session pings on idle time (OKX \"ping\", Bybit {\"op\":\"ping\"}, Binance WebSocket ping); answers keep it up") {
     // 一个快照之后只有心跳往来的会话：idle_ping = min(适配器默认间隔, stall 600 / 2) = 300 ms，运行 5 个空闲间隔：
     // 心跳按空闲时间发出、回应让看门狗不动手。OKX / Bybit 的应用层心跳由脚本回应；Binance 没有应用层心跳，
     // 发 WebSocket ping 控制帧，由服务器端的 Beast 自动应答
+    // A session with only heartbeat traffic after one snapshot: idle_ping = min(adapter default interval,
+    // stall 600 / 2) = 300 ms, run for 5 idle intervals: heartbeats go out by idle time and the replies keep
+    // the watchdog from acting. The script answers the OKX / Bybit application-level heartbeats; Binance has no
+    // application-level heartbeat, so WebSocket ping control frames are sent, which Beast on the server side
+    // answers automatically
     struct Case {
         Exchange exchange;
         std::string ping, pong;  // 应用层心跳与回应；"" = WebSocket ping
+                                 // application-level heartbeat and reply; "" = WebSocket ping
         std::function<void(WsSession&)> start;
     };
     const Case cases[] = {
@@ -1217,6 +1374,7 @@ TEST_CASE("feed: an idle session pings on idle time (OKX \"ping\", Bybit {\"op\"
          [](WsSession& ws) {
              ws.expectText(kOkxBooks5Sub);
              ws.send(simpleBook(0));  // 之后市场安静：books5 只在前 5 档变化时推送
+                                      // then the market is quiet: books5 pushes only when the top 5 levels change
          }},
         {Exchange::BYBIT, kBybitPing, kBybitPong,
          [](WsSession& ws) {
@@ -1228,12 +1386,16 @@ TEST_CASE("feed: an idle session pings on idle time (OKX \"ping\", Bybit {\"op\"
     for (const Case& k : cases) {
         MockExchangeServer server;
         server.setWebSocketScript([k](WsSession& ws) {  // 按值捕获：脚本线程可能比本次循环活得久
+                                                        // captured by value: the script thread may outlive
+                                                        // this iteration
             k.start(ws);
             if (!k.ping.empty()) answerPings(ws, k.ping, k.pong);
         });
         FeedConfig cfg = baseConfig(k.exchange, server);
         if (k.exchange == Exchange::BINANCE) cfg.path = kBinanceDepth20Path;
         cfg.ping_interval_ms = -1;  // 适配器默认间隔（OKX/Bybit 20 s；Binance 没有，空闲 stall / 2 才发）
+                                    // adapter default interval (OKX/Bybit 20 s; Binance has none
+                                    // and pings only after stall / 2 of idle time)
         cfg.stall_timeout_ms = 600;
         FeedRunner runner(cfg);
         REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
@@ -1247,20 +1409,30 @@ TEST_CASE("feed: an idle session pings on idle time (OKX \"ping\", Bybit {\"op\"
         std::vector<std::int64_t> pings;
         if (k.ping.empty()) {
             CHECK_GE(s.pongs + 1, s.pings);  // 最后一个 pong 可能还在路上
+                                             // the last pong may still be in flight
             CHECK_EQ(s.messages, 1u);        // 控制帧不算消息
+                                             // control frames are not messages
             CHECK(frames.empty());           // 没有发任何文本帧
+                                             // no text frame was sent at all
             pings = server.pingTimesNs(0);
         } else {
             CHECK_EQ(s.pongs, 0u);  // 应用层 pong 是普通消息
+                                    // an application-level pong is an ordinary message
             pings = timesOf(frames, server.frameTimesNs(0), k.ping);
             REQUIRE(pings.size() >= 3);
             REQUIRE(!frames.empty());
             CHECK_GE(ms(pings[0] - server.frameTimesNs(0)[0]), 280.0);  // 第一个心跳在快照之后空闲约 300 ms 才发出
+                                                                        // the first heartbeat goes out only after
+                                                                        // about 300 ms of idling after the snapshot
             CHECK_LE(pings.size(), std::size_t{6});
-            CHECK(waitFor([&] { return runner.feed.stats().messages >= 1 + pings.size(); }, 1000));  // 快照 + 每个 pong
+            // 快照 + 每个 pong
+            // snapshot + pongs
+            CHECK(waitFor([&] { return runner.feed.stats().messages >= 1 + pings.size(); }, 1000));
         }
         CHECK_GE(pings.size(), std::size_t{3});
-        for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);  // 回应刷新了空闲计时
+        // 回应刷新了空闲计时
+        // replies reset the idle timer
+        for (std::size_t i = 1; i < pings.size(); ++i) CHECK_GE(ms(pings[i] - pings[i - 1]), 280.0);
         CHECK(server.errors().empty());
     }
 }
@@ -1269,6 +1441,7 @@ TEST_CASE("feed: a server that never answers pings is still kicked by the stall 
     for (const bool app_level : {true, false}) {
         MockExchangeServer server;
         if (app_level) {  // OKX：收到 "ping" 但从不回 "pong"
+                          // OKX: receives "ping" but never answers "pong"
             server.setWebSocketScripts({
                 [](WsSession& ws) {
                     ws.expectText(kOkxBooks5Sub);
@@ -1278,6 +1451,7 @@ TEST_CASE("feed: a server that never answers pings is still kicked by the stall 
                 [](WsSession& ws) { ws.send(simpleBook(1)); },
             });
         } else {  // Binance：服务器卡住（不运行 io_context，不应答 WebSocket ping）
+                  // Binance: the server hangs (does not run its io_context, does not answer WebSocket pings)
             server.setWebSocketScripts({
                 [](WsSession& ws) {
                     ws.send(binanceTop(1000));
@@ -1299,6 +1473,7 @@ TEST_CASE("feed: a server that never answers pings is still kicked by the stall 
         if (app_level) {
             const std::vector<std::string> frames = server.framesReceived(0);
             CHECK_GE(std::count(frames.begin(), frames.end(), std::string("ping")), 1);  // 心跳确实发了
+                                                                                         // heartbeats were really sent
         } else {
             CHECK_EQ(s.pongs, 0u);
         }
@@ -1309,15 +1484,19 @@ TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as he
     MockExchangeServer server;
     // 连接 0..2 失败；3 = 安静的会话：一条 depth20 推送，之后约 600 ms 只有 WebSocket ping/pong，然后服务器关闭；
     // 4 及以后失败
+    // Connections 0..2 fail; 3 = a quiet session: one depth20 message, then about 600 ms of WebSocket ping/pong
+    // only, then the server closes; 4 and later fail
     server.setAcceptHandler([](std::size_t i) { return i == 3 ? AcceptAction::Serve : AcceptAction::CloseImmediately; });
     server.setWebSocketScript([](WsSession& ws) {
         ws.send(binanceTop(1000));
         ws.sleepMs(600);  // 期间 Beast 自动应答客户端的 ping
+                          // meanwhile Beast answers the client's pings automatically
         ws.close();
     });
     FeedConfig cfg = baseConfig(Exchange::BINANCE, server);
     cfg.path = kBinanceDepth20Path;
     cfg.ping_interval_ms = -1;  // WebSocket ping：空闲 100 ms 就发
+                                // WebSocket ping: sent after 100 ms of idle time
     cfg.stall_timeout_ms = 200;
     cfg.healthy_session_ms = 300;
     cfg.reconnect_initial_ms = 30;
@@ -1327,6 +1506,7 @@ TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as he
     REQUIRE(waitChecking(runner.feed, [&] { return server.acceptCount() >= 5; }, 10000));
     runner.stop();
     // 失败 0,1,2：30, 60, 120；安静但健康的会话 3 之后重置：30（不重置则为 240）
+    // Failures 0,1,2: 30, 60, 120; reset after the quiet but healthy session 3: 30 (240 without the reset)
     checkAnnouncedBackoff(events, server, {30, 60, 120, 30}, 4000);
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.stalls, 0u);
@@ -1336,6 +1516,7 @@ TEST_CASE("feed: a quiet session kept alive only by ping/pong still counts as he
 
 // ===========================================================================
 // 连接管理
+// Connection management
 // ===========================================================================
 
 TEST_CASE("feed: server closes the WebSocket -> RECONNECTING, backoff, reconnect; empty book published on disconnect") {
@@ -1369,12 +1550,16 @@ TEST_CASE("feed: server closes the WebSocket -> RECONNECTING, backoff, reconnect
             5000));
         watcher.stopWatching();
         // 每次状态变化都有对应的日志事件：按顺序检查（采样式的 StatusWatcher 可能错过很短的状态）
+        // Every status change has a matching log event: check them in order (the sampling StatusWatcher can miss
+        // very short states)
         const std::string connected = "[OKX] connected to wss://127.0.0.1:" + server.portString() + "/ws";
         CHECK(events.inOrder({"[OKX] connecting to", connected.c_str(), "[OKX] book synced (LIVE)",
                               graceful ? "[OKX] server closed the WebSocket" : "[OKX] connection lost",
                               "[OKX] reconnecting in ", "[OKX] connecting to", connected.c_str(),
                               "[OKX] book synced (LIVE)"}));
         // 采样只做"至少看到"的弱检查：断线后的 RECONNECTING（持续约 100 ms 退避）
+        // Sampling only makes a weak "at least seen" check: RECONNECTING after the disconnect (it lasts for the
+        // backoff of about 100 ms)
         CHECK(watcher.sawInOrder({FeedStatus::Reconnecting, FeedStatus::Live}));
         CHECK_EQ(runner.feed.status(), FeedStatus::Live);
         const FeedStats s = runner.feed.stats();
@@ -1382,12 +1567,15 @@ TEST_CASE("feed: server closes the WebSocket -> RECONNECTING, backoff, reconnect
         CHECK_EQ(s.connect_failures, 0u);
         CHECK(s.connected_since_ns > 0);
         // 断线时发布空簿：书 -> 空 -> 书
+        // An empty book is published on disconnect: book -> empty -> book
         REQUIRE_EQ(log.all.size(), std::size_t{3});
         CHECK_EQ(log.all[0].bids[0].price, 65000.0);
         CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
         CHECK_EQ(log.all[2].bids[0].price, 65001.0);
         CHECK_EQ(log.all[2].seq, 3u);
         // 退避：宣布的等待时间在 100 ms ±20% 内，且下一次连接确实在宣布之后至少这么久才到达
+        // Backoff: the announced wait is within 100 ms ±20%, and the next connection really arrives at least that
+        // long after the announcement
         std::vector<int> delays;
         const std::vector<EventLog::Event> announced = events.reconnects(delays);
         REQUIRE_EQ(delays.size(), std::size_t{1});
@@ -1411,8 +1599,10 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
     MockExchangeServer server;
     server.setWebSocketScripts({
         [](WsSession& ws) { ws.send(simpleBook(0)); },  // 之后静默
+                                                        // silent afterwards
         [](WsSession& ws) {
             for (int i = 0; i < 100; ++i) {  // 第二个会话持续有数据（5 s）
+                                             // the second session has data all along (5 s)
                 ws.send(simpleBook(1 + i));
                 ws.sleepMs(50);
             }
@@ -1436,8 +1626,11 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
     CHECK_EQ(s.connect_failures, 0u);
     CHECK(contains(runner.feed.lastError(), "stalled: no data for more than 300 ms during read"));
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);  // 第一个会话的快照确实收到了（停顿计时从它开始）
+                                                  // the first session's snapshot did arrive
+                                                  // (the stall timer starts from it)
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
     // 客户端时间线：连接日志 -> 快照（之后静默）-> 至少 300 ms 后踢断
+    // Client-side timeline: connected log -> snapshot (silence afterwards) -> kick at least 300 ms later
     const std::int64_t connected_ns = events.firstTime("[OKX] connected to");
     const std::int64_t stalled_ns = events.firstTime("[OKX] stalled");
     REQUIRE(connected_ns != 0);
@@ -1445,6 +1638,7 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
     CHECK_GE(ms(stalled_ns - connected_ns), 300.0);
     CHECK_LT(ms(stalled_ns - connected_ns), 3000.0);
     // 健康的第二个会话不会被误踢
+    // The healthy second session is not kicked by mistake
     runHealthChecks(runner.feed, 400);
     CHECK_EQ(runner.feed.stats().stalls, 1u);
     CHECK(server.errors().empty());
@@ -1452,11 +1646,15 @@ TEST_CASE("feed: silent server -> checkHealth kicks after stall_timeout_ms -> re
 
 TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TLS handshake, REST request, before run)") {
     {  // 阻塞在读中：run() 在 500 ms 内退出，服务器看到连接关闭；主动停止不是错误
+       // blocked in a read: run() exits within 500 ms and the server sees the connection close;
+       // a deliberate stop is not an error
         MockExchangeServer server;
         server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });  // 之后静默
+                                                                                   // silent afterwards
         FeedRunner runner(baseConfig(Exchange::OKX, server));
         REQUIRE(waitFor([&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
         std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 确保阻塞在读中
+                                                                     // make sure it is blocked in the read
         CHECK_EQ(runner.feed.status(), FeedStatus::Live);
         CHECK_LT(runner.stop(), 500.0);
         CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
@@ -1467,6 +1665,7 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
         CHECK_EQ(runner.feed.lastError(), std::string());
     }
     {  // 退避等待中
+       // during the backoff wait
         MockExchangeServer server;
         server.setAcceptHandler([](std::size_t) { return AcceptAction::CloseImmediately; });
         FeedConfig cfg = baseConfig(Exchange::OKX, server);
@@ -1480,6 +1679,7 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
         CHECK_EQ(runner.feed.stats().connect_failures, 1u);
     }
     {  // 阻塞在 TCP connect（SYN_SENT）中：在一个轮询片之内返回
+       // blocked in TCP connect (SYN_SENT): returns within one poll slice
         Listener hole(true);
         REQUIRE(hole.ok());
         FeedRunner runner(unreachableConfig(hole.port()));
@@ -1489,8 +1689,10 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
         CHECK_LT(runner.stop(), 200.0);
         CHECK_EQ(runner.feed.status(), FeedStatus::Stopped);
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);  // 主动停止不计为连接失败
+                                                             // a deliberate stop is not a connect failure
     }
     {  // TCP 已连接，服务器不做 TLS 握手
+       // TCP connected, the server does not do the TLS handshake
         MockExchangeServer server;
         server.setAcceptHandler([](std::size_t) { return AcceptAction::Silent; });
         FeedRunner runner(baseConfig(Exchange::OKX, server));
@@ -1500,6 +1702,7 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
         CHECK_LT(runner.stop(), 500.0);
     }
     {  // 阻塞在 REST 快照请求中（服务器 10 s 后才应答）
+       // blocked in the REST snapshot request (the server answers only after 10 s)
         MockExchangeServer server;
         server.setHttpHandler([](const HttpRequestInfo&) { return HttpReply{200, "{}", "application/json", 10000}; });
         server.setWebSocketScript([](WsSession& ws) { ws.send(binanceDiff(1, 2, {{"1.00", "1"}}, {})); });
@@ -1510,6 +1713,7 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
         CHECK_LT(runner.stop(), 500.0);
     }
     {  // run() 之前就 stop()：run() 立即返回
+       // stop() before run(): run() returns immediately
         FeedConfig cfg;
         cfg.exchange = Exchange::BYBIT;
         cfg.name = "Bybit";
@@ -1529,6 +1733,8 @@ TEST_CASE("feed: stop() is prompt in every phase (read, backoff, TCP connect, TL
 
 TEST_CASE("feed: stop() or a connect timeout landing before connect() starts still ends the attempt within 200 ms") {
     // feed 线程停在 connect() 系统调用之前（套接字已登记）：此刻的 shutdown 对套接字是空操作
+    // The feed thread is parked before the connect() system call (socket registered): a shutdown at this point
+    // is a no-op on the socket
     Listener hole(true);
     REQUIRE(hole.ok());
     {  // stop()
@@ -1543,6 +1749,8 @@ TEST_CASE("feed: stop() or a connect timeout landing before connect() starts sti
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);
     }
     {  // 连接超时的踢断：这次尝试仍在约一个轮询片内结束（而不是等内核放弃 SYN 重传）
+       // connect-timeout kick: this attempt still ends within about one poll slice (rather than waiting
+       // for the kernel to give up on SYN retransmission)
         FeedConfig cfg = unreachableConfig(hole.port());
         cfg.connect_timeout_ms = 300;
         cfg.reconnect_initial_ms = 5000;
@@ -1552,6 +1760,7 @@ TEST_CASE("feed: stop() or a connect timeout landing before connect() starts sti
         REQUIRE(waitFor([] { return g_connect_parked.load(); }, 2000));
         const std::int64_t t0 = hft::nowNs();
         runner.feed.checkHealth(hft::nowNs() + std::int64_t{10} * 1000000000);  // 连接时限早已过去
+                                                                                // the connect deadline is long past
         g_connect_release.store(true);
         REQUIRE(waitFor([&] { return runner.feed.stats().connect_failures == 1 && !runner.feed.lastError().empty(); },
                         1000));
@@ -1559,6 +1768,7 @@ TEST_CASE("feed: stop() or a connect timeout landing before connect() starts sti
         CHECK_EQ(runner.feed.status(), FeedStatus::Reconnecting);
         CHECK(contains(runner.feed.lastError(), "connect timeout: TCP connect did not complete within 300 ms"));
         CHECK_LT(runner.stop(), 200.0);  // 退避等待中
+                                         // during the backoff wait
     }
     g_connect_release.store(true);
 }
@@ -1570,12 +1780,15 @@ TEST_CASE("feed: a blackholed first address falls through to the next one within
     FeedConfig cfg = baseConfig(Exchange::OKX, env.server);
     cfg.host = "dual.test";
     cfg.connect_timeout_ms = 2000;  // 每个地址 max(1000, 2000 / 2) = 1000 ms
+                                    // per address max(1000, 2000 / 2) = 1000 ms
     FeedRunner runner(cfg);
     const std::int64_t t0 = hft::nowNs();
     REQUIRE(waitChecking(runner.feed, [&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
     const double took = ms(hft::nowNs() - t0);
     CHECK_GE(took, 990.0);   // 黑洞地址用满了自己的时限
+                             // the blackhole address used up its own deadline
     CHECK_LT(took, 2000.0);  // 同一个会话、在总时限之内换到了第二个地址
+                             // same session, moved on to the second address within the total deadline
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.connect_failures, 0u);
     CHECK_EQ(s.reconnects, 0u);
@@ -1593,7 +1806,9 @@ TEST_CASE("feed: a blackholed first REST address falls through to the next one b
     FeedConfig cfg = binanceDiffConfig(env.server);
     cfg.rest_host = "dual.test";
     cfg.rest_port = "443";  // 替换后的解析忽略端口
+                            // the replaced resolution ignores the port
     cfg.connect_timeout_ms = 2000;  // REST 连接总时限 min(2000, 10000 / 2) = 2000 ms → 每个地址 1000 ms
+                                    // total REST connect deadline min(2000, 10000 / 2) = 2000 ms → 1000 ms per address
     FeedRunner runner(cfg);
     REQUIRE(waitChecking(runner.feed, [&] { return runner.feed.status() == FeedStatus::Live; }, 5000));
     const FeedStats s = runner.feed.stats();
@@ -1606,6 +1821,7 @@ TEST_CASE("feed: a blackholed first REST address falls through to the next one b
     REQUIRE_EQ(reqs.size(), std::size_t{1});
     REQUIRE_EQ(sessions.size(), std::size_t{1});
     CHECK_GE(ms(reqs[0].time_ns - sessions[0]), 990.0);  // 先在黑洞地址上用满 1000 ms
+                                                         // first uses up 1000 ms on the blackhole address
     CHECK_LT(ms(reqs[0].time_ns - sessions[0]), 2000.0);
     CHECK(env.server.errors().empty());
 }
@@ -1624,6 +1840,8 @@ TEST_CASE("feed: after a connect timeout on a blackholed address the next sessio
     FeedConfig cfg = baseConfig(Exchange::OKX, env.server);
     cfg.host = "dual.test";
     cfg.connect_timeout_ms = 400;  // 单个地址的下限 1000 ms 比总时限还长：第一个会话耗在黑洞地址上
+                                   // the 1000 ms per-address floor is longer than the total deadline:
+                                   // the first session is used up on the blackhole address
     EventLog events;
     FeedRunner runner(cfg, events.callback());
     REQUIRE(waitChecking(
@@ -1631,6 +1849,8 @@ TEST_CASE("feed: after a connect timeout on a blackholed address the next sessio
         [&] { return env.server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live; }, 5000));
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.connect_failures, 1u);  // 只有第一个会话失败；服务器关闭之后的会话仍从连上过的地址开始
+                                       // only the first session fails; the session after the server closes still
+                                       // starts at the address that connected before
     CHECK_EQ(s.reconnects, 2u);
     CHECK_EQ(env.server.acceptCount(), std::size_t{2});
     CHECK(events.inOrder({"[OKX] connect timeout: TCP connect did not complete within 400 ms", "[OKX] connected to",
@@ -1647,9 +1867,11 @@ TEST_CASE("feed: wrong CA / untrusted certificate -> connect_failures and a clea
     const mock_exchange::TempFile other_ca(other.cert_pem, "wrong_ca");
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
     cfg.ca_file = other_ca.path();  // 一个没有签发服务器证书的 CA
+                                    // a CA that did not issue the server certificate
     cfg.reconnect_initial_ms = 30;
     FeedConfig system_only = baseConfig(Exchange::OKX, server);
     system_only.ca_file.clear();  // 只信任系统 CA
+                                  // trust only the system CAs
     system_only.reconnect_initial_ms = 30;
     {
         FeedRunner runner(cfg);
@@ -1672,6 +1894,7 @@ TEST_CASE("feed: wrong CA / untrusted certificate -> connect_failures and a clea
     }
     CHECK_EQ(server.wsSessionCount(), std::size_t{0});
     CHECK(!server.tlsFailures().empty());  // 服务器端看到客户端拒绝证书的 alert
+                                           // the server side sees the client's alert rejecting the certificate
 }
 
 TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls_verify=false connects without any CA") {
@@ -1682,6 +1905,8 @@ TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls
     MockExchangeServer server(opt);
     server.setWebSocketScript([](WsSession& ws) { ws.send(simpleBook(0)); });
     // 证书本身可信（ca_file = 服务器证书），但 SAN 里既没有 127.0.0.1 也没有 localhost
+    // The certificate itself is trusted (ca_file = the server certificate), but its SAN contains neither
+    // 127.0.0.1 nor localhost
     for (const char* host : {"127.0.0.1", "localhost"}) {
         FeedConfig cfg = baseConfig(Exchange::OKX, server);
         cfg.host = host;
@@ -1696,6 +1921,8 @@ TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls
     }
     CHECK_EQ(server.wsSessionCount(), std::size_t{0});
     {  // tls_verify=false：不需要任何 CA、也不比对主机名；host = localhost 同时走后台线程的 DNS 解析路径
+       // tls_verify=false: no CA needed and no hostname check; host = localhost also takes the
+       // background-thread DNS resolution path
         FeedConfig cfg = baseConfig(Exchange::OKX, server);
         cfg.tls_verify = false;
         cfg.ca_file.clear();
@@ -1707,6 +1934,8 @@ TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls
         CHECK_EQ(runner.feed.stats().connect_failures, 0u);
         CHECK_EQ(log.all[0].bids[0].price, 65000.0);
         // 脚本不等订阅帧就推送：服务器线程只在下一次运行 io_context 时才记录客户端的帧，先等它记录下来
+        // The script pushes without waiting for the subscribe frame: the server thread records the client's frames
+        // only the next time it runs its io_context, so wait for it to record them first
         CHECK(waitFor([&] { return !server.framesReceived(0).empty(); }, 2000));
         CHECK_EQ(server.framesReceived(0), std::vector<std::string>{kOkxBooks5Sub});
     }
@@ -1714,6 +1943,7 @@ TEST_CASE("feed: certificate without a matching SAN -> IP/hostname mismatch; tls
 
 // ===========================================================================
 // 快照发布
+// Snapshot publishing
 // ===========================================================================
 
 TEST_CASE("feed: snapshots arrive through the SPSC queue with increasing seq, sane timestamps and the venue id") {
@@ -1747,6 +1977,8 @@ TEST_CASE("feed: snapshots arrive through the SPSC queue with increasing seq, sa
         if (i > 0) CHECK_GE(snap.recv_ns, log.all[static_cast<std::size_t>(i - 1)].recv_ns);
     }
     // published 在 tryPush 之后才计数：取到最后一个快照时可能还差一次，稍等即可
+    // published is counted only after tryPush: when the last snapshot has been popped it may still be one
+    // short, so just wait a moment
     CHECK(waitFor([&] { return runner.feed.stats().published == static_cast<std::uint64_t>(kCount); }, 2000));
     CHECK_EQ(s.dropped_snapshots, 0u);
     CHECK_EQ(s.messages, static_cast<std::uint64_t>(kCount));
@@ -1771,6 +2003,8 @@ TEST_CASE("feed: dropped_snapshots counts publishes that found the tiny queue fu
     FeedRunner runner(cfg);
     REQUIRE_EQ(runner.feed.queue().capacity(), std::size_t{2});
     // messages 在处理之前计数；等待每条消息的发布尝试都已计入 published 或 dropped
+    // messages is counted before processing; wait until every message's publish attempt has been counted in
+    // published or dropped
     REQUIRE(waitFor(
         [&] {
             const FeedStats st = runner.feed.stats();
@@ -1778,6 +2012,8 @@ TEST_CASE("feed: dropped_snapshots counts publishes that found the tiny queue fu
         },
         5000));
     // 非空快照入队之后要留一个空槽位（给断线时的空簿）：容量 2 的队列只放得下一本簿
+    // A non-empty snapshot must leave one free slot after it is enqueued (for the empty book on disconnect): a
+    // queue of capacity 2 holds only one book
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.published, 1u);
     CHECK_EQ(s.dropped_snapshots, static_cast<std::uint64_t>(kCount - 1));
@@ -1786,8 +2022,13 @@ TEST_CASE("feed: dropped_snapshots counts publishes that found the tiny queue fu
     log.pump(runner.feed);
     REQUIRE_EQ(log.all.size(), std::size_t{1});
     CHECK_EQ(log.all[0].seq, 1u);  // 留在队列里的是最早的那一本；之后的 seq 跳号表示丢弃
+                                   // the one left in the queue is the earliest book; later skips in seq mean drops
     CHECK_EQ(runner.feed.getLatencyTracker().count(), static_cast<std::uint64_t>(kCount));  // 丢弃的也计入处理延迟
+                                                                                            // dropped ones also count
+                                                                                            // in processing latency
     // 消费者手里是非空簿时丢弃的快照不重试：腾出位置之后也不会再送来
+    // Snapshots dropped while the consumer holds a non-empty book are not retried: they are not delivered
+    // even after room frees up
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});
 }
@@ -1796,6 +2037,9 @@ namespace {
 
 // 消费者在 feed 线程退避或卡在下一个会话的某个同步步骤里时才腾出队列：它取到的最后一个快照必须是断线时的空簿
 //（第 1 本簿、空簿；第 2、3 本簿被丢弃），而且立即就能取到
+// The consumer drains the queue only while the feed thread backs off or is stuck in one of the synchronous
+// steps of the next session: the last snapshot it pops must be the empty book from the disconnect (book 1,
+// empty book; books 2 and 3 were dropped), and it must be available immediately
 void checkDrainEndsWithEmptyBook(MarketDataFeed& feed, const char* phase) {
     SnapshotLog log;
     log.pump(feed);
@@ -1810,9 +2054,11 @@ void checkDrainEndsWithEmptyBook(MarketDataFeed& feed, const char* phase) {
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
     CHECK_EQ(log.all[1].seq, 4u);  // 2、3 号（第 2、3 本簿）确实丢了
+                                   // seq 2 and 3 (books 2 and 3) really were dropped
     CHECK_LE(log.all[1].publish_ns, log.pop_ns[1]);
     CHECK_EQ(s.published, 2u);
     CHECK_EQ(s.dropped_snapshots, 2u);  // 非空快照不能占用最后一个槽位
+                                        // a non-empty snapshot may not take the last slot
 }
 
 }  // namespace
@@ -1821,7 +2067,13 @@ TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (
     // 队列容量 2 代表"消费者卡住、1024 个槽位已满"。断线时的空簿用掉为它预留的最后一个槽位；TLS 握手、WebSocket
     // 升级和第一个读处理器里的 REST 请求都是同步的、期间没有重试：空簿要是没能入队，消费者腾出位置之后仍拿着断线前的
     // 价格，直到 connect_timeout_ms（默认 10 s）或停顿看门狗结束那个会话
+    // Queue capacity 2 stands for "consumer stuck, all 1024 slots full". The empty book on disconnect uses the
+    // last slot reserved for it; the TLS handshake, the WebSocket upgrade and the REST request in the first read
+    // handler are all synchronous, with no retries meanwhile: if the empty book were not enqueued, the consumer
+    // would still hold the pre-disconnect prices after making room, until connect_timeout_ms (default 10 s) or
+    // the stall watchdog ends that session
     {  // 退避等待中：交易所长时间不可用（退避 3 s）
+       // during the backoff wait: the exchange is unavailable for a long time (3 s backoff)
         MockExchangeServer server;
         server.setWebSocketScripts({threeBooksThenClose, [](WsSession& ws) { ws.send(simpleBook(9)); }});
         FeedConfig cfg = baseConfig(Exchange::OKX, server);
@@ -1836,9 +2088,11 @@ TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         SnapshotLog more;
         CHECK_EQ(more.pump(runner.feed), std::size_t{0});  // 只送一次
+                                                           // delivered only once
         CHECK_EQ(runner.feed.stats().published, 2u);
     }
     {  // TCP 已连上，服务器不做 TLS 握手
+       // TCP connected, the server does not do the TLS handshake
         MockExchangeServer server;
         server.setAcceptHandler([](std::size_t i) { return i == 0 ? AcceptAction::Serve : AcceptAction::Silent; });
         server.setWebSocketScript(threeBooksThenClose);
@@ -1852,7 +2106,10 @@ TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (
         checkDrainEndsWithEmptyBook(runner.feed, "the next TLS handshake");
     }
     {  // WebSocket 升级请求迟迟得不到应答
+       // the WebSocket upgrade request goes unanswered for a long time
         std::atomic<int> upgrades{0};      // 声明在服务器之前：服务器线程里的过滤器可能用到它们，直到服务器析构
+                                           // declared before the server: the filter on the server thread
+                                           // may use them until the server is destroyed
         std::atomic<bool> release{false};
         MockExchangeServer server;
         const MockExchangeServer* srv = &server;
@@ -1877,6 +2134,8 @@ TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (
         release.store(true);
     }
     {  // Binance 增量深度：下一个会话第一条消息触发的 REST 快照请求迟迟得不到应答
+       // Binance diff depth: the REST snapshot request triggered by the next session's first message
+       // goes unanswered for a long time
         MockExchangeServer server;
         server.setHttpHandler([](const HttpRequestInfo& info) {
             if (info.index == 0) return HttpReply{200, binanceDepth(105, {{"65000.00", "1.0"}}, {{"65001.00", "1.0"}})};
@@ -1886,6 +2145,7 @@ TEST_CASE("feed: a consumer that drains during backoff or a stuck next session (
         server.setWebSocketScripts({
             [](WsSession& ws) {
                 // 快照（L=105）之后回放 101..110 → 第 1 本簿；111..120、121..130 → 第 2、3 本簿
+                // After the snapshot (L=105), replaying 101..110 → book 1; 111..120, 121..130 → books 2 and 3
                 ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {}));
                 ws.send(binanceDiff(111, 120, {{"65000.00", "2.5"}}, {}));
                 ws.send(binanceDiff(121, 130, {{"65000.00", "3.5"}}, {}));
@@ -1911,15 +2171,23 @@ TEST_CASE("feed: a pending book is retried once the queue has room; the publish 
     server.setWebSocketScripts({
         threeBooksThenClose,
         [](WsSession& ws) { ws.send(simpleBook(9)); },  // 之后安静：没有新的推送来替换消费者手里的空簿
+                                                        // quiet afterwards: no new message replaces
+                                                        // the empty book the consumer holds
     });
     FeedConfig cfg = baseConfig(Exchange::OKX, server);
     // 第 2、3 本簿入队失败（非空快照要给空簿留一个槽位），断线时的空簿用掉最后一个；新会话的第一本簿入队失败、
     // 保持待发布，消费者腾出位置之后由重试送达
+    // Books 2 and 3 fail to enqueue (a non-empty snapshot must leave a slot for the empty book), and the empty
+    // book on disconnect takes the last one; the new session's first book fails to enqueue and stays pending,
+    // and a retry delivers it once the consumer makes room
     cfg.queue_capacity = 2;
     struct Calls {
         std::mutex mutex;
         std::vector<std::size_t> queue_sizes;    // 回调时队列里的快照数（消费者在新会话 LIVE 之前不取）
+                                                 // snapshots in the queue at callback time (the consumer
+                                                 // does not pop before the new session is LIVE)
         std::vector<std::uint64_t> published;    // 回调时的 stats().published
+                                                 // stats().published at callback time
         std::vector<std::thread::id> threads;
     };
     auto calls = std::make_shared<Calls>();
@@ -1932,6 +2200,8 @@ TEST_CASE("feed: a pending book is retried once the queue has room; the publish 
         calls->threads.push_back(std::this_thread::get_id());
     });
     // 消费者直到新会话 LIVE（其第一本簿因队列满没能入队）之后才开始取
+    // The consumer starts popping only after the new session is LIVE (its first book failed to enqueue because
+    // the queue was full)
     REQUIRE(waitFor(
         [&] {
             return server.wsSessionCount() == 2 && runner.feed.status() == FeedStatus::Live &&
@@ -1942,25 +2212,34 @@ TEST_CASE("feed: a pending book is retried once the queue has room; the publish 
     {
         std::lock_guard<std::mutex> lock(calls->mutex);
         CHECK_EQ(calls->queue_sizes, (std::vector<std::size_t>{1, 2}));   // 每次都在入队之后：第 1 本簿、空簿
+                                                                          // always after the push: book 1, empty book
         CHECK_EQ(calls->published, (std::vector<std::uint64_t>{1, 2}));    // 计数已包含这一次
+                                                                           // the count already includes this one
     }
     SnapshotLog log;
     REQUIRE(waitFor([&] { log.pump(runner.feed); return log.all.size() == 3; }, 500));
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);  // 断线时的空簿
+                                                                // the empty book from the disconnect
     CHECK_EQ(log.all[1].seq, 4u);
     // 消费者手里是空簿：新会话没能入队的簿保持待发布，腾出位置之后送达（推送稀少的交易所不会一直显示空簿）
+    // The consumer holds the empty book: the new session's book that failed to enqueue stays pending and is
+    // delivered once there is room (an exchange with rare pushes does not keep showing an empty book)
     REQUIRE_EQ(log.all[2].bid_count, 1u);
     CHECK_EQ(log.all[2].bids[0].price, 65009.0);
     CHECK_EQ(log.all[2].seq, 5u);
     CHECK_LT(ms(log.pop_ns[2] - log.all[2].publish_ns), 100.0);  // publish_ns = 真正入队的时刻
+                                                                 // publish_ns = when it was actually enqueued
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});  // 只送一次
+                                                      // delivered only once
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.published, 3u);
     CHECK_EQ(s.dropped_snapshots, 3u);  // 重试不重复计数
+                                        // the retry is not counted twice
     std::lock_guard<std::mutex> lock(calls->mutex);
     CHECK_EQ(calls->queue_sizes.size(), std::size_t{3});  // 丢弃的 3 次没有回调，重试成功的那次有
+                                                          // no callback for the 3 drops; the successful retry gets one
     CHECK_EQ(calls->published.back(), 3u);
     for (const std::thread::id& id : calls->threads) CHECK(id == runner.thread.get_id());
 }
@@ -1983,6 +2262,7 @@ TEST_CASE("feed: an exception thrown by the publish callback is swallowed and th
 TEST_CASE("feed: a book still pending when its session ends is dropped with it, never delivered after the empty book") {
     MockExchangeServer server;
     // 第三个连接起服务器不做 TLS 握手：之后不会再有新的簿
+    // From the third connection on, the server does not do the TLS handshake: no new book comes after that
     server.setAcceptHandler([](std::size_t i) { return i < 2 ? AcceptAction::Serve : AcceptAction::Silent; });
     server.setWebSocketScripts({
         [](WsSession& ws) {
@@ -1992,6 +2272,8 @@ TEST_CASE("feed: a book still pending when its session ends is dropped with it, 
         },
         [](WsSession& ws) {
             ws.send(simpleBook(9));  // 队列已满（第 1 本簿 + 断线时的空簿）：没能入队，保持待发布
+                                     // queue full (book 1 + the empty book from the disconnect):
+                                     // not enqueued, stays pending
             ws.sleepMs(50);
             ws.close(1001, "going away");
         },
@@ -2002,6 +2284,7 @@ TEST_CASE("feed: a book still pending when its session ends is dropped with it, 
     cfg.reconnect_max_ms = 1000;
     FeedRunner runner(cfg);
     // 第二个会话也结束之后（退避约 1 s 期间），消费者才开始取
+    // The consumer starts popping only after the second session has ended too (during the backoff of about 1 s)
     REQUIRE(waitFor(
         [&] {
             return server.wsSessionCount() == 2 && runner.feed.stats().dropped_snapshots == 1 &&
@@ -2014,6 +2297,8 @@ TEST_CASE("feed: a book still pending when its session ends is dropped with it, 
     CHECK_EQ(log.all[0].bids[0].price, 65000.0);
     CHECK_EQ(log.all[1].bid_count + log.all[1].ask_count, 0u);
     // 第二个会话的簿随会话一起作废：腾出位置之后也不会在空簿之后送来过期的 65009
+    // The second session's book is discarded together with the session: even after room frees up, the stale
+    // 65009 is never delivered after the empty book
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK_EQ(log.pump(runner.feed), std::size_t{0});
     CHECK_EQ(runner.feed.stats().published, 2u);
@@ -2022,6 +2307,7 @@ TEST_CASE("feed: a book still pending when its session ends is dropped with it, 
 
 // ===========================================================================
 // 退避、重连与 REST 额度
+// Backoff, reconnects and the REST budget
 // ===========================================================================
 
 TEST_CASE("feed: failed attempts back off exponentially (initial, 2x, 4x ... capped at max)") {
@@ -2045,6 +2331,8 @@ TEST_CASE("feed: failed attempts back off exponentially (initial, 2x, 4x ... cap
 TEST_CASE("feed: the backoff attempt counter resets only after a session stayed LIVE for healthy_session_ms") {
     MockExchangeServer server;
     // 连接 0..2 失败；3 = 短会话（LIVE 约 40 ms）；4 失败；5 = 健康会话（LIVE 约 300 ms）；6 及以后失败
+    // Connections 0..2 fail; 3 = short session (LIVE for about 40 ms); 4 fails; 5 = healthy session (LIVE for
+    // about 300 ms); 6 and later fail
     server.setAcceptHandler([](std::size_t i) {
         return i == 3 || i == 5 ? AcceptAction::Serve : AcceptAction::CloseImmediately;
     });
@@ -2071,6 +2359,8 @@ TEST_CASE("feed: the backoff attempt counter resets only after a session stayed 
     REQUIRE(waitFor([&] { return server.acceptCount() >= 7; }, 10000));
     runner.stop();
     // 失败 0,1,2：30, 60, 120；短会话 3 不重置：240；失败 4：480；健康会话 5 之后重置：30（否则 960）
+    // Failures 0,1,2: 30, 60, 120; short session 3 does not reset: 240; failure 4: 480; reset after the healthy
+    // session 5: 30 (otherwise 960)
     checkAnnouncedBackoff(events, server, {30, 60, 120, 240, 480, 30}, 4000);
     CHECK(server.errors().empty());
 }
@@ -2090,6 +2380,8 @@ TEST_CASE("feed: adapter-requested reconnect (Binance serverShutdown) is immedia
     REQUIRE(waitFor([&] { return server.acceptCount() >= 5; }, 8000));
     runner.stop();
     // 前 kMaxImmediateReconnects 次立即重连（"reconnecting now"），之后按退避（400 ms，-20% 抖动）
+    // The first kMaxImmediateReconnects reconnects are immediate ("reconnecting now"), after that they back off
+    // (400 ms, -20% jitter)
     static_assert(MarketDataFeed::kMaxImmediateReconnects == 3, "update the expected sequence");
     checkAnnouncedBackoff(events, server, {0, 0, 0, 400}, 400);
     const FeedStats s = runner.feed.stats();
@@ -2101,6 +2393,8 @@ TEST_CASE("feed: adapter-requested reconnect (Binance serverShutdown) is immedia
 namespace {
 
 // Binance 增量深度：第 k 个 REST 请求返回 lastUpdateId = last_update_ids[k] 的快照（之后的请求用最后一个）
+// Binance diff depth: the k-th REST request returns a snapshot with lastUpdateId = last_update_ids[k]
+// (later requests use the last one)
 mock_exchange::HttpHandler snapshotsBridging(std::vector<std::uint64_t> last_update_ids) {
     auto ids = std::make_shared<const std::vector<std::uint64_t>>(std::move(last_update_ids));
     return [ids](const HttpRequestInfo& info) {
@@ -2110,6 +2404,7 @@ mock_exchange::HttpHandler snapshotsBridging(std::vector<std::uint64_t> last_upd
 }
 
 // 第一个 WebSocket 会话期间到达的 REST 请求
+// REST requests that arrived during the first WebSocket session
 std::vector<HttpRequestInfo> firstSessionRequests(const MockExchangeServer& server) {
     const std::vector<std::int64_t> sessions = server.wsSessionTimesNs();
     std::vector<HttpRequestInfo> out;
@@ -2137,8 +2432,11 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
     const std::vector<HttpRequestInfo> reqs = server.httpRequests();
     REQUIRE(reqs.size() >= 3);
     CHECK_GE(trace.requestGapMs(reqs, 1), 20 * 0.8 - 2.0);  // 第 1 次重试：20 ms ±20%
+                                                            // 1st retry: 20 ms ±20%
     CHECK_GE(trace.requestGapMs(reqs, 2), 40 * 0.8 - 2.0);  // 连续失败 2 次：间隔加倍，40 ms ±20%
+                                                            // 2 failures in a row: interval doubled, 40 ms ±20%
     // 第一个会话恰好请求了 rest_max_attempts 次就放弃并重连
+    // The first session made exactly rest_max_attempts requests, then gave up and reconnected
     REQUIRE(server.wsSessionTimesNs().size() >= 2);
     CHECK_EQ(firstSessionRequests(server).size(), std::size_t{3});
     runner.stop();
@@ -2147,6 +2445,7 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
     CHECK_GE(s.reconnects, 1u);
     CHECK_EQ(s.rest_snapshots, 0u);
     CHECK_EQ(s.parse_errors, 0u);  // 非 200 不交给适配器解析
+                                   // non-200 responses are not handed to the adapter for parsing
     const std::string err = runner.feed.lastError();
     CHECK(contains(err, "HTTP 500"));
     CHECK(contains(err, "REST snapshot request limit reached (rest_max_attempts 3)"));
@@ -2154,6 +2453,8 @@ TEST_CASE("feed: REST snapshot keeps failing -> retried with backoff, session en
 
 TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when every resync succeeds; requests are spaced") {
     // 上游每个事件都有缺口：每次 REST 快照都能同步成功，但下一个事件又触发一轮重同步
+    // Every upstream event comes with a gap: every REST snapshot syncs successfully, but the next event
+    // triggers another round of resync
     MockExchangeServer server;
     std::vector<std::uint64_t> ids;
     for (std::uint64_t k = 0; k < 12; ++k) ids.push_back(100 * (k + 1) + 5);
@@ -2176,7 +2477,10 @@ TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when ev
     REQUIRE(waitFor([&] { return server.wsSessionCount() >= 2; }, 5000));
     const std::vector<HttpRequestInfo> reqs = firstSessionRequests(server);
     REQUIRE_EQ(reqs.size(), std::size_t{2});  // 之前：一个会话里每个缺口一次，没有上限
+                                              // before: one per gap within a session, with no limit
     CHECK_GE(trace.requestGapMs(reqs, 1), 150 * 0.8 - 2.0);  // 事件每 30 ms 一个，请求却至少相隔 ~150 ms
+                                                             // one event every 30 ms, yet requests are
+                                                             // at least ~150 ms apart
     CHECK(contains(runner.feed.lastError(), "REST snapshot request limit reached (rest_max_attempts 2), reconnecting"));
     CHECK(contains(runner.feed.lastError(), "gap"));
     CHECK(events.inOrder({"[Binance] book synced (LIVE)", "[Binance] REST snapshot request limit reached",
@@ -2189,15 +2493,20 @@ TEST_CASE("feed: rest_max_attempts bounds REST requests per session even when ev
 TEST_CASE("feed: the per-session REST budget refills once the book has stayed in sync for healthy_session_ms") {
     // rest_max_attempts = 2：同步（请求 0）→ 连续 400 ms 没有缺口（> healthy 200 ms，额度恢复）→ 缺口（请求 1）
     // → 缺口（请求 2，额度恢复后的第 2 次）→ 缺口：额度用完，重连。不恢复的话第一个会话只有 2 次请求。
+    // rest_max_attempts = 2: sync (request 0) → no gap for 400 ms straight (> healthy 200 ms, budget refilled)
+    // → gap (request 1) → gap (request 2, the 2nd since the refill) → gap: budget used up, reconnect.
+    // Without the refill the first session would have only 2 requests.
     MockExchangeServer server;
     server.setHttpHandler(snapshotsBridging({105, 1005, 2005}));
     server.setWebSocketScript([](WsSession& ws) {
         ws.send(binanceDiff(101, 110, {{"65000.00", "1.5"}}, {}));
         for (std::uint64_t j = 0; j < 20; ++j) {  // 不间断的事件：111..120, 121..130, ...
+                                                  // uninterrupted events: 111..120, 121..130, ...
             ws.sleepMs(20);
             ws.send(binanceDiff(111 + 10 * j, 120 + 10 * j, {{"65000.00", std::to_string(2 + j)}}, {}));
         }
         for (std::uint64_t g = 1; g <= 3; ++g) {  // 三个缺口
+                                                  // three gaps
             ws.sleepMs(100);
             ws.send(binanceDiff(1000 * g + 1, 1000 * g + 10, {{"65000.00", "1.0"}}, {}));
         }
@@ -2215,6 +2524,7 @@ TEST_CASE("feed: the per-session REST budget refills once the book has stayed in
 
 // ===========================================================================
 // 连接失败
+// Connection failures
 // ===========================================================================
 
 TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never completes the TLS handshake") {
@@ -2233,6 +2543,8 @@ TEST_CASE("feed: connect timeout kicks a server that accepts TCP but never compl
     CHECK_EQ(server.acceptCount(), std::size_t{2});
     CHECK(contains(runner.feed.lastError(), "connect timeout: TLS handshake did not complete within 300 ms"));
     // 客户端时间线：第一次 "connecting" 日志（早于连接计时起点）到超时错误日志至少 300 ms
+    // Client-side timeline: at least 300 ms from the first "connecting" log line (earlier than the start of the
+    // connect timer) to the timeout error log line
     const std::int64_t connecting_ns = events.firstTime("[OKX] connecting to wss://127.0.0.1:");
     const std::int64_t timeout_ns = events.firstTime("[OKX] connect timeout");
     REQUIRE(connecting_ns != 0);
@@ -2273,6 +2585,7 @@ TEST_CASE("feed: Binance diff stream without REST configuration ends the session
 
 // ===========================================================================
 // 稳态
+// Steady state
 // ===========================================================================
 
 TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, adapter, publish, ping); loopback rate") {
@@ -2283,6 +2596,8 @@ TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, ad
     server.setWebSocketScript([go](WsSession& ws) {
         ws.expectText(kBybitSub);
         // 50+50 档快照；之后每条 delta 修改/删除/恢复其中一档（价格集合有界，簿永不交叉）
+        // Snapshot with 50+50 levels; each later delta modifies/deletes/restores one of them (the price set is
+        // bounded and the book never crosses)
         Levels bids, asks;
         for (int i = 0; i < 50; ++i) {
             bids.push_back({tenths(650000 - i), "1.0"});
@@ -2305,6 +2620,7 @@ TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, ad
         for (int i = kWarmup; i < kWarmup + kMeasured; ++i) {
             ws.send(delta(i));
             if (i % 100 == 0) ws.sleepMs(1);  // 让心跳（5 ms）在测量区间内也会发出
+                                              // so heartbeats (5 ms) also go out during the measured interval
         }
     });
     FeedConfig cfg = baseConfig(Exchange::BYBIT, server);
@@ -2332,6 +2648,7 @@ TEST_CASE("feed: steady state allocates nothing on the feed thread (TLS read, ad
     const std::size_t pings_during = server.framesReceived(0).size() - pings_before;
     CHECK_EQ(allocs, 0u);
     CHECK_GT(pings_during, std::size_t{0});  // 测量区间内确实发送过心跳
+                                             // heartbeats really were sent during the measured interval
     const FeedStats s = runner.feed.stats();
     CHECK_EQ(s.gaps, 0u);
     CHECK_EQ(s.parse_errors, 0u);

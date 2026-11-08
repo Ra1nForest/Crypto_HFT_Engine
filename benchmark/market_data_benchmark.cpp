@@ -25,6 +25,49 @@
 // 或把新旧两个二进制交替运行多次。代码布局也会让个别小消息的行（如 bbo-tbt）在不同构建间相差 10-20%。
 // 自检（行情流失去同步或校验和失败、簿不一致、深度或构成偏离标签等）失败时打印 "!!"，程序以非零状态退出。
 // 用法：./build/market_data_benchmark [--quick] [--cold]
+// Market data module benchmark. Note: this program directly includes and tests the real headers
+// under include/ (exchanges/*, orderbook.h, hft/crc32.h), not separately written copies; the
+// "old implementation" column is the pre-upgrade processing pipeline of market_data_feed.h
+// (buffers_to_string + constructing a padded_string per message + the old parseBinanceDepth), copied
+// verbatim into this file for comparison.
+// Contents:
+//   1. Per-message processing time of each adapter (adapter.onMessage, TSC-timed per message; exact
+//      p50/p90/p99, mean, share above 100 µs)
+//      a. Mock-exchange market data streams: generated the same way as the messages the monitor receives
+//         in the offline demo — the market simulation of tools/mock_market.h drives the publisher state
+//         machines of tools/mock_publishers.h (seed, warm-up, windows and push periods match the defaults
+//         of tools/mock_exchange.h): Binance depth20 and 1000-level diffs, OKX books 400-level diffs and
+//         snapshots (with checksum) / books5 / bbo-tbt, Bybit orderbook.50.
+//         A diff changes over a hundred levels on average, spread across the whole window, mostly inserts
+//         and deletes. Use this group when quoting "per-message cost".
+//      b. Book apply only, on the same diffs: per-level setLevel (what the adapters did before 0ec0622) vs
+//         batched applyLevels, A/B interleaved timing; the final books must be bit-identical; also prints
+//         the measured book depth, change mix and share of "best-first".
+//      c. Synthetic small diffs (the former section 1, kept as micro-benchmarks): they only change the best
+//         30 levels and are almost all in-place quantity changes after warm-up, never reaching the
+//         insert/delete memmove, far below the per-message cost of real market data; do not quote them as
+//         the per-message cost.
+//      --cold: measures group a again with cold caches (walks a buffer larger than the LLC before each
+//      message). Real market data delivers a message only every 10-100 ms, so the caches are mostly cold
+//      during processing; the default warm-cache, back-to-back timing is a lower bound.
+//   2. Old pipeline vs new pipeline: the same Binance depth20 messages, end-to-end time and heap
+//      allocations per message; plus the time of the buffer handling alone.
+//      The two pipelines are timed alternately on the same message (A/B interleaved, the order alternating
+//      between odd and even messages), so noise on the shared CPU affects both equally.
+//      The old pipeline uses the upgraded OrderBook (tail fast path), so the difference comes only from how
+//      the messages are processed.
+//   3. OrderBook upsert micro-benchmarks: updates at the top of a 400-level book (in-place quantity change,
+//      insert/delete at the top, random level, old-style full-book rebuild)
+//   4. One diff applied to a deep book: per-level setLevel vs batched applyLevels (two orders: best-first /
+//      shuffled). The generator keeps the book depth equal to the label and inserts/deletes/quantity
+//      changes at about 1/3 each; the measured mean depth and change mix are printed next to each row.
+// Note: the machine's CPUs are shared by several processes, so the absolute values of a single run may
+// vary by ±50%; for comparisons look at relative values within the same run, or run the old and new
+// binaries alternately several times. Code layout can also make individual small-message rows (e.g.
+// bbo-tbt) differ by 10-20% between builds.
+// A failed self-check (a stream losing sync or failing a checksum, books disagreeing, depth or mix
+// deviating from the label, etc.) prints "!!", and the program exits with a non-zero status.
+// Usage: ./build/market_data_benchmark [--quick] [--cold]
 //
 
 #include "hft/alloc_counter.h"
@@ -34,6 +77,7 @@
 #include "hft/latency_histogram.h"
 #include "hft/timing.h"
 #include "mock_publishers.h"  // tools/（CMake 为本目标加入的 include 目录）
+                              // tools/ (an include directory CMake adds for this target)
 #include "orderbook.h"
 
 #include <boost/beast/core/buffers_to_string.hpp>
@@ -58,6 +102,8 @@
 #include <vector>
 
 // 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
+// Heap allocation counting: see hft/alloc_counter.h (counting global operator new/delete; this is the
+// only translation unit of the program that includes it)
 namespace {
 std::atomic<std::uint64_t>& g_allocs = hft::alloc_counter::g_total;
 }  // namespace
@@ -65,6 +111,7 @@ std::atomic<std::uint64_t>& g_allocs = hft::alloc_counter::g_total;
 namespace {
 
 // 防止编译器把被测代码当作无用代码删除
+// Prevents the compiler from eliminating the code under test as dead code
 template <class T>
 inline void doNotOptimize(const T& value) {
     __asm__ __volatile__("" : : "r,m"(value) : "memory");
@@ -96,6 +143,8 @@ std::string qty8(std::mt19937_64& rng) { return fixedTicks(1 + static_cast<std::
 
 // ---------------------------------------------------------------------------
 // 第 2 节的计时：每条消息 rdtsc/rdtscp，结果按 TSC 频率换算为 ns 记入直方图
+// Timing for section 2: rdtsc/rdtscp per message, the result converted to ns at the TSC frequency and
+// recorded in a histogram
 // ---------------------------------------------------------------------------
 struct Result {
     const char* name;
@@ -109,6 +158,9 @@ struct Result {
 
 // A/B 交替计时：同一条消息上紧挨着分别跑 A 与 B（奇偶轮换先后顺序），两者经历相同的机器状态，
 // 共享 CPU 上的噪声对比较的影响最小
+// A/B alternating timing: A and B run back to back on the same message (the order alternates between
+// odd and even messages), so both see the same machine state and noise on the shared CPU has the least
+// effect on the comparison
 template <class FnA, class FnB>
 std::pair<Result, Result> measureAB(const char* name_a, const char* name_b, const std::vector<std::string>& msgs,
                                     double levels_per_msg, FnA&& fa, FnB&& fb) {
@@ -163,9 +215,11 @@ AdapterConfig config(Exchange ex) {
 
 // ---------------------------------------------------------------------------
 // 消息生成（模拟真实行情：BTCUSDT，0.01/0.1 跳价，顶部附近变化最多）
+// Message generation (simulates real market data: BTCUSDT, 0.01/0.1 ticks, most changes near the top)
 // ---------------------------------------------------------------------------
 
 // Binance depth20@100ms：每条 20 + 20 档
+// Binance depth20@100ms: 20 + 20 levels per message
 std::vector<std::string> binanceDepth20(std::size_t n, std::mt19937_64& rng) {
     std::vector<std::string> out;
     std::int64_t mid = 6500000;
@@ -186,6 +240,7 @@ std::vector<std::string> binanceDepth20(std::size_t n, std::mt19937_64& rng) {
 }
 
 // 交易所侧的簿：tick -> 数量字符串（买盘 tick < mid < 卖盘 tick）
+// Exchange-side book: tick -> quantity string (bid tick < mid < ask tick)
 struct SimBook {
     std::map<std::int64_t, std::string> bids, asks;
     std::int64_t bestBid() const { return bids.rbegin()->first; }
@@ -193,6 +248,8 @@ struct SimBook {
 };
 
 // 随机改动一档：改量 / 删除 / 在顶部附近插入（保持不交叉、每侧档位数大致稳定）
+// Randomly changes one level: quantity change / delete / insert near the top (keeps the book uncrossed
+// and the number of levels per side roughly stable)
 template <class QtyFn>
 void randomChange(SimBook& book, std::mt19937_64& rng, std::size_t target_levels, QtyFn&& qty, bool& bid,
                   std::int64_t& tick, std::string& q) {
@@ -238,6 +295,8 @@ Levels sideLevels(const std::map<std::int64_t, std::string>& side, bool bid, int
 
 // 一条随机增量：k 次 randomChange（同一档位以最后一次为准），按价格排好分成 {买盘, 卖盘}；
 // 删除的档位数量写作 zero
+// One random diff: k randomChange calls (for the same level the last one wins), sorted by price and
+// split into {bids, asks}; the quantity of a deleted level is written as the string passed in zero
 template <class QtyFn>
 std::pair<Levels, Levels> randomDiff(SimBook& book, std::mt19937_64& rng, std::size_t target_levels, std::size_t k,
                                      QtyFn&& qty, const char* zero, std::string (*fmt)(std::int64_t, int), int decimals) {
@@ -283,6 +342,7 @@ std::string bybitQty(std::mt19937_64& rng) { return fixedTicks(1 + static_cast<s
 
 // ---------------------------------------------------------------------------
 // 自检：失败时打印 "!!"，程序最后以非零状态退出
+// Self-check: prints "!!" on failure, and the program exits with a non-zero status at the end
 // ---------------------------------------------------------------------------
 int g_check_failures = 0;
 
@@ -293,6 +353,7 @@ void check(bool ok, const std::string& what) {
 }
 
 // 两个簿的档位逐位相同
+// The levels of the two books are bit-identical
 bool sameBook(const OrderBook& x, const OrderBook& y) {
     auto eq = [](const std::vector<PriceLevel>& a, const std::vector<PriceLevel>& b) {
         if (a.size() != b.size()) return false;
@@ -305,9 +366,12 @@ bool sameBook(const OrderBook& x, const OrderBook& y) {
 }
 
 // 实测的变化构成：把变化逐档 setLevel 到参考簿上，按档位数的变化分类；同时累计每条消息之前的簿深度
+// Measured change mix: each change is applied with setLevel to a reference book and classified by how
+// the level count changes; also accumulates the book depth before each message
 struct ChangeMix {
     std::uint64_t inserts = 0, deletes = 0, qty_changes = 0, noops = 0;
     double depth_sum = 0;       // 每条消息之前的每侧平均档位数之和
+                                // sum of the mean level count per side before each message
     std::size_t messages = 0;
 
     std::uint64_t total() const { return inserts + deletes + qty_changes + noops; }
@@ -336,12 +400,21 @@ void applyClassified(OrderBook& book, BookSide side, const std::vector<PriceLeve
 
 // ---------------------------------------------------------------------------
 // 第 4 节的工作负载：深度平稳的增量生成器
+// Workload for section 4: a depth-stationary diff generator
 // ---------------------------------------------------------------------------
 // 交易所侧的买盘有 2 × depth 个价位槽（价格 65000 - 0.25 × s），开始时偶数槽有档位，即起始簿为
 // 65000 - 0.5 × i（i < depth）。每个变化以各 1/3 的概率删除一个已有档位、在一个空槽插入新档位、改一个已有档位的数量，
 // 目标在整个簿上均匀抽取；档位数偏离 depth 时插入/删除改为往回拉，所以深度保持在 depth ± 1，构成仍是各约 1/3。
 // 同一价格在一条消息里最多出现一次（与交易所的增量一致）。每条消息给出两种顺序：最优在前（Binance / OKX / Bybit
 // 的发送顺序）与随机打乱。
+// The exchange-side bids have 2 × depth price slots (price 65000 - 0.25 × s); at the start the even
+// slots hold levels, i.e. the starting book is 65000 - 0.5 × i (i < depth). Each change, with
+// probability 1/3 each, deletes an existing level, inserts a new level into an empty slot, or changes
+// an existing level's quantity, with targets drawn uniformly over the whole book; when the level count
+// is off depth, inserts/deletes switch to pulling it back, so the depth stays at depth ± 1 and the mix
+// is still about 1/3 each.
+// A price appears at most once in a message (as in the exchanges' diffs). Each message comes in two
+// orders: best-first (the sending order of Binance / OKX / Bybit) and randomly shuffled.
 struct DeepWorkload {
     OrderBook start;
     std::vector<std::vector<PriceLevel>> best_first;
@@ -362,6 +435,7 @@ DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_
         if (s % 2 == 0) w.start.updateBid(price(s), 1.0 + static_cast<double>(s / 2));
     }
     // 把槽 s 从 from 移到 to（与末尾交换后删除，O(1)）
+    // Moves slot s from from to to (swap with the last element, then remove; O(1))
     auto move = [&](std::vector<std::size_t>& from, std::vector<std::size_t>& to, std::size_t s) {
         const std::size_t i = where[s];
         from[i] = from.back();
@@ -371,6 +445,7 @@ DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_
         to.push_back(s);
     };
     std::vector<std::size_t> stamp(slots, SIZE_MAX);  // 槽最近一次被改动的消息序号
+                                                      // index of the message that last changed the slot
     w.best_first.resize(msgs);
     w.shuffled.resize(msgs);
     for (std::size_t m = 0; m < msgs; ++m) {
@@ -378,6 +453,7 @@ DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_
         batch.reserve(changes);
         for (std::size_t k = 0; k < changes; ++k) {
             unsigned op = static_cast<unsigned>(r() % 3);  // 0 删除，1 插入，2 改量
+                                                           // 0 delete, 1 insert, 2 quantity change
             if (op != 2) {
                 if (present.size() > depth) op = 0;
                 if (present.size() < depth) op = 1;
@@ -406,11 +482,13 @@ DeepWorkload makeDeepWorkload(std::size_t depth, std::size_t changes, std::size_
 
 // ---------------------------------------------------------------------------
 // 第 1 节：逐条计时的统计（精确分位数：样本排序后按最近秩取值，单位 µs）
+// Section 1: per-message timing statistics (exact percentiles: nearest rank of the sorted samples, in µs)
 // ---------------------------------------------------------------------------
 struct SampleStats {
     std::size_t n = 0;
     double p50 = 0, p90 = 0, p99 = 0, mean = 0;
     double above_100us = 0;  // 超过 100 µs 的消息比例（0..1）
+                             // share of messages above 100 µs (0..1)
 };
 
 SampleStats summarize(std::vector<double> ns) {
@@ -442,6 +520,8 @@ double ticksToNs(std::uint64_t t0, std::uint64_t t1) {
 }
 
 // 冷缓存模式：每条消息之前读改写一遍大于 LLC 的缓冲区，把被测代码的数据挤出各级缓存
+// Cold-cache mode: before each message, read-modify-write a buffer larger than the LLC once, evicting
+// the data of the code under test from all cache levels
 constexpr std::size_t kEvictBytes = std::size_t{64} << 20;
 
 void evictCaches(std::vector<unsigned char>& buf) {
@@ -456,12 +536,15 @@ void evictCaches(std::vector<unsigned char>& buf) {
 
 // ---------------------------------------------------------------------------
 // 报文里的买卖档位（预解析；数值与适配器完全相同：同一个 adapter_detail::parseLevels）
+// Bid and ask levels in the messages (pre-parsed; the values are identical to the adapters': the same
+// adapter_detail::parseLevels)
 // ---------------------------------------------------------------------------
 struct ParsedLevels {
     std::vector<PriceLevel> bids, asks;
 };
 
 // 取出 Binance "b"/"a" 或 "bids"/"asks"、OKX data[].bids/asks、Bybit data.b/a，不做协议检查
+// Extracts Binance "b"/"a" or "bids"/"asks", OKX data[].bids/asks, Bybit data.b/a, without protocol checks
 bool collectLevels(adapter_detail::od::object obj, std::vector<adapter_detail::RawLevel>& bids,
                    std::vector<adapter_detail::RawLevel>& asks, bool top) {
     namespace od = adapter_detail::od;
@@ -523,35 +606,55 @@ double averageLevels(const std::vector<ParsedLevels>& msgs, std::size_t begin, s
 }
 
 // 与适配器相同：每侧超过 kMaxBookLevels 时裁掉远端档位
+// Same as the adapters: trims the far levels when a side exceeds kMaxBookLevels
 void trimLikeAdapters(OrderBook& book) { book.truncate(adapter_detail::kMaxBookLevels); }
 
 // ---------------------------------------------------------------------------
 // 模拟交易所的行情流：与离线演示中监控程序收到的报文以同样的方式生成
 // （tools/mock_market.h 的市场仿真 + tools/mock_publishers.h 的发布状态机，参数同 tools/mock_exchange.h 的默认值）
+// Mock-exchange market data streams: generated the same way as the messages the monitor receives in
+// the offline demo (the market simulation of tools/mock_market.h + the publisher state machines of
+// tools/mock_publishers.h, with the defaults of tools/mock_exchange.h as parameters)
 // ---------------------------------------------------------------------------
 namespace sim = mock_exchange::sim;
 namespace pub = mock_exchange::pub;
 
 constexpr std::uint64_t kMockSeed = 1;     // tools/run_mock_demo.sh 默认的 --seed
+                                           // the default --seed of tools/run_mock_demo.sh
 constexpr double kMockWarmupS = 5.0;       // MockExchangeOptions::warmup_s 的默认值
+                                           // default of MockExchangeOptions::warmup_s
 // 推送周期（毫秒）：同 tools/mock_exchange.h 的 kBinanceFastMs、kOkxBooksMs、kOkxBboMs 与 kBybitPeriodsMs（50 档）
+// Push periods (milliseconds): the same as kBinanceFastMs, kOkxBooksMs, kOkxBboMs and kBybitPeriodsMs
+// (50 levels) in tools/mock_exchange.h
 constexpr int kMockBinanceMs = 100;
 constexpr int kMockOkxBooksMs = 100;
 constexpr int kMockOkxBboMs = 10;
 constexpr int kMockBybit50Ms = 20;
 constexpr int kMockOkxSnapshotMs = 500;    // 每 0.5 s 取一个 books 快照（新订阅时收到的那种），各不相同
+                                           // a books snapshot every 0.5 s (the kind a new subscription gets),
+                                           // each one different
 constexpr std::size_t kMockBybitCapture = 200;  // mock_exchange 取 Bybit 最深的 200 档窗口，各深度的发布者再取前 N 档
+                                                // mock_exchange takes Bybit's deepest window of 200 levels;
+                                                // each depth's publisher then takes the first N levels
 
 struct MockStreams {
     std::string binance_rest;                  // GET /api/v3/depth?limit=1000，在第一条增量之后取得
+                                               // GET /api/v3/depth?limit=1000, taken after the first diff
     std::vector<std::string> binance_diffs;    // <symbol>@depth@100ms（第 0 条被 REST 快照覆盖）
+                                               // <symbol>@depth@100ms (message 0 is covered by the REST snapshot)
     std::vector<std::string> binance_depth20;  // <symbol>@depth20@100ms
     std::string okx_snapshot;                  // books 订阅时的快照
+                                               // snapshot received when subscribing to books
     std::vector<std::string> okx_updates;      // books 增量（带 checksum）
+                                               // books diffs (with checksum)
     std::vector<std::string> okx_snapshots;    // 不同时刻的 books 快照
+                                               // books snapshots at different times
     std::vector<std::string> okx_books5;       // books5 全量推送
+                                               // books5 full pushes
     std::vector<std::string> okx_bbo;          // bbo-tbt 全量推送
+                                               // bbo-tbt full pushes
     std::string bybit_snapshot;                // orderbook.50 订阅时的快照
+                                               // snapshot received when subscribing to orderbook.50
     std::vector<std::string> bybit_deltas;     // orderbook.50 delta
 };
 
@@ -564,12 +667,15 @@ MockStreams generateMockStreams(double seconds) {
     const sim::Venue& vo = market.venue(1);
     const sim::Venue& vy = market.venue(2);
     pub::BinanceDepthPublisher binance;  // 1000 档窗口
+                                         // 1000-level window
     pub::OkxBooksPublisher books;        // 400 档窗口
+                                         // 400-level window
     pub::OkxTopPublisher books5("books5", 5);
     pub::OkxTopPublisher bbo("bbo-tbt", 1);
     pub::BybitBookPublisher bybit(50);
     const std::int64_t t0_ms = 1700000000000;
     // 预热结束时以当前深度初始化全部发布者（同 MockExchange::resetHubs）
+    // After the warm-up, initialize all publishers from the current depth (same as MockExchange::resetHubs)
     binance.reset(vb.depth(Side::Buy, binance.window()), vb.depth(Side::Sell, binance.window()), vb.bookEvents());
     {
         const pub::Levels b = vo.depth(Side::Buy, books.window());
@@ -599,6 +705,8 @@ MockStreams generateMockStreams(double seconds) {
                                 vb.bookEvents(), now, msg)) {
                 s.binance_diffs.push_back(msg);
                 // 客户端缓冲第一条增量后拉取 REST 快照（limit 同 tools/mock_config.json）
+                // The client fetches the REST snapshot after buffering the first diff (limit as in
+                // tools/mock_config.json)
                 if (s.binance_diffs.size() == 1) s.binance_rest = binance.restSnapshot(1000);
             }
             s.binance_depth20.push_back(binance.partialDepth(20));
@@ -627,22 +735,29 @@ MockStreams generateMockStreams(double seconds) {
 
 // ---------------------------------------------------------------------------
 // 第 1 节的一行：一段报文经真实适配器（onMessage）逐条计时
+// One row of section 1: a run of messages through a real adapter (onMessage), timed per message
 // ---------------------------------------------------------------------------
 struct StreamRow {
     std::string name;
     SampleStats stats;
     double bytes = 0;    // 平均每条字节数
+                         // mean bytes per message
     double levels = 0;   // 平均每条档位数（两侧合计）
+                         // mean levels per message (both sides combined)
     double allocs = 0;   // 平均每条堆分配次数
+                         // mean heap allocations per message
 };
 
 // msgs[begin, end) 逐条计时；evict 非空时每条之前冲掉缓存（冷缓存模式）
+// Times msgs[begin, end) one message at a time; when evict is non-null, flushes the caches before each
+// message (cold-cache mode)
 StreamRow timeAdapter(ExchangeAdapter& a, const std::vector<std::string>& msgs, std::size_t begin, std::size_t end,
                       std::vector<unsigned char>* evict) {
     StreamRow row;
     std::vector<double> ns;
     ns.reserve(end - begin);
     if (evict != nullptr) evictCaches(*evict);  // 先分配好缓冲区
+                                                // allocate the buffer up front
     AdapterResult out;
     double bytes = 0;
     std::uint64_t allocs = 0;
@@ -665,6 +780,8 @@ StreamRow timeAdapter(ExchangeAdapter& a, const std::vector<std::string>& msgs, 
 }
 
 // 适配器统计里不该出现的问题（缺口、重同步、校验和失败、格式错误、未同步）；空串 = 正常
+// Problems that should not appear in the adapter stats (gaps, resyncs, checksum failures, parse errors,
+// not synced); empty string = OK
 std::string adapterProblems(const ExchangeAdapter& a) {
     const AdapterStats& s = a.stats();
     std::string why;
@@ -691,13 +808,18 @@ void printStreamRow(const StreamRow& r) {
 
 // ---------------------------------------------------------------------------
 // 第 1b 节：同一批增量只看簿的应用——逐档 setLevel（0ec0622 之前的适配器）vs applyLevels，A/B 交错
+// Section 1b: book apply only, on the same diffs — per-level setLevel (the adapters before 0ec0622) vs
+// applyLevels, A/B interleaved
 // ---------------------------------------------------------------------------
 struct ApplyComparison {
     SampleStats per_level, batched;
     ChangeMix mix;
     double levels = 0;                 // 平均每条档位数
+                                       // mean levels per message
     std::size_t batched_sides = 0;     // 超过 kBatchThreshold 档、走批量路径的一侧
+                                       // sides with more than kBatchThreshold levels, taking the batched path
     std::size_t best_first_sides = 0;  // 其中已严格按最优在前排好的
+                                       // of which already strictly sorted best-first
     bool same = false;
 };
 
@@ -710,10 +832,12 @@ bool strictlyBestFirst(BookSide side, const std::vector<PriceLevel>& v) {
 }
 
 // start：起始快照；msgs[first, ...)：依次应用的增量，前 warm 条不计时
+// start: initial snapshot; msgs[first, ...): diffs applied in order, the first warm ones untimed
 ApplyComparison compareApply(const ParsedLevels& start, const std::vector<ParsedLevels>& msgs, std::size_t first,
                              std::size_t warm) {
     ApplyComparison c;
     OrderBook per_level, batched, ref;  // ref：不计时的参考簿，用于分类变化与核对
+                                        // ref: untimed reference book, for classifying changes and checking
     for (OrderBook* b : {&per_level, &batched, &ref}) {
         b->reserve(2048);
         for (const PriceLevel& l : start.bids) b->setLevel(BookSide::Bid, l.price, l.quantity);
@@ -781,6 +905,7 @@ ApplyComparison compareApply(const ParsedLevels& start, const std::vector<Parsed
 
 // ---------------------------------------------------------------------------
 // 升级前的处理流程（原样复制自旧 market_data_feed.h，作为对照）
+// The pre-upgrade processing pipeline (copied verbatim from the old market_data_feed.h, for comparison)
 // ---------------------------------------------------------------------------
 namespace legacy {
 
@@ -843,9 +968,12 @@ int main(int argc, char** argv) {
     const std::size_t n = quick ? 2000 : 20000;
     std::mt19937_64 rng(20261104);
     hft::TscClock::instance();  // 先校准
+                                // calibrate first
 
     std::printf("Market data benchmark (real headers from include/)\n");
     // stage 1（结构索引）在运行时按 CPU 选择内核；On-Demand 的内联迭代代码使用编译期的 builtin 内核
+    // Stage 1 (structural indexing) picks a kernel for the CPU at run time; the inlined On-Demand iteration
+    // code uses the compile-time builtin kernel
     std::printf("  simdjson %s: stage-1 kernel %s (runtime dispatch), On-Demand inline kernel %s (compile flags)\n",
                 SIMDJSON_VERSION, simdjson::get_active_implementation()->name().c_str(),
                 simdjson::builtin_implementation()->name().c_str());
@@ -853,6 +981,9 @@ int main(int argc, char** argv) {
 
     // ======================= 1. 各适配器每条消息耗时 =======================
     // 1a / 1b：模拟交易所的行情流（与离线演示中监控程序收到的报文相同），每个流的前 20% 只预热、不计时
+    // ======================= 1. Per-message time of each adapter =======================
+    // 1a / 1b: mock-exchange market data streams (the same messages the monitor receives in the offline demo);
+    // the first 20% of each stream only warms up and is not timed
     const double mock_seconds = quick ? 30.0 : 180.0;
     const MockStreams ms = generateMockStreams(mock_seconds);
     const std::vector<ParsedLevels> p_binance_diffs = parseMessages(ms.binance_diffs);
@@ -867,10 +998,13 @@ int main(int argc, char** argv) {
         const char* name;
         Exchange ex;
         const char* subscribe;                          // nullptr = config() 的默认订阅
+                                                        // nullptr = the default subscription of config()
         const std::vector<std::string>* msgs;
         const std::vector<ParsedLevels>* parsed;
         std::size_t first;                              // 第一条要处理的报文（之前的已被 prime 覆盖）
+                                                        // first message to process (earlier ones are covered by prime)
         std::function<void(ExchangeAdapter&)> prime;    // 进入已同步状态：订阅快照 / REST 快照
+                                                        // enter the synced state: subscribe snapshot / REST snapshot
     };
     const auto feedOne = [](ExchangeAdapter& a, const std::string& m) {
         AdapterResult r;
@@ -884,6 +1018,8 @@ int main(int argc, char** argv) {
         {"Binance diff@100ms (1000-level window)", Exchange::BINANCE, nullptr, &ms.binance_diffs, &p_binance_diffs, 1,
          [&](ExchangeAdapter& a) {
              feedOne(a, ms.binance_diffs[0]);  // 缓冲并请求快照；REST 快照覆盖这一条（u <= lastUpdateId）
+                                               // buffers it and requests a snapshot; the REST snapshot
+                                               // covers this message (u <= lastUpdateId)
              AdapterResult r;
              a.onRestSnapshot(ms.binance_rest, r);
          }},
@@ -897,6 +1033,9 @@ int main(int argc, char** argv) {
     };
     // 一条比流中所有报文都大、会被适配器忽略的消息：先把 simdjson parser 与报文缓冲区撑到稳态容量
     // （否则每遇到一条"史上最大"的报文都会扩容一次，allocs/m 量到的是预热而不是稳态）
+    // A message that the adapter ignores and that is larger than any in the stream: first grows the simdjson
+    // parser and the message buffer to their steady-state capacity (otherwise every "largest ever" message
+    // grows them once, and allocs/m measures the warm-up instead of the steady state)
     const auto growBuffers = [&](ExchangeAdapter& a, const std::vector<std::string>& msgs) {
         std::size_t largest = 0;
         for (const std::string& m : msgs) largest = std::max(largest, m.size());
@@ -910,6 +1049,8 @@ int main(int argc, char** argv) {
         }
     };
     // 一个流经真实适配器：prime 同步，再预热前 20%（不计时），其余（最多 max_timed 条）逐条计时
+    // One stream through a real adapter: prime syncs, then the first 20% warms up (untimed) and the rest
+    // (at most max_timed messages) is timed message by message
     const auto runMock = [&](const MockCase& mc, std::vector<unsigned char>* evict, std::size_t max_timed) {
         AdapterConfig cfg = config(mc.ex);
         if (mc.subscribe != nullptr) cfg.subscribe_msg = mc.subscribe;
@@ -942,6 +1083,8 @@ int main(int argc, char** argv) {
     for (const MockCase& mc : mock_cases) printStreamRow(runMock(mc, nullptr, SIZE_MAX));
 
     // 1b：只看簿的应用。setLevel 一栏是 0ec0622 之前适配器应用增量的方式，applyLevels 是现在的方式
+    // 1b: book apply only. The setLevel column is how the adapters applied diffs before 0ec0622, applyLevels
+    // is how they do it now
     std::printf("\n  1b. Book apply only, the same mock diffs pre-parsed: per-level setLevel (how the adapters applied a diff\n"
                 "      before 0ec0622) vs OrderBook::applyLevels (now), A/B interleaved per message, books must end\n"
                 "      identical (us/msg). depth = mean levels per side; mix measured; sorted = share of the sides with more\n"
@@ -991,11 +1134,14 @@ int main(int argc, char** argv) {
     }
 
     // 1c：旧的第 1 节，保留作微基准
+    // 1c: the old section 1, kept as micro-benchmarks
     std::printf("\n  1c. Synthetic small diffs (the former section 1; micro-benchmarks, NOT per-message costs of real streams):\n"
                 "      changes only touch the best 30 levels and are in-place quantity changes once warmed up, so they never\n"
                 "      reach the insert/erase path that dominates real diffs. Book depth and qty share are measured.\n");
     printStreamHeader();
     // 一行微基准：计时后把同样的报文逐档重放到计时前的簿上，得到实测的簿深度与变化构成（写进行名）
+    // One micro-benchmark row: after timing, the same messages are replayed level by level onto the book as
+    // it was before timing, giving the measured book depth and change mix (written into the row name)
     const auto microRow = [&](const char* what, ExchangeAdapter& a, const std::vector<std::string>& msgs) {
         const OrderBook before = a.book();
         StreamRow row = timeAdapter(a, msgs, 0, msgs.size(), nullptr);
@@ -1019,6 +1165,7 @@ int main(int argc, char** argv) {
     };
 
     // Binance diff depth（已与 1000 档 REST 快照同步）
+    // Binance diff depth (synced with a 1000-level REST snapshot)
     {
         SimBook book;
         const std::int64_t mid = 6500000;
@@ -1048,9 +1195,11 @@ int main(int argc, char** argv) {
         a->onConnected();
         AdapterResult out;
         const auto first = makeEvents(1);  // 第一条触发缓冲 + 快照请求
+                                           // the first one triggers buffering + a snapshot request
         a->onMessage(first[0], out);
         out.reset();
         a->onRestSnapshot(snapshotNow(), out);  // 快照在第一条事件之后取得：L >= U，第一条被丢弃
+                                                // snapshot taken after the first event: L >= U, first one dropped
         const auto warm = makeEvents(2000);
         const auto msgs = makeEvents(n);
         for (const auto& m : warm) {
@@ -1061,6 +1210,7 @@ int main(int argc, char** argv) {
     }
 
     // OKX books 增量（含校验和）
+    // OKX books diffs (with checksum)
     {
         SimBook book;
         const std::int64_t mid = 300000;
@@ -1140,6 +1290,7 @@ int main(int argc, char** argv) {
     }
 
     // ======================= 2. 旧流程 vs 新流程 =======================
+    // ======================= 2. Old pipeline vs new pipeline =======================
     std::printf("\n2. Old feed pipeline vs adapter (same Binance depth20 messages, from a filled beast::flat_buffer)\n");
     printHeader();
     {
@@ -1152,6 +1303,8 @@ int main(int argc, char** argv) {
             buffer.commit(m.size());
         };
         // 旧流程：buffers_to_string -> msg.assign -> padded_string -> iterate -> parseBinanceDepth（含旧的互斥锁）
+        // Old pipeline: buffers_to_string -> msg.assign -> padded_string -> iterate -> parseBinanceDepth
+        // (including the old mutex)
         simdjson::ondemand::parser parser;
         OrderBook legacy_book("Binance:BTCUSDT");
         std::mutex legacy_mutex;
@@ -1159,6 +1312,7 @@ int main(int argc, char** argv) {
         msg.reserve(4096);
         auto oldPipeline = [&](const std::string& m) {
             fill(m);  // 模拟 ws.read 填好缓冲区（两种流程都包含这一步）
+                      // simulates ws.read filling the buffer (both pipelines include this step)
             msg.assign(boost::beast::buffers_to_string(buffer.data()));
             simdjson::padded_string padded_msg(msg);
             simdjson::ondemand::document doc;
@@ -1183,6 +1337,7 @@ int main(int argc, char** argv) {
         printResult(old_r);
         printResult(new_r);
         // 只看缓冲区处理：每条消息两次分配 + 两次复制 vs 一次复制、零分配
+        // Buffer handling only: two allocations + two copies per message vs one copy and zero allocations
         adapter_detail::PaddedBuffer pbuf;
         auto oldBuffer = [&](const std::string& m) {
             fill(m);
@@ -1211,6 +1366,7 @@ int main(int argc, char** argv) {
     }
 
     // ======================= 3. OrderBook upsert 微基准 =======================
+    // ======================= 3. OrderBook upsert micro-benchmarks =======================
     std::printf("\n3. OrderBook upsert on a 400-level book (ns/op, mean over the batch)\n");
     {
         const std::size_t ops = quick ? 200000 : 2000000;
@@ -1243,6 +1399,7 @@ int main(int argc, char** argv) {
         timeIt("new best price inserted then removed (memmove 400 levels)", [](OrderBook& b, std::size_t i, std::uint32_t x) {
             const bool bid = (i & 2) != 0;
             const double p = bid ? 65000.25 : 65000.25;  // 价差中间
+                                                         // in the middle of the spread
             b.setLevel(bid ? BookSide::Bid : BookSide::Ask, p, (i & 1) ? 0.0 : 1.0 + static_cast<double>(x % 7));
         });
         timeIt("qty change at a random level of 400 (binary search)", [](OrderBook& b, std::size_t i, std::uint32_t x) {
@@ -1257,6 +1414,8 @@ int main(int argc, char** argv) {
         });
         {
             // 旧 feed 的整簿重建：clearBids + 按交易所顺序 20 次 updateBid（尾部快路径，每档 O(1)）
+            // The old feed's full-book rebuild: clearBids + 20 updateBid calls in exchange order (tail fast path,
+            // O(1) per level)
             OrderBook b;
             std::vector<double> prices(20), qtys(20);
             for (int k = 0; k < 20; ++k) {
@@ -1275,6 +1434,7 @@ int main(int argc, char** argv) {
         }
         {
             // 对照：std::map<double, double> 的同类顶部改量
+            // Reference: the same kind of quantity changes at the top, on a std::map<double, double>
             std::map<double, double, std::greater<double>> m;
             for (int i = 0; i < 400; ++i) m[65000.0 - 0.5 * i] = 1.0 + i;
             std::mt19937_64 r(7);
@@ -1289,6 +1449,7 @@ int main(int argc, char** argv) {
         }
         {
             // BookSnapshot 发布与消费（feed 每条消息一次 assignFrom，主线程一次 copyTo）
+            // BookSnapshot publish and consume (the feed does one assignFrom per message, the main thread one copyTo)
             OrderBook b;
             build(b);
             OrderBook dst;
@@ -1311,6 +1472,14 @@ int main(int argc, char** argv) {
     // 都要 memmove 半个簿；applyLevels 一次线性归并（输入不是最优在前时先排序）。三种方式应用完全相同的变化，
     // 最终簿必须逐位相同。生成器见 makeDeepWorkload：深度平稳在标签值上，插入/删除/改量各约 1/3；
     // 每行旁边打印实测的平均深度与变化构成，偏离标签时自检失败。最深一档的标签等于适配器的簿上限 kMaxBookLevels。
+    // ============ 4. One diff message applied to a deep book: per-level setLevel vs batched applyLevels ============
+    // Diff messages (Binance 100 ms diff, OKX books update) have their level changes spread over the whole
+    // depth: a per-level upsert has to memmove half the book on every insert/delete; applyLevels does one
+    // linear merge (sorting first when the input is not best-first). The three methods apply exactly the same
+    // changes, and the final books must be bit-identical. For the generator see makeDeepWorkload: depth
+    // stationary at the label value, inserts/deletes/quantity changes about 1/3 each; the measured mean depth
+    // and change mix are printed next to each row, and the self-check fails when they deviate from the label.
+    // The label of the deepest case equals the adapters' book cap kMaxBookLevels.
     std::printf("\n4. One diff message applied to a deep book: per-level setLevel vs batched applyLevels (us/msg)\n");
     std::printf("   Depth-stationary generator: each change deletes an existing level, inserts a new one or changes a\n"
                 "   level's quantity (1/3 each, uniform over the book); depth held at the label +-1; each price at most\n"
@@ -1327,6 +1496,7 @@ int main(int argc, char** argv) {
             const std::size_t msgs = quick ? 200 : 2000;
             const DeepWorkload w = makeDeepWorkload(c.depth, c.changes, msgs, 11);
             // mode 0：逐档 setLevel（最优在前的顺序）；1：applyLevels（最优在前）；2：applyLevels（打乱）
+            // mode 0: per-level setLevel (best-first order); 1: applyLevels (best-first); 2: applyLevels (shuffled)
             auto run = [&](int mode, OrderBook& book) {
                 book = w.start;
                 book.reserve(2 * c.depth);
@@ -1350,6 +1520,7 @@ int main(int argc, char** argv) {
             const double sorted_us = run(1, sorted_book);
             const double shuffled_us = run(2, shuffled_book);
             // 不计时的核对：实测深度与变化构成
+            // Untimed check: measured depth and change mix
             ChangeMix mix;
             OrderBook ref = w.start;
             for (const auto& batch : w.best_first) {

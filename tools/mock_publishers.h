@@ -2,6 +2,10 @@
 // mock_publishers.h
 // 模拟交易所的行情发布状态机（纯协议层，无网络、无线程）：把撮合引擎的深度窗口按 Binance / OKX / Bybit 的协议
 // 差分成推送报文并维护各自的序列号，按"最近一次发布的深度"生成新订阅的快照与 Binance REST 响应。
+// Market data publishing state machines of the mock exchange (pure protocol layer, no networking, no
+// threads): diff the matching engine's depth window into push messages per the Binance / OKX / Bybit
+// protocols, maintain each one's sequence numbers, and generate the snapshots for new subscriptions and
+// the Binance REST responses from "the most recently published depth".
 //
 
 #pragma once
@@ -18,15 +22,28 @@
 
 // ============================================================================
 // 一致性约定（三家相同）
+// Consistency contract (the same for all three venues)
 //
 // 每个发布者保存"最近一次发布的深度窗口" W（每侧前 N 档，最优在前）及其序列号。每个推送周期取引擎当前的
 // 前 N 档与 W 逐档差分（wire::diffSide），只推送变化的档位：数量变化或新出现的档位给出新数量，消失的档位
 // （撤光、吃光，或被更优的新档位挤出窗口）给出数量 0；然后 W ← 当前窗口。窗口没有变化的周期不推送
 // （序列号不前进），与真实交易所"只在有变化时推送"一致。
+// Each publisher keeps "the most recently published depth window" W (top N levels per side, best first)
+// and its sequence number. Every push cycle diffs the engine's current top N levels against W level by
+// level (wire::diffSide) and pushes only the levels that changed: a level whose quantity changed or that
+// newly appeared gets its new quantity, a level that disappeared (cancelled away, traded away, or pushed
+// out of the window by a better new level) gets quantity 0; then W ← the current window. A cycle in which
+// the window did not change pushes nothing (the sequence number does not advance), consistent with real
+// exchanges' "push only when something changed".
 //
 // 推论：客户端从任何一个由 W 生成的快照（新订阅时的快照、Binance REST 响应）开始，按序应用之后的每条推送，
 // 本地簿恒等于发布者的 W，也就是引擎在最近一次发布时刻的前 N 档（价格、数量逐档相等）。
 // 测试（tests/test_mock_exchange.cpp）正是用真实的协议适配器验证这一点。
+// Corollary: a client that starts from any snapshot generated from W (the snapshot on a new subscription,
+// a Binance REST response) and applies every later push in order always has a local book equal to the
+// publisher's W, i.e. the engine's top N levels at the time of the most recent publish (equal level by
+// level in price and quantity).
+// The tests (tests/test_mock_exchange.cpp) verify exactly this with the real protocol adapters.
 //
 // 序列号：
 // - Binance：U/u 使用交易所的"簿事件计数"（受理、成交、撤单、改单回调的累计数，单调递增）。
@@ -35,6 +52,19 @@
 //   checksum 按 OKX 规则用已发布窗口的前 25 档、以推送中完全相同的字符串计算（同一价格/数量的格式化是纯函数）。
 // - Bybit：u 每条 delta 严格 +1（新订阅的快照给出当前 u）；seq（cross sequence）取簿事件计数。
 // 计数偶尔没有前进（理论上不会：窗口变化必然伴随引擎事件）时取"上一条 + 1"，保证序列号严格递增。
+// Sequence numbers:
+// - Binance: U/u use the exchange's "book event count" (the cumulative number of accept, trade, cancel and
+//   modify callbacks, monotonically increasing).
+//   Each delta covers [previous u + 1, current count]; the REST snapshot's lastUpdateId = the u of the
+//   latest delta.
+// - OKX books: seqId likewise takes the book event count; prevSeqId = the seqId of the previous push; a
+//   snapshot's prevSeqId = -1.
+//   checksum follows the OKX rules over the top 25 levels of the published window, computed from exactly
+//   the same strings as in the pushes (formatting a given price/quantity is a pure function).
+// - Bybit: u is strictly +1 per delta (the snapshot of a new subscription gives the current u); seq (cross
+//   sequence) takes the book event count.
+// When the count occasionally has not advanced (in theory it cannot: a window change always comes with
+// engine events), "previous + 1" is used, so the sequence numbers increase strictly.
 // ============================================================================
 namespace mock_exchange::pub {
 
@@ -45,6 +75,8 @@ using wire::Levels;
 namespace detail {
 
 // 已发布的深度窗口（每侧前 n 档，最优在前）及差分用的暂存区（稳态不分配）
+// The published depth window (top n levels per side, best first) and scratch buffers for diffing (no
+// allocation in steady state)
 class DepthWindow {
 public:
     explicit DepthWindow(std::size_t n) : n_(n) {}
@@ -56,6 +88,9 @@ public:
 
     // 与新深度的前 n 档差分：有变化时窗口更新为新深度、差分留在 diffBids() / diffAsks()，返回 true；
     // 没有变化返回 false（差分为空，窗口不变）。compare_orders 见 wire::diffSide。
+    // Diffs against the top n levels of the new depth: on a change, the window becomes the new depth, the
+    // diff is left in diffBids() / diffAsks(), and it returns true; without a change it returns false (the
+    // diff is empty, the window unchanged). For compare_orders see wire::diffSide.
     bool advance(const Levels& bids, const Levels& asks, bool compare_orders) {
         top(bids, cur_bids_);
         top(asks, cur_asks_);
@@ -88,14 +123,20 @@ private:
 
 // ---------------------------------------------------------------------------
 // Binance：增量深度（@100ms 与默认的 1000 ms）、部分深度 depth5/10/20、REST GET /api/v3/depth
+// Binance: incremental depth (@100ms and the default 1000 ms), partial depth depth5/10/20,
+// REST GET /api/v3/depth
 // ---------------------------------------------------------------------------
 class BinanceDepthPublisher {
 public:
     static constexpr std::size_t kWindow = 1000;            // 增量流覆盖的档位数（每侧）
+                                                            // levels covered by the incremental stream (per side)
     static constexpr std::size_t kDefaultRestLimit = 100;   // REST 不带 limit 时（与真实接口一致）
+                                                            // REST without a limit (same as the real API)
     static constexpr std::size_t kMaxRestLimit = 5000;      // REST limit 上限（超过按 5000）
+                                                            // REST limit cap (anything larger is treated as 5000)
 
     // 初始状态（不产生推送）：例如预热结束时的深度与簿事件计数
+    // Initial state (produces no push): e.g. the depth and the book event count at the end of the warm-up
     void reset(const Levels& bids, const Levels& asks, std::uint64_t update_id) {
         w_.reset(bids, asks);
         last_u_ = update_id;
@@ -105,6 +146,8 @@ public:
     }
 
     // 快速流（btcusdt@depth@100ms）的一个推送周期：与已发布窗口差分。窗口无变化返回 false（不推送，u 不前进）。
+    // One push cycle of the fast stream (btcusdt@depth@100ms): diff against the published window. Returns
+    // false if the window did not change (no push, u does not advance).
     bool publish(const Levels& bids, const Levels& asks, std::uint64_t update_id, std::int64_t event_ms,
                  std::string& out) {
         if (!w_.advance(bids, asks, false)) return false;
@@ -122,6 +165,16 @@ public:
     // 可能落在慢速事件的 [U, u] 区间内。某档在 L 之前变过、到 u 时又变回原值，净差分里没有它，客户端就会留着
     // 快照里的中间值；包含区间内触及过的每个价位（最终数量）则与任何 L 都一致——这也是真实 Binance 的语义。
     // 调用顺序：同一步先 publish 再 publishSlow。没有任何变化时返回 false。
+    // Slow stream (btcusdt@depth, 1000 ms): collects every price the fast stream touched since the previous
+    // slow event and gives their current quantities (no longer in the window → 0). U = the previous slow
+    // event's u + 1, u = the fast stream's current u.
+    // Why collect the "touched prices" rather than diff once more against the window from 1 s ago: the REST
+    // snapshot is taken from the fast stream's state (some 100 ms boundary L), which can fall inside the slow
+    // event's [U, u] range. A level that changed before L and is back to its original value by u is absent
+    // from the net diff, so the client would keep the intermediate value from the snapshot; including every
+    // price touched within the range (with its final quantity) is consistent with any L — which is also the
+    // semantics of the real Binance.
+    // Call order: within one step, publish first, then publishSlow. Returns false when nothing changed.
     bool publishSlow(std::int64_t event_ms, std::string& out) {
         if (touched_bids_.empty() && touched_asks_.empty()) return false;
         collectTouched(touched_bids_, w_.bids(), true, slow_bids_);
@@ -133,9 +186,12 @@ public:
     }
 
     // GET /api/v3/depth 的响应体：已发布窗口的前 limit 档（窗口只有 kWindow 档，limit 更大时按窗口返回）
+    // Response body of GET /api/v3/depth: the top limit levels of the published window (the window holds only
+    // kWindow levels; a larger limit returns the whole window)
     std::string restSnapshot(std::size_t limit) const { return wire::binanceDepth(last_u_, w_.bids(), w_.asks(), limit); }
 
     // 部分深度推送 btcusdt@depth<levels>[@100ms]（形状与 REST 响应相同）
+    // Partial depth push btcusdt@depth<levels>[@100ms] (same shape as the REST response)
     std::string partialDepth(std::size_t levels) const { return restSnapshot(levels); }
 
     std::uint64_t lastUpdateId() const noexcept { return last_u_; }
@@ -143,6 +199,8 @@ public:
 
 private:
     // 触及过的价位（排序去重，最优在前）在已发布窗口中的当前档位，放进 out；清空 touched
+    // Looks up the touched prices (sorted, deduplicated, best first) in the published window and puts their
+    // current levels into out; clears touched
     static void collectTouched(std::vector<Price>& touched, const Levels& window, bool bids, Levels& out) {
         auto better = [bids](Price a, Price b) { return wire::better(bids, a, b); };
         std::sort(touched.begin(), touched.end(), better);
@@ -157,21 +215,31 @@ private:
     }
 
     detail::DepthWindow w_{kWindow};     // 已发布窗口
+                                         // published window
     std::uint64_t last_u_ = 0;           // 快速流最近一条事件的 u（REST lastUpdateId）
+                                         // u of the fast stream's latest event (REST lastUpdateId)
     std::uint64_t slow_last_u_ = 0;      // 慢速流最近一条事件的 u
+                                         // u of the slow stream's latest event
     std::vector<Price> touched_bids_;    // 自上一条慢速事件以来快速流触及的价位
+                                         // prices the fast stream touched since the previous slow event
     std::vector<Price> touched_asks_;
     Levels slow_bids_, slow_asks_;       // 慢速事件的暂存区
+                                         // scratch buffers for slow events
 };
 
 // ---------------------------------------------------------------------------
 // OKX books（400 档增量）：订阅时快照，之后每 100 ms 增量；prevSeqId/seqId 衔接，带 checksum
+// OKX books (400-level deltas): a snapshot on subscribe, then a delta every 100 ms; chained by
+// prevSeqId/seqId, with checksum
 // ---------------------------------------------------------------------------
 class OkxBooksPublisher {
 public:
     static constexpr std::size_t kWindow = 400;
     // 窗口长时间不变时的心跳间隔（bids/asks 为空、prevSeqId == seqId）。真实 OKX 约 60 s；
     // 仿真中盘口每 100 ms 都在变，实际几乎不会触发，测试里用短间隔验证。
+    // Heartbeat interval while the window stays unchanged for a long time (empty bids/asks,
+    // prevSeqId == seqId). The real OKX uses about 60 s; in the simulation the top of book changes every
+    // 100 ms, so it almost never fires in practice; the tests verify it with a short interval.
     static constexpr std::int64_t kDefaultHeartbeatMs = 30000;
 
     explicit OkxBooksPublisher(std::int64_t heartbeat_ms = kDefaultHeartbeatMs) : heartbeat_ms_(heartbeat_ms) {}
@@ -184,6 +252,8 @@ public:
     }
 
     // 一个推送周期：有变化 → action "update"；无变化且距上次推送超过心跳间隔 → 心跳；否则返回 false
+    // One push cycle: changed → action "update"; unchanged and longer than the heartbeat interval since the
+    // last push → heartbeat; otherwise returns false
     bool publish(const Levels& bids, const Levels& asks, std::int64_t seq, std::int64_t ts_ms, std::string& out) {
         const std::int64_t prev = last_seq_;
         if (w_.advance(bids, asks, true)) {
@@ -193,6 +263,8 @@ public:
             return false;
         }
         // 心跳时差分两侧都是空数组、prevSeqId == seqId，checksum 仍是当前窗口的
+        // In a heartbeat both sides of the diff are empty arrays and prevSeqId == seqId; the checksum is still
+        // the current window's
         out = wire::okxBooks("books", wire::kOkxInstId, "update", w_.diffBids(), w_.diffAsks(), ts_ms, checksum_, prev,
                              last_seq_);
         last_push_ms_ = ts_ms;
@@ -200,6 +272,8 @@ public:
     }
 
     // 新订阅的快照：已发布窗口（prevSeqId = -1，seqId = 最近一条推送的 seqId）
+    // Snapshot for a new subscription: the published window (prevSeqId = -1, seqId = the seqId of the latest
+    // push)
     std::string snapshot(std::int64_t ts_ms) const {
         return wire::okxBooks("books", wire::kOkxInstId, "snapshot", w_.bids(), w_.asks(), ts_ms, checksum_, -1,
                               last_seq_);
@@ -218,6 +292,8 @@ private:
 
 // ---------------------------------------------------------------------------
 // OKX books5 / bbo-tbt：每次推送完整的前 N 档（无 action），前 N 档变化时才推送；订阅时先推一次当前状态
+// OKX books5 / bbo-tbt: every push carries the complete top N levels (no action) and is sent only when the
+// top N levels change; on subscribe the current state is pushed once first
 // ---------------------------------------------------------------------------
 class OkxTopPublisher {
 public:
@@ -247,10 +323,13 @@ private:
 
 // ---------------------------------------------------------------------------
 // Bybit orderbook.{depth}.BTCUSDT：订阅时 snapshot，之后 delta（u 严格 +1）
+// Bybit orderbook.{depth}.BTCUSDT: a snapshot on subscribe, then deltas (u strictly +1)
 // ---------------------------------------------------------------------------
 class BybitBookPublisher {
 public:
     // 起始更新号：足够大，第一条 delta 不可能是 u == 1（Bybit 用 u == 1 表示"服务重启后的快照"）
+    // Initial update id: large enough that the first delta can never be u == 1 (Bybit uses u == 1 to mean
+    // "snapshot after a service restart")
     static constexpr std::uint64_t kInitialUpdateId = 1000000;
 
     explicit BybitBookPublisher(std::size_t depth = 50)

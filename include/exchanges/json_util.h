@@ -1,6 +1,8 @@
 //
 // json_util.h
 // 适配器共用的 JSON 工具：可复用的带 padding 缓冲区（不再每条消息构造 padded_string）、档位数组与数值字段解析。
+// JSON utilities shared by the adapters: a reusable padded buffer (no padded_string constructed per
+// message any more), and parsing of level arrays and numeric fields.
 //
 
 #pragma once
@@ -25,15 +27,25 @@ namespace adapter_detail {
 namespace od = simdjson::ondemand;
 
 // 单条消息（含 REST 快照响应体）的大小上限：超过即视为格式错误，不复制、不解析（与 feed 的 REST 响应体上限一致）
+// Size limit of a single message (REST snapshot response bodies included): anything larger is treated as
+// malformed and is neither copied nor parsed (the same as the feed's REST response body limit)
 inline constexpr std::size_t kMaxMessageBytes = std::size_t{16} << 20;
 // 单个档位数组的元素上限（Binance REST 最多 5000 档；远超任何真实消息，用于限制恶意/损坏消息的内存占用）
+// Element limit of a single level array (Binance REST has at most 5000 levels; far above any real
+// message, it bounds the memory used by malicious/corrupt messages)
 inline constexpr std::size_t kMaxLevelsPerArray = 200000;
 // 本地簿每侧保留的最大档位数：增量协议会不断带来快照范围之外的远端档位，
 // 超出时裁掉最差的远端档位（不影响顶部；Binance 文档本来就说明快照范围外的档位不可靠）
+// Maximum number of levels the local book keeps per side: incremental protocols keep bringing in far
+// levels outside the snapshot range, and beyond the limit the worst far levels are trimmed (the top is
+// not affected; the Binance docs already state that levels outside the snapshot range are unreliable)
 inline constexpr std::size_t kMaxBookLevels = 5000;
 
 // 解析出的原始档位：数值 + 原始字符串（字符串视图指向 simdjson parser 的内部缓冲区，下一次解析前有效）。
 // 前两个字段与 PriceLevel 同名，因此可以直接交给 OrderBook::applyLevels
+// A parsed raw level: values + original strings (the string views point into the internal buffer of
+// the simdjson parser and stay valid until the next parse).
+// The first two fields are named as in PriceLevel, so it can be handed straight to OrderBook::applyLevels
 struct RawLevel {
     double price;
     double quantity;
@@ -43,6 +55,9 @@ struct RawLevel {
 
 // 可复用的带 padding 缓冲区：把消息复制进来并在末尾补 SIMDJSON_PADDING 个 0 字节。
 // 只有遇到比以往更大的消息时才（按 2 倍）扩容，预热之后每条消息零分配。
+// Reusable padded buffer: copies the message in and appends SIMDJSON_PADDING zero bytes.
+// It grows (2×) only on a message larger than any seen before; after warm-up, zero allocations per
+// message.
 class PaddedBuffer {
 public:
     simdjson::padded_string_view assign(std::string_view data) {
@@ -72,6 +87,18 @@ private:
 // 没有读取的值由迭代器自动跳过（结构错误仍会在下一次迭代时报告）。
 // 各适配器手写字段循环而不用回调：回调 lambda 不会被内联，每个字段都要多一次调用并把迭代器状态写回内存，
 // 小消息（bbo-tbt、books5）因此慢几个百分点。
+// simdjson On-Demand parser + reusable buffer. After a successful load, doc and the string views
+// obtained from it stay valid until the next load.
+// Usage convention (followed by every adapter): any failed nested read aborts the whole message at once.
+// On a fatal error (TAPE_ERROR, INCOMPLETE_ARRAY_OR_OBJECT etc., anything except INCORRECT_TYPE /
+// NO_SUCH_FIELD) On-Demand discards the document and the outer loop silently ends with it; touching the
+// document after that (e.g. doc.at_end()) is a null pointer access. So doc.at_end() is called only after
+// the whole root object has been iterated successfully.
+// Values that are not read are skipped automatically by the iterator (structural errors are still
+// reported on the next iteration).
+// The adapters hand-write their field loops instead of using callbacks: a callback lambda is not
+// inlined, so every field costs an extra call and writes the iterator state back to memory, which makes
+// small messages (bbo-tbt, books5) a few percent slower.
 class JsonReader {
 public:
     simdjson::error_code load(std::string_view payload, od::document& doc) {
@@ -85,6 +112,8 @@ private:
 };
 
 // 记录一个字段：它（或与它互斥的 conflicts 中任一字段）已经出现过时返回 false（重复字段 = 格式错误）
+// Records a field: returns false if it (or any of the mutually exclusive fields in conflicts) has
+// already been seen (duplicate field = malformed)
 inline bool firstSeen(unsigned& seen, unsigned bit, unsigned conflicts = 0) noexcept {
     if ((seen & (bit | conflicts)) != 0) return false;
     seen |= bit;
@@ -92,10 +121,14 @@ inline bool firstSeen(unsigned& seen, unsigned bit, unsigned conflicts = 0) noex
 }
 
 // 10^0 .. 10^18：快路径最多 18 位小数（总位数 <= 19 且整数部分至少 1 位），全部可以被 double 精确表示
+// 10^0 .. 10^18: the fast path takes at most 18 fractional digits (total digits <= 19 with at least 1
+// integer digit); all of them are exactly representable as a double
 inline constexpr double kExactPow10[19] = {1e0, 1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
                                            1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
 
 // 慢路径：std::from_chars（正确舍入），必须整串被消费且结果为有限值（拒绝 "nan"/"inf"/前后缀垃圾）
+// Slow path: std::from_chars (correctly rounded); the whole string must be consumed and the result must
+// be finite (rejects "nan"/"inf"/leading or trailing garbage)
 inline bool parseDecimalSlow(std::string_view s, double& out) noexcept {
     const char* const last = s.data() + s.size();
     const auto res = std::from_chars(s.data(), last, out);
@@ -106,6 +139,12 @@ inline bool parseDecimalSlow(std::string_view s, double& out) noexcept {
 // 超过 19 位时 m 会回绕，由调用方按位数判定转去慢路径。
 // （试过每次并行处理 4 位，以及小数部分一次 8 位的 SWAR：指令数少了，但实测没有变快——Binance 持平，
 // OKX / Bybit 反而慢 2-5%；瓶颈在精确除法与循环出口分支，因此保留最简单的写法。）
+// Accumulates the run of digits at the start of [p, end) into m (m = m * 10^n + digits) and returns the
+// position of the first non-digit.
+// Beyond 19 digits m wraps around; the caller decides by digit count to switch to the slow path.
+// (Tried processing 4 digits at a time in parallel, and an 8-digits-at-once SWAR for the fractional
+// part: fewer instructions, but no measured speed-up — Binance unchanged, OKX / Bybit actually 2-5%
+// slower; the bottleneck is the exact division and the loop exit branch, so the simplest form is kept.)
 inline const char* accumulateDigits(const char* p, const char* end, std::uint64_t& m) noexcept {
     while (p != end && static_cast<unsigned>(*p - '0') <= 9u) {
         m = m * 10 + static_cast<unsigned>(*p - '0');
@@ -121,6 +160,16 @@ inline const char* accumulateDigits(const char* p, const char* end, std::uint64_
 // tests/test_market_data.cpp 用 300 万个随机字符串验证与 from_chars 逐位一致。
 // 实测（g++ 13 -O2）：整条消息改用 from_chars 时 depth20 慢约 6%、Bybit delta 慢约 12%，指令数多 11-15%
 // （benchmark/market_data_benchmark.cpp 第 1 节）。depth20 一条消息有 80 个数。
+// Decimal string -> double, with a result bit-identical to std::from_chars.
+// Fast path (Clinger): exchange quantities/prices are almost always of the form [0-9]+(\.[0-9]+)?. If
+// the total number of digits is <= 19 and the integer mantissa m <= 2^53, then m and 10^k (k <= 18) are
+// both exactly representable as doubles, and the IEEE division m / 10^k gives the exact decimal value
+// correctly rounded, identical to from_chars (correctly rounded). Everything else (exponents, too long,
+// signs, "nan" etc.) goes to from_chars.
+// tests/test_market_data.cpp verifies bit-for-bit agreement with from_chars on 3 million random strings.
+// Measured (g++ 13 -O2): with from_chars for the whole message, depth20 is about 6% slower and a Bybit
+// delta about 12% slower, with 11-15% more instructions (benchmark/market_data_benchmark.cpp section 1).
+// A depth20 message has 80 numbers.
 inline bool parseDecimal(std::string_view s, double& out) noexcept {
     const char* p = s.data();
     const char* const end = p + s.size();
@@ -135,6 +184,7 @@ inline bool parseDecimal(std::string_view s, double& out) noexcept {
         p = accumulateDigits(p, end, m);
         frac = static_cast<int>(p - frac_start);
         if (frac == 0) return parseDecimalSlow(s, out);  // "1." 之类：交给 from_chars 判定
+                                                         // "1." and the like: let from_chars decide
     }
     if (p != end || int_digits == 0 || int_digits + frac > 19 || m > (std::uint64_t{1} << 53)) {
         return parseDecimalSlow(s, out);
@@ -145,6 +195,8 @@ inline bool parseDecimal(std::string_view s, double& out) noexcept {
 
 // 读取整数字段（std::int64_t 或 std::uint64_t）：接受 JSON 整数或整串都是十进制整数的字符串
 // （OKX 的 ts 是字符串，其余交易所是数字）
+// Reads an integer field (std::int64_t or std::uint64_t): accepts a JSON integer or a string that is a
+// decimal integer in its entirety (OKX's ts is a string, the other exchanges send numbers)
 template <class Int>
 inline bool readInt(od::value& v, Int& out) noexcept {
     static_assert(std::is_same_v<Int, std::int64_t> || std::is_same_v<Int, std::uint64_t>);
@@ -170,6 +222,8 @@ inline bool readString(od::value& v, std::string_view& out) noexcept {
 inline bool readBool(od::value& v, bool& out) noexcept { return v.get_bool().get(out) == simdjson::SUCCESS; }
 
 // 读取用于展示的标量文本：字符串取内容，数字取原始记号（去掉尾随空白）；其他类型失败
+// Reads scalar text for display: for a string its content, for a number its raw token (trailing
+// whitespace removed); other types fail
 inline bool readScalarText(od::value& v, std::string_view& out) noexcept {
     od::json_type t;
     if (v.type().get(t) != simdjson::SUCCESS) return false;
@@ -187,6 +241,13 @@ inline bool readScalarText(od::value& v, std::string_view& out) noexcept {
 // 每个元素必须是至少 2 个字符串的数组（多余元素如 OKX 的 "0"、订单数被跳过）；
 // 价格必须为正的有限值，数量为非负有限值。任何违例返回 false（调用方丢弃整条消息）。
 // 会分配内存（out 扩容，仅预热阶段），因此不是 noexcept；调用方负责捕获 std::bad_alloc。
+// Parses a level array [[price, size, ...], ...] and appends it to out.
+// Each element must be an array of at least 2 strings (extra elements such as OKX's "0" and the order
+// count are skipped);
+// the price must be positive and finite, the quantity non-negative and finite. Any violation returns
+// false (the caller drops the whole message).
+// It allocates (out grows, only during warm-up), so it is not noexcept; the caller is responsible for
+// catching std::bad_alloc.
 inline bool parseLevels(od::value& v, std::vector<RawLevel>& out) {
     od::array arr;
     if (v.get_array().get(arr) != simdjson::SUCCESS) return false;
@@ -207,6 +268,8 @@ inline bool parseLevels(od::value& v, std::vector<RawLevel>& out) {
                 if (item_value.get_string().get(r.sz) != simdjson::SUCCESS) return false;
             }
             ++idx;  // 其余元素不读取，迭代器会自动跳过（结构错误仍会在下一次迭代时报告）
+                    // the other elements are not read; the iterator skips them automatically
+                    // (structural errors are still reported on the next iteration)
         }
         if (idx < 2) return false;
         if (!parseDecimal(r.px, r.price) || !(r.price > 0.0)) return false;
@@ -218,6 +281,7 @@ inline bool parseLevels(od::value& v, std::vector<RawLevel>& out) {
 }
 
 // 拼接错误信息（只在错误路径上调用，允许分配）
+// Concatenates an error message (only called on error paths; allocation is allowed)
 inline std::string concat(std::initializer_list<std::string_view> parts) {
     std::size_t n = 0;
     for (std::string_view p : parts) n += p.size();

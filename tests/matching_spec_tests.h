@@ -2,11 +2,16 @@
 // matching_spec_tests.h
 // 撮合引擎规范测试套件（docs/MATCHING_ENGINE.md「Semantics」的可执行版本）：对任意满足同一接口的订单簿模板注册
 // 全部规范用例，逐条比对完整事件序列，并在每一步之后检查不变量与查询一致性。
+// Matching engine spec test suite (the executable version of "Semantics" in docs/MATCHING_ENGINE.md):
+// registers every spec case for any order book template that satisfies the same interface, compares the
+// complete event sequence entry by entry, and checks invariants and query consistency after every step.
 //
 // 用法（test_matching.cpp 中，静态初始化期调用）：
+// Usage (in test_matching.cpp, called during static initialization):
 //   registerMatchingSpecTests<hft::matching::ReferenceOrderBook>("reference");
 //   registerMatchingSpecTests<hft::matching::LimitOrderBook>("optimized");
 // 用例名为 "<impl_name>/<area>: <description>"。
+// Case names are "<impl_name>/<area>: <description>".
 //
 
 #pragma once
@@ -22,22 +27,29 @@
 #include <vector>
 
 // CHECK_LEVELS(expr, {px, qty, orders}, ...)：任意返回 std::vector<LevelInfo> 的表达式
+// CHECK_LEVELS(expr, {px, qty, orders}, ...): any expression that returns a std::vector<LevelInfo>
 #define CHECK_LEVELS(actual, ...)                                                          \
     ::hft::matching::test::checkList((actual),                                             \
         std::vector<::hft::matching::LevelInfo>{__VA_ARGS__}, #actual, __FILE__, __LINE__)
 
 // 布置盘面：请求必须只产生 Accepted 并原样挂单（仅在本头文件内使用，末尾 #undef）
+// Sets up the book: the request must produce only Accepted and rest as is (used only in this header,
+// #undef at the end)
 #define PLACE(h, req) (h).place((req), __FILE__, __LINE__)
 
 namespace hft::matching::test {
 
 // 规范测试夹具：持有记录型监听器与被测订单簿。每个修改操作返回该操作产生的全部事件，
 // 并在操作之后检查 checkInvariants() 与查询一致性（失败即终止当前用例）。
+// Spec test fixture: holds a recording listener and the order book under test. Every mutating operation
+// returns all the events it produced, and checkInvariants() and query consistency are checked after the
+// operation (a failure aborts the current case).
 template <template <class> class BookT>
 struct SpecHarness {
     using Book = BookT<RecordingListener>;
 
     RecordingListener listener;  // 必须先于 book 构造（book 持有它的引用）
+                                 // must be constructed before book (book holds a reference to it)
     Book book;
 
     explicit SpecHarness(std::size_t max_orders = 0) : listener(), book(listener, max_orders) {
@@ -89,12 +101,14 @@ struct SpecHarness {
 };
 
 // 订单查询行的简写构造
+// Shorthand constructor for an order query row
 inline OrderInfo orderInfo(OrderId id, AccountId account, Side side, Price price, Qty remaining,
                            bool post_only = false, StpMode stp = StpMode::None) {
     return OrderInfo{id, account, side, price, remaining, post_only, stp};
 }
 
 // 把用例注册为 "<impl>/<name>"
+// Registers cases as "<impl>/<name>"
 class SpecRegistrar {
 public:
     explicit SpecRegistrar(std::string impl_name) : impl_name_(std::move(impl_name)) {}
@@ -107,6 +121,8 @@ private:
 };
 
 // 各区域的用例注册函数放在 spec 子命名空间，简写别名与账户常量不外泄
+// The per-area case registration functions live in the spec sub-namespace, so the shorthand aliases and
+// account constants do not leak out
 namespace spec {
 
 using S = Side;
@@ -121,6 +137,7 @@ inline constexpr AccountId kD = 4;
 
 // ============================================================================
 // submit 校验（规则 1-6 及其优先顺序）
+// submit validation (rules 1-6 and their precedence)
 // ============================================================================
 template <template <class> class BookT>
 void registerValidationSpecs(const SpecRegistrar& add) {
@@ -154,8 +171,10 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         const OrderRequest m1 = marketBuy(2, 2).account(kB).price(-7);
         CHECK_EVENTS(h.submit(m1), accepted(m1), trade(1, 1, 2, kA, kB, S::Buy, 100, 2, 3, 0));
         const OrderRequest m2 = marketBuy(3, 1).account(kB).price(1);  // 远低于卖一，照样成交
+                                                                       // far below the best ask, still trades
         CHECK_EVENTS(h.submit(m2), accepted(m2), trade(2, 1, 3, kA, kB, S::Buy, 100, 1, 2, 0));
         const OrderRequest m3 = marketSell(4, 1).account(kB).price(INT64_MAX);  // 买盘为空
+                                                                                // bid side is empty
         CHECK_EVENTS(h.submit(m3), accepted(m3), cancelled(4, 1, CR::MarketRemainder));
         const OrderRequest m4 = marketBuy(5, 1).account(kB).price(0).fok();
         CHECK_EVENTS(h.submit(m4), accepted(m4), trade(3, 1, 5, kA, kB, S::Buy, 100, 1, 1, 0));
@@ -193,6 +212,7 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(2, 101, 5).account(kB));
         const StateSnapshot before = snapshotOf(h.book);
         // 这些请求若被接受都会成交；重复 id 必须在此之前拒绝
+        // These requests would all trade if accepted; the duplicate id must be rejected before that
         CHECK_EVENTS(h.submit(buy(2, 101, 5).ioc().account(kC)), rejectedNew(2, RR::DuplicateOrderId));
         CHECK_EVENTS(h.submit(buy(1, 101, 1).fok().account(kC)), rejectedNew(1, RR::DuplicateOrderId));
         CHECK_EVENTS(h.submit(marketSell(1, 1).account(kC)), rejectedNew(1, RR::DuplicateOrderId));
@@ -241,6 +261,8 @@ void registerValidationSpecs(const SpecRegistrar& add) {
 
     add("validation: quantity and price are checked before post-only crossing", __LINE__, [] {
         // 卖出 post-only 且价格 <= 0 时 crosses(Sell, p) 为真：只有规则顺序能决定拒单原因
+        // For a post-only sell with a price <= 0, crosses(Sell, p) is true: only the rule order decides the
+        // reject reason
         H h;
         PLACE(h, buy(1, 100, 5).account(kA));
         CHECK_EVENTS(h.submit(sell(2, 0, 1).postOnly()), rejectedNew(2, RR::InvalidPrice));
@@ -256,6 +278,7 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.submit(buy(3, 101, 1).postOnly()), rejectedNew(3, RR::CapacityExceeded));
         CHECK_EVENTS(h.submit(sell(4, 100, 1).postOnly()), rejectedNew(4, RR::CapacityExceeded));
         // 有空位时，同样的请求才轮到 post-only 规则
+        // Only when there is room does the same request reach the post-only rule
         H g(3);
         PLACE(g, buy(1, 100, 5).account(kA));
         PLACE(g, sell(2, 101, 5).account(kA));
@@ -341,16 +364,20 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.submit(sell(4, 100, 11).postOnly().account(kB)), rejectedNew(4, RR::InvalidQuantity));
         CHECK_UNCHANGED(before, h.book);
         // 恰好达到上限：接受；之后这一档再多一手也不行
+        // Reaching the bound exactly: accepted; after that, not even one more lot fits at this level
         const OrderRequest a5 = sell(5, 100, 10).account(kB);
         CHECK_EVENTS(h.submit(a5), accepted(a5));
         CHECK_DEPTH(h.book, S::Sell, {100, kMax, 2});
         CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1), infoOf(a5));
         CHECK_EVENTS(h.submit(sell(6, 100, 1).account(kC)), rejectedNew(6, RR::InvalidQuantity));
         // 买盘同理
+        // Same for the bid side
         PLACE(h, buy(7, 99, kMax).account(kC));
         CHECK_EVENTS(h.submit(buy(8, 99, 1).account(kD)), rejectedNew(8, RR::InvalidQuantity));
         CHECK_DEPTH(h.book, S::Buy, {99, kMax, 1});
         // 上限按档位计算：同一侧的其他价位不受影响；被拒的 id 也没有被占用
+        // The bound is per level: other prices on the same side are unaffected;
+        // the rejected ids were not taken either
         const OrderRequest a2 = sell(2, 101, kMax).account(kB);
         CHECK_EVENTS(h.submit(a2), accepted(a2));
         const OrderRequest b8 = buy(8, 98, kMax).account(kD);
@@ -363,6 +390,9 @@ void registerValidationSpecs(const SpecRegistrar& add) {
     add("validation: the level total bound is checked after duplicate id and capacity", __LINE__, [] {
         // 上限触发时本侧在该价位已有档位：价格必然为正、订单也不可能穿价，所以它与 InvalidPrice、
         // PostOnlyWouldCross 永远不会同时成立；能与它同时成立、决定先后的只有重复 id 与容量规则
+        // When the bound triggers, this side already has a level at that price: the price must be positive and
+        // the order cannot cross, so it never holds together with InvalidPrice or PostOnlyWouldCross; the only
+        // rules that can hold at the same time, where precedence matters, are the duplicate id and capacity rules
         H h(2);
         constexpr Qty kMax = kMaxLevelQty;
         PLACE(h, sell(1, 100, kMax).account(kA));
@@ -380,6 +410,7 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(1, 100, kMax).account(kA));
         PLACE(h, buy(2, 99, kMax).account(kA));
         // IOC / FOK / 市价单不会挂单：本侧该价位已满也照常接受
+        // IOC / FOK / market orders never rest: accepted as usual even if this side's level at the price is full
         const OrderRequest i3 = sell(3, 100, kMax).ioc().account(kB);
         CHECK_EVENTS(h.submit(i3), accepted(i3), cancelled(3, kMax, CR::IocRemainder));
         const OrderRequest f4 = buy(4, 99, kMax).fok().account(kB);
@@ -387,6 +418,8 @@ void registerValidationSpecs(const SpecRegistrar& add) {
         const OrderRequest m5 = marketSell(5, 2).account(kB);
         CHECK_EVENTS(h.submit(m5), accepted(m5), trade(1, 2, 5, kA, kB, S::Sell, 99, 2, kMax - 2, 0));
         // 会穿价的限价 GTC：本侧在它的价格上不可能已有档位（盘口不交叉），剩余量挂成新的一档
+        // A limit GTC that crosses: this side cannot already have a level at its price (the book never crosses),
+        // so the remainder rests as a new level
         const OrderRequest b6 = buy(6, 101, kMax).account(kB);
         CHECK_EVENTS(h.submit(b6), accepted(b6), trade(2, 1, 6, kA, kB, S::Buy, 100, kMax, 0, 0));
         PLACE(h, sell(7, 100, 5).account(kA));
@@ -402,6 +435,7 @@ void registerValidationSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 挂单与深度
+// Resting orders and depth
 // ============================================================================
 template <template <class> class BookT>
 void registerRestingSpecs(const SpecRegistrar& add) {
@@ -450,6 +484,7 @@ void registerRestingSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 撮合：价格-时间优先、成交价、部分成交、扫档
+// Matching: price-time priority, trade price, partial fills, sweeping levels
 // ============================================================================
 template <template <class> class BookT>
 void registerMatchingSpecs(const SpecRegistrar& add) {
@@ -542,6 +577,7 @@ void registerMatchingSpecs(const SpecRegistrar& add) {
         CHECK_TOP(h.book, 102, std::nullopt);
         CHECK_DEPTH(h.book, S::Buy, {102, 7, 1});
         // 挂出的剩余量此后就是 maker
+        // The rested remainder is a maker from then on
         const OrderRequest t2 = sell(3, 100, 2).account(kA);
         CHECK_EVENTS(h.submit(t2), accepted(t2), trade(2, 2, 3, kB, kA, S::Sell, 102, 2, 5, 0));
     });
@@ -582,6 +618,7 @@ void registerMatchingSpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.submit(b), accepted(b));
         CHECK_TOP(h.book, 100, 101);
         const OrderRequest s = sell(3, 101, 1).account(kB);  // 排在 1 号单之后
+                                                             // queued behind order 1
         CHECK_EVENTS(h.submit(s), accepted(s));
         CHECK_ORDERS_AT(h.book, S::Sell, 101, infoOf(a1), infoOf(s));
         CHECK_EQ(h.book.lastTradeId(), 0u);
@@ -590,6 +627,7 @@ void registerMatchingSpecs(const SpecRegistrar& add) {
     add("matching: self-trade happens when the taker's STP mode is None", __LINE__, [] {
         H h;
         const OrderRequest m = sell(1, 101, 5).account(kA).stp(SM::CancelBoth);  // maker 的 STP 模式无关
+                                                                                 // maker's STP mode is irrelevant
         PLACE(h, m);
         const OrderRequest t = buy(2, 101, 3).account(kA);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 1, 2, kA, kA, S::Buy, 101, 3, 2, 0));
@@ -612,6 +650,7 @@ void registerMatchingSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 市价单
+// Market orders
 // ============================================================================
 template <template <class> class BookT>
 void registerMarketSpecs(const SpecRegistrar& add) {
@@ -624,6 +663,7 @@ void registerMarketSpecs(const SpecRegistrar& add) {
         const OrderRequest m2 = marketSell(2, 3).account(kA);
         CHECK_EVENTS(h.submit(m2), accepted(m2), cancelled(2, 3, CR::MarketRemainder));
         // 同侧有挂单不影响：只看对手方
+        // Resting orders on the same side make no difference: only the opposite side counts
         PLACE(h, buy(3, 100, 1));
         const OrderRequest m3 = marketBuy(4, 2);
         CHECK_EVENTS(h.submit(m3), accepted(m3), cancelled(4, 2, CR::MarketRemainder));
@@ -669,6 +709,7 @@ void registerMarketSpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.submit(m2), accepted(m2), trade(2, 3, 4, kA, kB, S::Sell, 98, 1, 0, 2),
                      cancelled(4, 2, CR::MarketRemainder));
         CHECK_EQ(h.book.orderCount(), 0u);  // 市价单从不挂单
+                                            // market orders never rest
     });
 
     add("market: FOK market order is killed when total liquidity is short", __LINE__, [] {
@@ -701,6 +742,7 @@ void registerIocSpecs(const SpecRegistrar& add) {
         const OrderRequest t1 = buy(2, 100, 5).ioc().account(kB);
         CHECK_EVENTS(h.submit(t1), accepted(t1), cancelled(2, 5, CR::IocRemainder));
         const OrderRequest t2 = sell(3, 50, 2).ioc().account(kB);  // 买盘为空
+                                                                   // bid side is empty
         CHECK_EVENTS(h.submit(t2), accepted(t2), cancelled(3, 2, CR::IocRemainder));
         CHECK_EQ(h.book.orderCount(), 1u);
         CHECK_NO_ORDER(h.book, 2);
@@ -730,6 +772,7 @@ void registerIocSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // FOK（含与 STP 的组合）
+// FOK (including combinations with STP)
 // ============================================================================
 template <template <class> class BookT>
 void registerFokSpecs(const SpecRegistrar& add) {
@@ -765,6 +808,7 @@ void registerFokSpecs(const SpecRegistrar& add) {
         CHECK_UNCHANGED(before, h.book);
         CHECK_EQ(h.book.lastTradeId(), 0u);
         // 被撤销的 FOK 从未挂单，id 立即可用
+        // The cancelled FOK never rested, so its id is available at once
         const OrderRequest again = buy(4, 98, 1).account(kB);
         CHECK_EVENTS(h.submit(again), accepted(again));
     });
@@ -788,6 +832,7 @@ void registerFokSpecs(const SpecRegistrar& add) {
         PLACE(h, buy(2, 98, 5).account(kA));
         const StateSnapshot before = snapshotOf(h.book);
         const OrderRequest t1 = sell(3, 99, 6).fok().account(kB);  // >= 99 的买单只有 5
+                                                                   // bids at >= 99 add up to only 5
         CHECK_EVENTS(h.submit(t1), accepted(t1), cancelled(3, 6, CR::FokUnfillable));
         CHECK_UNCHANGED(before, h.book);
         const OrderRequest t2 = sell(4, 98, 10).fok().account(kB);
@@ -815,6 +860,7 @@ void registerFokSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(2, 101, 2).account(kB));
         const StateSnapshot before = snapshotOf(h.book);
         // 总量 5 >= 4，但非本账户的只有 2
+        // Total 5 >= 4, but only 2 of it belongs to other accounts
         const OrderRequest t = buy(3, 101, 4).fok().account(kA).stp(SM::CancelMaker);
         CHECK_EVENTS(h.submit(t), accepted(t), cancelled(3, 4, CR::FokUnfillable));
         CHECK_UNCHANGED(before, h.book);
@@ -828,10 +874,12 @@ void registerFokSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(3, 102, 10).account(kB));
         const StateSnapshot before = snapshotOf(h.book);
         // 本账户 maker 之前只有 2；其后的 10 不计入
+        // Only 2 ahead of the self maker; the 10 behind it do not count
         const OrderRequest t1 = buy(4, 102, 4).fok().account(kA).stp(SM::CancelTaker);
         CHECK_EVENTS(h.submit(t1), accepted(t1), cancelled(4, 4, CR::FokUnfillable));
         CHECK_UNCHANGED(before, h.book);
         // 本账户 maker 之前的量足够时正常成交，且不触碰它
+        // When the quantity ahead of the self maker is enough, it trades normally and does not touch it
         const OrderRequest t2 = buy(5, 102, 2).fok().account(kA).stp(SM::CancelTaker);
         CHECK_EVENTS(h.submit(t2), accepted(t2), trade(1, 1, 5, kB, kA, S::Buy, 101, 2, 0, 0));
         CHECK_ORDERS_AT(h.book, S::Sell, 101, infoOf(self));
@@ -844,6 +892,7 @@ void registerFokSpecs(const SpecRegistrar& add) {
         const StateSnapshot before = snapshotOf(h.book);
         const OrderRequest t1 = buy(3, 102, 5).fok().account(kA).stp(SM::CancelBoth);
         CHECK_EVENTS(h.submit(t1), accepted(t1), cancelled(3, 5, CR::FokUnfillable));  // maker 1 不被撤
+                                                                                       // maker 1 is not cancelled
         CHECK_UNCHANGED(before, h.book);
 
         H g;
@@ -880,6 +929,8 @@ void registerFokSpecs(const SpecRegistrar& add) {
         constexpr Qty kP62 = Qty{1} << 62;
         PLACE(h, sell(1, 100, kP62).account(kA));
         // 第二张 2^62 会让档位总量超过 INT64_MAX：拒单；补上 2^62 - 1 恰好到 INT64_MAX
+        // A second 2^62 would push the level total past INT64_MAX: rejected;
+        // topping up with 2^62 - 1 reaches INT64_MAX exactly
         CHECK_EVENTS(h.submit(sell(2, 100, kP62).account(kB)), rejectedNew(2, RR::InvalidQuantity));
         PLACE(h, sell(3, 100, kP62 - 1).account(kB));
         CHECK_DEPTH(h.book, S::Sell, {100, kMax, 2});
@@ -888,6 +939,8 @@ void registerFokSpecs(const SpecRegistrar& add) {
         const OrderRequest f5 = buy(5, 100, 10).fok().account(kC).stp(SM::CancelMaker);
         CHECK_EVENTS(h.submit(f5), accepted(f5), trade(2, 1, 5, kA, kC, S::Buy, 100, 10, kP62 - 20, 0));
         // 整档还剩 INT64_MAX - 20：多要一手就整单撤销，正好这么多就全部成交
+        // The level has INT64_MAX - 20 left in total: one lot more and the whole order is cancelled, exactly that
+        // much and it fills completely
         const StateSnapshot before = snapshotOf(h.book);
         const OrderRequest f6 = buy(6, 100, kMax - 19).fok().account(kC);
         CHECK_EVENTS(h.submit(f6), accepted(f6), cancelled(6, kMax - 19, CR::FokUnfillable));
@@ -907,10 +960,13 @@ void registerFokSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(2, 101, kMax).account(kB));
         PLACE(h, sell(3, 102, kMax).account(kC));
         // 整侧总量远超 INT64_MAX；预检从 INT64_MAX 倒数，跨档也不溢出
+        // The total of the side is far above INT64_MAX; the pre-check counts down from INT64_MAX and does not
+        // overflow across levels
         const OrderRequest f4 = buy(4, 102, kMax).fok().account(kD);
         CHECK_EVENTS(h.submit(f4), accepted(f4), trade(1, 1, 4, kA, kD, S::Buy, 100, kMax - 5, 0, 5),
                      trade(2, 2, 4, kB, kD, S::Buy, 101, 5, kMax - 5, 0));
         // CancelMaker 跳过本账户的一整档，下一档正好够
+        // CancelMaker skips a whole level of self makers; the next level is exactly enough
         const OrderRequest f5 = buy(5, 102, kMax).fok().account(kB).stp(SM::CancelMaker);
         CHECK_EVENTS(h.submit(f5), accepted(f5), cancelled(2, kMax - 5, CR::SelfTradePrevention),
                      trade(3, 3, 5, kC, kB, S::Buy, 102, kMax, 0, 0));
@@ -920,6 +976,7 @@ void registerFokSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 自成交保护（STP）
+// Self-trade prevention (STP)
 // ============================================================================
 template <template <class> class BookT>
 void registerStpSpecs(const SpecRegistrar& add) {
@@ -933,6 +990,7 @@ void registerStpSpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.submit(t), accepted(t), cancelled(1, 2, CR::SelfTradePrevention),
                      trade(1, 2, 3, kB, kA, S::Buy, 101, 3, 0, 1));
         CHECK_ORDER(h.book, 3, infoOf(t, 1));  // GTC 剩余量挂单
+                                               // the GTC remainder rests
         CHECK_TOP(h.book, 101, std::nullopt);
     });
 
@@ -952,6 +1010,7 @@ void registerStpSpecs(const SpecRegistrar& add) {
                      cancelled(4, 1, CR::SelfTradePrevention),
                      trade(2, 5, 7, kC, kA, S::Buy, 103, 2, 0, 0));
         CHECK_DEPTH(h.book, S::Sell, {104, 1, 1});  // 成交完即停止：6 号单不受影响
+                                                    // stops once filled: order 6 is not affected
     });
 
     add("stp: CancelTaker cancels the taker and leaves the maker untouched", __LINE__, [] {
@@ -1032,6 +1091,8 @@ void registerStpSpecs(const SpecRegistrar& add) {
 
     add("stp: self makers beyond the limit price are never touched", __LINE__, [] {
         // STP 只作用于撮合循环真正会成交的 maker：不穿价的同账户挂单不受影响
+        // STP only applies to makers that the matching loop would really trade with: same-account resting
+        // orders that are not crossed are unaffected
         H h;
         const OrderRequest far = sell(2, 103, 2).account(kA);
         PLACE(h, sell(1, 101, 2).account(kA));
@@ -1074,6 +1135,7 @@ void registerStpSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 撤单
+// Cancel
 // ============================================================================
 template <template <class> class BookT>
 void registerCancelSpecs(const SpecRegistrar& add) {
@@ -1112,15 +1174,19 @@ void registerCancelSpecs(const SpecRegistrar& add) {
         const OrderRequest t = buy(2, 101, 2).account(kB);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 1, 2, kA, kB, S::Buy, 101, 2, 0, 0));
         CHECK_EVENTS(h.cancel(1), rejectedCancel(1));  // 完全成交的 maker
+                                                       // fully filled maker
         CHECK_EVENTS(h.cancel(2), rejectedCancel(2));  // 完全成交的 taker
+                                                       // fully filled taker
         const OrderRequest ioc = buy(3, 100, 1).ioc();
         CHECK_EVENTS(h.submit(ioc), accepted(ioc), cancelled(3, 1, CR::IocRemainder));
         CHECK_EVENTS(h.cancel(3), rejectedCancel(3));  // IOC 从不挂单
+                                                       // an IOC never rests
         const OrderRequest mkt = marketSell(4, 1);
         CHECK_EVENTS(h.submit(mkt), accepted(mkt), cancelled(4, 1, CR::MarketRemainder));
         CHECK_EVENTS(h.cancel(4), rejectedCancel(4));
         CHECK_EVENTS(h.submit(buy(5, 0, 1)), rejectedNew(5, RR::InvalidPrice));
         CHECK_EVENTS(h.cancel(5), rejectedCancel(5));  // 被拒的订单
+                                                       // rejected order
     });
 
     add("cancel: cancelling twice rejects the second request", __LINE__, [] {
@@ -1162,6 +1228,7 @@ void registerCancelSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 改单
+// Modify
 // ============================================================================
 template <template <class> class BookT>
 void registerModifySpecs(const SpecRegistrar& add) {
@@ -1251,6 +1318,8 @@ void registerModifySpecs(const SpecRegistrar& add) {
         CHECK_TOP(h.book, 102, 103);
         CHECK_EQ(h.book.lastTradeId(), 1u);
         CHECK_EVENTS(h.cancel(1), cancelled(1, 2, CR::UserRequested));  // 撤单报告改单成交后的剩余量
+                                                                        // the cancel reports the remainder
+                                                                        // left after the modify's fill
     });
 
     add("modify: an aggressive modify that fills completely leaves no order", __LINE__, [] {
@@ -1285,9 +1354,12 @@ void registerModifySpecs(const SpecRegistrar& add) {
         PLACE(h, sell(2, 102, 5).account(kB));
         const StateSnapshot before = snapshotOf(h.book);
         CHECK_EVENTS(h.modify(1, 102, 5), rejectedModify(1, RR::PostOnlyWouldCross));  // 锁价
+                                                                                       // locking
         CHECK_EVENTS(h.modify(1, 103, 1), rejectedModify(1, RR::PostOnlyWouldCross));  // 穿价
+                                                                                       // crossing
         CHECK_EVENTS(h.modify(1, 500, 9), rejectedModify(1, RR::PostOnlyWouldCross));
         CHECK_UNCHANGED(before, h.book);  // 包括队列位置
+                                          // including queue position
 
         H g;
         PLACE(g, buy(1, 100, 5).account(kB));
@@ -1306,8 +1378,10 @@ void registerModifySpecs(const SpecRegistrar& add) {
         PLACE(h, q);
         PLACE(h, sell(3, 101, 5).account(kB));
         CHECK_EVENTS(h.modify(1, 100, 9), modified(1, 100, 9));  // 加量：排到队尾
+                                                                 // increase: moves to the back of the queue
         CHECK_ORDERS_AT(h.book, S::Buy, 100, infoOf(q), infoOf(p, 9));
         CHECK_EVENTS(h.modify(1, 100, 4), modified(1, 100, 4));  // 减量：原地
+                                                                 // decrease: in place
         CHECK_ORDERS_AT(h.book, S::Buy, 100, infoOf(q), infoOf(p, 4));
     });
 
@@ -1319,6 +1393,7 @@ void registerModifySpecs(const SpecRegistrar& add) {
         CHECK_ORDER(h.book, 1, orderInfo(1, kA, S::Buy, 102, 4, true, SM::CancelBoth));
         CHECK_TOP(h.book, 102, 103);
         // 对手方为空时任意价格都不穿价
+        // With the opposite side empty, no price crosses
         CHECK_EVENTS(h.cancel(2), cancelled(2, 5, CR::UserRequested));
         CHECK_EVENTS(h.modify(1, 5000, 4), modified(1, 5000, 4));
         CHECK_TOP(h.book, 5000, std::nullopt);
@@ -1339,6 +1414,8 @@ void registerModifySpecs(const SpecRegistrar& add) {
         CHECK_UNCHANGED(before, h.book);
 
         // 卖出 post-only 改到 <= 0 的价格时 crosses() 为真：价格规则必须先于 post-only 规则
+        // When a post-only sell is modified to a price <= 0, crosses() is true: the price rule must come before
+        // the post-only rule
         H g;
         PLACE(g, buy(1, 100, 5).account(kA));
         PLACE(g, sell(2, 102, 5).postOnly().account(kB));
@@ -1373,8 +1450,11 @@ void registerModifySpecs(const SpecRegistrar& add) {
         const OrderRequest t = buy(3, 101, 4).account(kC);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 1, 3, kA, kC, S::Buy, 101, 4, 6, 0));
         CHECK_EVENTS(h.modify(1, 101, 6), modified(1, 101, 6));  // 等于剩余量：原地
+                                                                 // equal to the remaining quantity: in place
         CHECK_ORDERS_AT(h.book, S::Sell, 101, infoOf(a1, 6), infoOf(a2));
         CHECK_EVENTS(h.modify(1, 101, 7), modified(1, 101, 7));  // 大于剩余量（仍小于原始 10）：失去优先级
+                                                                 // above the remaining quantity
+                                                                 // (still below the original 10): loses priority
         CHECK_ORDERS_AT(h.book, S::Sell, 101, infoOf(a2), infoOf(a1, 7));
     });
 
@@ -1433,8 +1513,10 @@ void registerModifySpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.modify(1, 109, 8), modified(1, 109, 8));
         CHECK_ORDER(h.book, 1, orderInfo(1, kC, S::Sell, 109, 8, true, SM::CancelTaker));
         CHECK_EVENTS(h.modify(2, 108, 3), modified(2, 108, 3));  // 加量
+                                                                 // increase
         CHECK_ORDER(h.book, 2, orderInfo(2, kD, S::Sell, 108, 3, false, SM::CancelMaker));
         // 改价后的订单作为 maker：成交回报中的账户来自原订单
+        // The repriced orders act as makers: the account in each fill report comes from the original order
         const OrderRequest t = buy(3, 109, 4).account(kA);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 2, 3, kD, kA, S::Buy, 108, 3, 0, 1),
                      trade(2, 1, 3, kC, kA, S::Buy, 109, 1, 7, 0));
@@ -1464,19 +1546,23 @@ void registerModifySpecs(const SpecRegistrar& add) {
         PLACE(h, a3);
         const StateSnapshot before = snapshotOf(h.book);
         // 其他订单共 INT64_MAX - 9：2 号单最多加到 9（它自己原来的 5 不计入）
+        // The other orders total INT64_MAX - 9: order 2 can grow to at most 9 (its own original 5 does not count)
         CHECK_EVENTS(h.modify(2, 100, 10), rejectedModify(2, RR::InvalidQuantity));
         CHECK_EVENTS(h.modify(2, 100, kMax), rejectedModify(2, RR::InvalidQuantity));
         CHECK_UNCHANGED(before, h.book);  // 被拒的改单保留原队列位置
+                                          // a rejected modify keeps the original queue position
         CHECK_EVENTS(h.modify(2, 100, 9), modified(2, 100, 9));
         CHECK_DEPTH(h.book, S::Sell, {100, kMax, 3});
         CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1), infoOf(a3), infoOf(a2, 9));
         // 原地减量从不受限；减量空出来的数量可以再加回去
+        // An in-place decrease is never limited; the quantity freed by a decrease can be added back
         CHECK_EVENTS(h.modify(1, 100, kMax - 12), modified(1, 100, kMax - 12));
         CHECK_EVENTS(h.modify(3, 100, 4), rejectedModify(3, RR::InvalidQuantity));
         CHECK_EVENTS(h.modify(3, 100, 3), modified(3, 100, 3));
         CHECK_ORDERS_AT(h.book, S::Sell, 100, infoOf(a1, kMax - 12), infoOf(a2, 9), infoOf(a3, 3));
         CHECK_DEPTH(h.book, S::Sell, {100, kMax, 3});
         // 独占一档的订单可以加到 INT64_MAX
+        // An order alone at its level can grow to INT64_MAX
         const OrderRequest b4 = buy(4, 90, 1).account(kD);
         PLACE(h, b4);
         CHECK_EVENTS(h.modify(4, 90, kMax), modified(4, 90, kMax));
@@ -1494,14 +1580,19 @@ void registerModifySpecs(const SpecRegistrar& add) {
         CHECK_EVENTS(h.modify(2, 100, kMax), rejectedModify(2, RR::InvalidQuantity));
         CHECK_UNCHANGED(before, h.book);
         // 数量减到 3 才放得下：恰好到 INT64_MAX
+        // It only fits once the quantity is reduced to 3: exactly INT64_MAX
         CHECK_EVENTS(h.modify(2, 100, 3), modified(2, 100, 3));
         CHECK_DEPTH(h.book, S::Buy, {100, kMax, 2});
         CHECK_ORDER(h.book, 2, orderInfo(2, kB, S::Buy, 100, 3));
         // 改到没有档位的价格只受订单自身数量的限制；改回满档价位时只看目标档位的现有总量
+        // Moving to a price with no level is limited only by the order's own quantity; moving back to the price of
+        // the full level only considers the target level's existing total
         CHECK_EVENTS(h.modify(1, 99, kMax), modified(1, 99, kMax));
         CHECK_DEPTH(h.book, S::Buy, {100, 3, 1}, {99, kMax, 1});
         CHECK_EVENTS(h.modify(1, 100, kMax - 2), rejectedModify(1, RR::InvalidQuantity));
         // 穿价的改价：本侧在新价格上不可能已有档位，成交后剩余量挂成新的一档
+        // A reprice that crosses: this side cannot already have a level at the new price, and after the fills the
+        // remainder rests as a new level
         CHECK_EVENTS(h.modify(2, 105, kMax), modified(2, 105, kMax),
                      trade(1, 3, 2, kC, kB, S::Buy, 105, 1, 0, kMax - 1));
         CHECK_DEPTH(h.book, S::Buy, {105, kMax - 1, 1}, {99, kMax, 1});
@@ -1513,6 +1604,7 @@ void registerModifySpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 容量上限（max_orders）
+// Capacity limit (max_orders)
 // ============================================================================
 template <template <class> class BookT>
 void registerCapacitySpecs(const SpecRegistrar& add) {
@@ -1569,6 +1661,7 @@ void registerCapacitySpecs(const SpecRegistrar& add) {
     add("capacity: max_orders = 0 means unlimited", __LINE__, [] {
         H h;
         // 批量灌单时绕过逐步检查以节省时间，最后统一检查
+        // The bulk load bypasses the per-step checks to save time and checks once at the end
         for (OrderId id = 1; id <= 2000; ++id) {
             const Side side = id % 2 ? S::Buy : S::Sell;
             const Price price = side == S::Buy ? 1000 - static_cast<Price>(id % 40)
@@ -1586,6 +1679,7 @@ void registerCapacitySpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 订单 id 与成交 id
+// Order ids and trade ids
 // ============================================================================
 template <template <class> class BookT>
 void registerIdSpecs(const SpecRegistrar& add) {
@@ -1597,15 +1691,19 @@ void registerIdSpecs(const SpecRegistrar& add) {
         const OrderRequest t = buy(2, 101, 2).account(kB);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 1, 2, kA, kB, S::Buy, 101, 2, 0, 0));
         const OrderRequest r1 = buy(1, 100, 3).account(kC);  // 已成交 maker 的 id，且换了方向
+                                                             // id of a filled maker, with the side switched
         CHECK_EVENTS(h.submit(r1), accepted(r1));
         const OrderRequest r2 = sell(2, 105, 1).account(kC);  // 已成交 taker 的 id
+                                                              // id of a filled taker
         CHECK_EVENTS(h.submit(r2), accepted(r2));
         CHECK_EVENTS(h.cancel(1), cancelled(1, 3, CR::UserRequested));
         const OrderRequest r3 = buy(1, 99, 1);  // 已撤订单的 id
+                                                // id of a cancelled order
         CHECK_EVENTS(h.submit(r3), accepted(r3));
         const OrderRequest ioc = sell(3, 200, 1).ioc();
         CHECK_EVENTS(h.submit(ioc), accepted(ioc), cancelled(3, 1, CR::IocRemainder));
         const OrderRequest r4 = sell(3, 200, 1);  // IOC 结束后立即复用
+                                                  // reused right after the IOC finished
         CHECK_EVENTS(h.submit(r4), accepted(r4));
         CHECK_ORDER(h.book, 1, infoOf(r3));
         CHECK_ORDER(h.book, 2, infoOf(r2));
@@ -1637,6 +1735,7 @@ void registerIdSpecs(const SpecRegistrar& add) {
         PLACE(h, sell(2, 102, 1).account(kA));
         PLACE(h, sell(3, 103, 5).account(kA));
         // 不成交的操作不消耗成交 id
+        // Operations without trades do not consume trade ids
         CHECK_EVENTS(h.submit(buy(9, 0, 1)), rejectedNew(9, RR::InvalidPrice));
         CHECK_EVENTS(h.cancel(42), rejectedCancel(42));
         const OrderRequest k = buy(4, 103, 100).fok().account(kB);
@@ -1672,6 +1771,7 @@ void registerIdSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 查询接口
+// Query interface
 // ============================================================================
 template <template <class> class BookT>
 void registerQuerySpecs(const SpecRegistrar& add) {
@@ -1767,6 +1867,8 @@ void registerQuerySpecs(const SpecRegistrar& add) {
 
     add("queries: orders at the minimum and the maximum price", __LINE__, [] {
         // 每一步之后 verify() 都要对挂在最高价 INT64_MAX 的卖单、价格 1 的买单做完整的查询一致性检查
+        // After every step verify() has to run the full query consistency check on a sell order resting at the
+        // maximum price INT64_MAX and a buy order at price 1
         H h;
         constexpr Price kTop = INT64_MAX;
         const OrderRequest a1 = sell(1, kTop, 3).account(kA);
@@ -1780,12 +1882,15 @@ void registerQuerySpecs(const SpecRegistrar& add) {
         CHECK_EQ(h.book.volumeAt(S::Sell, kTop), 3);
         CHECK_ORDERS_AT(h.book, S::Sell, kTop, infoOf(a1));
         // 限价 INT64_MAX 的买单扫过两档卖单，剩余量挂在最高价
+        // A buy with limit INT64_MAX sweeps both ask levels, and its remainder rests at the maximum price
         const OrderRequest t = buy(4, kTop, 5).account(kC);
         CHECK_EVENTS(h.submit(t), accepted(t), trade(1, 3, 4, kA, kC, S::Buy, kTop - 1, 1, 0, 4),
                      trade(2, 1, 4, kA, kC, S::Buy, kTop, 3, 0, 1));
         CHECK_TOP(h.book, kTop, std::nullopt);
         CHECK_DEPTH(h.book, S::Buy, {kTop, 1, 1}, {1, 4, 1});
         // 限价 1 的卖单从最高价一路扫到价格 1，剩余量挂在价格 1
+        // A sell with limit 1 sweeps from the maximum price all the way down to price 1, and the remainder
+        // rests at price 1
         const OrderRequest s = sell(5, 1, 6).account(kD);
         CHECK_EVENTS(h.submit(s), accepted(s), trade(3, 4, 5, kC, kD, S::Sell, kTop, 1, 0, 5),
                      trade(4, 2, 5, kB, kD, S::Sell, 1, 4, 0, 1));
@@ -1837,6 +1942,7 @@ void registerQuerySpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 综合脚本：多种规则交织，每一步完整比对事件
+// Combined script: several rules interleaved, with the full events compared at every step
 // ============================================================================
 template <template <class> class BookT>
 void registerScenarioSpecs(const SpecRegistrar& add) {
@@ -1853,6 +1959,7 @@ void registerScenarioSpecs(const SpecRegistrar& add) {
         CHECK_DEPTH(h.book, S::Buy, {104, 1, 1}, {101, 2, 1}, {100, 4, 1});
         CHECK_DEPTH(h.book, S::Sell, {105, 5, 1});
         // 4 号单改价穿到 105，遇到同账户的 1 号单：CancelBoth
+        // Order 4 is repriced through to 105 and meets order 1 of the same account: CancelBoth
         CHECK_EVENTS(h.modify(4, 105, 2), modified(4, 105, 2),
                      cancelled(1, 5, CR::SelfTradePrevention),
                      cancelled(4, 2, CR::SelfTradePrevention));
@@ -1874,6 +1981,7 @@ void registerScenarioSpecs(const SpecRegistrar& add) {
 
 // ============================================================================
 // 入口：注册完整规范套件，用例名为 "<impl_name>/<area>: <description>"
+// Entry point: registers the full spec suite, with case names "<impl_name>/<area>: <description>"
 // ============================================================================
 template <template <class> class BookT>
 void registerMatchingSpecTests(const std::string& impl_name) {
@@ -1896,6 +2004,7 @@ void registerMatchingSpecTests(const std::string& impl_name) {
 }  // namespace hft::matching::test
 
 // 允许不带命名空间直接调用 registerMatchingSpecTests<...>("...")
+// Allows calling registerMatchingSpecTests<...>("...") directly without the namespace
 using hft::matching::test::registerMatchingSpecTests;
 
 #undef PLACE

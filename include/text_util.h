@@ -1,6 +1,8 @@
 //
 // text_util.h
 // 终端文本工具：按"可见宽度"（UTF-8 码点数，跳过 ANSI 转义序列）填充、居中、截断、去色与清洗。
+// Terminal text helpers: pad, center, truncate, strip colors and sanitize by "visible width" (UTF-8 code
+// points, skipping ANSI escape sequences).
 //
 
 #pragma once
@@ -22,17 +24,42 @@
 //   文本会被终端（和 visibleWidth）当作序列的一部分吞掉，所以生成文本的函数（truncateVisible / padRight / padLeft /
 //   center / fit）都会丢掉结尾的悬空序列（它本来就不可见），保证结果可以安全地与其他文本拼接。
 // 截断永远不会切开一个码点或一个完整的转义序列。
+// Definition of visible width (the same for every function):
+// - ANSI escape sequences have width 0: CSI (ESC [ parameter bytes 0x30-0x3F* intermediate bytes 0x20-0x2F*
+//   final byte 0x40-0x7E, e.g. the color "\033[32m"), OSC (ESC ] ... terminated by BEL or ESC \) and other
+//   short sequences starting with ESC. Unterminated sequences have width 0 too.
+// - Every other UTF-8 code point has width 1 (single-width characters such as 'µ', '═', '│' are 1 column
+//   each); C0 control characters and DEL have width 0.
+// - Each invalid UTF-8 byte (a stray continuation byte, a lead byte missing its continuation bytes, an
+//   overlong encoding, a surrogate code point, 0xF5-0xFF, etc.) counts as 1 column (the terminal shows
+//   U+FFFD).
+// - Known limitation: East Asian wide characters and emoji take 2 columns in a terminal and combining
+//   characters 0, but all of them count as 1 column here. This program's output has only ASCII, box-drawing
+//   characters ('─', '│', '═' etc., the U+2500 block), '…' and 'µ', all single-width, so it is not affected.
+// - "Dangling" escape sequence: the string ends in the middle of an escape sequence (e.g. a lone ESC,
+//   "\033[31", an OSC without its terminator). Text appended after it would be swallowed by the terminal (and
+//   visibleWidth) as part of the sequence, so the functions that produce text (truncateVisible / padRight /
+//   padLeft / center / fit) all drop a trailing dangling sequence (it is invisible anyway), which makes their
+//   results safe to concatenate with other text.
+// Truncation never splits a code point or a complete escape sequence.
 namespace text_util {
 
 namespace detail {
 
 // 一个词法单元：转义序列（宽度 0）或一个码点 / 非法字节。
 // 未结束的转义序列（complete = false）如果一直延续到字符串末尾，就是"悬空"序列（见文件头说明）。
+// A token: an escape sequence (width 0) or one code point / invalid byte.
+// An unterminated escape sequence (complete = false) that runs to the end of the string is a "dangling"
+// sequence (see the file header).
 struct Token {
     std::size_t len = 0;      // 字节数（>= 1）
+                              // number of bytes (>= 1)
     std::size_t width = 0;    // 可见宽度（0 或 1）
+                              // visible width (0 or 1)
     bool escape = false;      // 是否为转义序列
+                              // whether it is an escape sequence
     bool complete = false;    // 转义序列以合法的终止字节（或 OSC 的 BEL / ST）结束
+                              // the escape sequence ends with a valid final byte (or BEL / ST for OSC)
 };
 
 inline bool isContinuation(unsigned char b) noexcept { return (b & 0xC0) == 0x80; }
@@ -40,10 +67,12 @@ inline bool isContinuation(unsigned char b) noexcept { return (b & 0xC0) == 0x80
 inline bool inRange(unsigned char b, unsigned char lo, unsigned char hi) noexcept { return b >= lo && b <= hi; }
 
 // 解析 s[i] 开始的转义序列（s[i] == ESC）
+// Parse the escape sequence starting at s[i] (s[i] == ESC)
 inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
     const std::size_t n = s.size();
     std::size_t j = i + 1;
     if (j >= n) return Token{1, 0, true, false};  // 孤立的 ESC
+                                                  // lone ESC
     const unsigned char kind = static_cast<unsigned char>(s[j]);
     if (kind == '[') {  // CSI
         ++j;
@@ -51,9 +80,12 @@ inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
         while (j < n && inRange(static_cast<unsigned char>(s[j]), 0x20, 0x2F)) ++j;
         if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x40, 0x7E)) return Token{j + 1 - i, 0, true, true};
         // 终止字节缺失：字符串在这里结束（悬空），或后面是非法字节（序列在此中断，之后的字节按普通字符处理）
+        // No final byte: the string ends here (dangling), or an invalid byte follows (the sequence is broken off
+        // here and the following bytes are treated as ordinary characters)
         return Token{j - i, 0, true, false};
     }
     if (kind == ']') {  // OSC：到 BEL 或 ST（ESC \）为止
+                        // OSC: up to BEL or ST (ESC \)
         ++j;
         while (j < n) {
             const unsigned char b = static_cast<unsigned char>(s[j]);
@@ -64,6 +96,7 @@ inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
         return Token{j - i, 0, true, false};
     }
     // 其他 ESC 序列：中间字节 0x20-0x2F*，再加一个终止字节 0x30-0x7E
+    // Other ESC sequences: intermediate bytes 0x20-0x2F*, then one final byte 0x30-0x7E
     while (j < n && inRange(static_cast<unsigned char>(s[j]), 0x20, 0x2F)) ++j;
     if (j < n && inRange(static_cast<unsigned char>(s[j]), 0x30, 0x7E)) return Token{j + 1 - i, 0, true, true};
     return Token{j - i, 0, true, false};
@@ -72,12 +105,17 @@ inline Token escapeToken(std::string_view s, std::size_t i) noexcept {
 // 读取 s[i] 开始的一个词法单元（i < s.size()）。
 // 多字节序列按 RFC 3629 严格校验：第二个字节的合法范围随首字节而定（E0: A0-BF，ED: 80-9F，F0: 90-BF，
 // F4: 80-8F，其余 80-BF），从而拒绝过长编码、UTF-16 代理码点（U+D800-U+DFFF）与大于 U+10FFFF 的值。
+// Read one token starting at s[i] (i < s.size()).
+// Multi-byte sequences are validated strictly per RFC 3629: the valid range of the second byte depends on
+// the lead byte (E0: A0-BF, ED: 80-9F, F0: 90-BF, F4: 80-8F, otherwise 80-BF), which rejects overlong
+// encodings, UTF-16 surrogate code points (U+D800-U+DFFF) and values above U+10FFFF.
 inline Token nextToken(std::string_view s, std::size_t i) noexcept {
     const unsigned char b = static_cast<unsigned char>(s[i]);
     if (b == 0x1B) return escapeToken(s, i);
     if (b < 0x80) return Token{1, (b < 0x20 || b == 0x7F) ? std::size_t{0} : std::size_t{1}, false, false};
     std::size_t need = 0;
     unsigned char lo = 0x80, hi = 0xBF;  // 第二个字节的合法范围
+                                         // valid range of the second byte
     if (inRange(b, 0xC2, 0xDF)) {
         need = 1;
     } else if (inRange(b, 0xE0, 0xEF)) {
@@ -90,9 +128,12 @@ inline Token nextToken(std::string_view s, std::size_t i) noexcept {
         if (b == 0xF4) hi = 0x8F;
     } else {
         return Token{1, 1, false, false};  // 孤立续字节或非法首字节（C0、C1、F5-FF）
+                                           // stray continuation byte or invalid lead byte (C0, C1, F5-FF)
     }
     for (std::size_t k = 1; k <= need; ++k) {
         // 缺少续字节（含字符串在多字节序列中间结束）或第二个字节越界：首字节单独算一个非法字符，后面的字节重新解析
+        // Missing continuation byte (including the string ending inside a multi-byte sequence) or second byte out
+        // of range: the lead byte alone counts as one invalid character and the following bytes are parsed again
         if (i + k >= s.size()) return Token{1, 1, false, false};
         const unsigned char c = static_cast<unsigned char>(s[i + k]);
         if (k == 1 ? !inRange(c, lo, hi) : !isContinuation(c)) return Token{1, 1, false, false};
@@ -103,9 +144,14 @@ inline Token nextToken(std::string_view s, std::size_t i) noexcept {
 // 一次扫描得到可见宽度，以及去掉结尾悬空转义序列后的长度。
 // 去掉的是"以悬空序列结尾的一串未完成转义序列"：例如 "a\033\033" 中第一个 ESC 只是被第二个 ESC 打断，
 // 去掉第二个之后它自己就悬空了，所以两个都要去掉。去掉的都是宽度 0 的字节，之前的词法单元不受影响。
+// One scan yields the visible width and the length without the trailing dangling escape sequence.
+// What is dropped is "a run of unterminated escape sequences ending in a dangling one": e.g. in "a\033\033"
+// the first ESC is only interrupted by the second, and once the second is dropped the first dangles
+// itself, so both must go. Only width-0 bytes are dropped; the tokens before them are not affected.
 struct Measure {
     std::size_t width = 0;
     std::size_t keep = 0;   // s 的前 keep 个字节结尾不悬空
+                            // the first keep bytes of s do not end dangling
 };
 
 inline Measure measure(std::string_view s) noexcept {
@@ -113,6 +159,7 @@ inline Measure measure(std::string_view s) noexcept {
     Measure m;
     m.keep = s.size();
     std::size_t run = kNone;  // 结尾处连续的未完成转义序列的起点
+                              // start of the run of unterminated escape sequences at the end
     for (std::size_t i = 0; i < s.size();) {
         const Token t = nextToken(s, i);
         if (!t.escape || t.complete) {
@@ -121,6 +168,8 @@ inline Measure measure(std::string_view s) noexcept {
             run = i;
         }
         if (run != kNone && i + t.len == s.size()) {  // 悬空：未结束的序列一直延续到末尾（必然是最后一个词法单元）
+                                                      // dangling: an unterminated sequence runs to the end
+                                                      // (necessarily the last token)
             m.keep = run;
             break;
         }
@@ -133,9 +182,11 @@ inline Measure measure(std::string_view s) noexcept {
 }  // namespace detail
 
 // 可见宽度（列数）
+// Visible width (number of columns)
 inline std::size_t visibleWidth(std::string_view s) noexcept { return detail::measure(s).width; }
 
 // 去掉所有转义序列（得到纯文本，用于写日志或测试比较）
+// Remove every escape sequence (yields plain text, for logging or test comparisons)
 inline std::string stripAnsi(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -151,6 +202,12 @@ inline std::string stripAnsi(std::string_view s) {
 // DEL 与 UTF-8 编码的 C1 控制字符（U+0080-U+009F，部分终端把 U+009B 当作 CSI）替换为空格，非法 UTF-8 字节替换为 '?'。
 // 结果是合法的 UTF-8，不会向终端注入转义序列，也不会用换行破坏单行布局
 // （ESC 变成空格后，转义序列的其余字节作为普通可见文本保留）。
+// Text from external sources (exchange error messages, labels from the config, etc.) is sanitized before
+// it is displayed or logged: C0 control characters (including ESC, newline, tab), DEL and UTF-8-encoded C1
+// control characters (U+0080-U+009F; some terminals treat U+009B as CSI) are replaced by spaces, invalid
+// UTF-8 bytes by '?'. The result is valid UTF-8, injects no escape sequences into the terminal and cannot
+// break a single-line layout with newlines (once ESC becomes a space, the remaining bytes of the escape
+// sequence stay as ordinary visible text).
 inline std::string sanitize(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -175,6 +232,7 @@ inline std::string sanitize(std::string_view s) {
 }
 
 // 把字符串 s 重复 n 次（如 repeat("─", 43)）
+// Repeat the string s n times (e.g. repeat("─", 43))
 inline std::string repeat(std::string_view s, std::size_t n) {
     std::string out;
     out.reserve(s.size() * n);
@@ -185,6 +243,11 @@ inline std::string repeat(std::string_view s, std::size_t n) {
 // 截断到最多 width 列。被截掉的部分里的完整转义序列全部保留（宽度为 0），所以颜色的复位码不会丢失。
 // 发生截断且 ellipsis 不比 width 宽时，在截断处放 ellipsis（如 "…"），总宽度仍不超过 width。
 // 结尾的悬空转义序列被丢弃。
+// Truncate to at most width columns. Every complete escape sequence in the cut-off part is kept (width 0),
+// so color reset codes are never lost.
+// When something is cut and ellipsis is no wider than width, ellipsis (e.g. "…") goes at the cut, and the
+// total width still does not exceed width.
+// A trailing dangling escape sequence is dropped.
 inline std::string truncateVisible(std::string_view s, std::size_t width, std::string_view ellipsis = {}) {
     const detail::Measure m = detail::measure(s);
     s = s.substr(0, m.keep);
@@ -216,11 +279,16 @@ inline std::string truncateVisible(std::string_view s, std::size_t width, std::s
     }
     // 总宽度 > width >= target，必然在某处发生了截断，省略号已经放好。
     // 截掉中间的字符可能让截断点之前被打断的转义序列变成悬空：再去一次结尾
+    // Total width > width >= target, so a cut happened somewhere and the ellipsis is already in place.
+    // Cutting out characters in the middle can leave an escape sequence that was interrupted before the cut
+    // point dangling: trim the end once more
     out.resize(detail::measure(out).keep);
     return out;
 }
 
 // 右侧补空格到至少 width 列（已足够宽时不截断）；结尾的悬空转义序列被丢弃
+// Pad with spaces on the right to at least width columns (no truncation when already wide enough); a
+// trailing dangling escape sequence is dropped
 inline std::string padRight(std::string_view s, std::size_t width) {
     const detail::Measure m = detail::measure(s);
     std::string out(s.substr(0, m.keep));
@@ -229,6 +297,8 @@ inline std::string padRight(std::string_view s, std::size_t width) {
 }
 
 // 左侧补空格到至少 width 列（右对齐）；结尾的悬空转义序列被丢弃
+// Pad with spaces on the left to at least width columns (right-aligned); a trailing dangling escape
+// sequence is dropped
 inline std::string padLeft(std::string_view s, std::size_t width) {
     const detail::Measure m = detail::measure(s);
     std::string out;
@@ -238,6 +308,7 @@ inline std::string padLeft(std::string_view s, std::size_t width) {
 }
 
 // 居中到恰好 width 列：多出的一个空格放在右侧；过宽时截断
+// Center to exactly width columns: an odd extra space goes on the right; truncated when too wide
 inline std::string center(std::string_view s, std::size_t width) {
     const detail::Measure m = detail::measure(s);
     if (m.width >= width) return truncateVisible(s, width);
@@ -249,6 +320,7 @@ inline std::string center(std::string_view s, std::size_t width) {
 }
 
 // 恰好 width 列：过宽截断（可选省略号），不足补空格
+// Exactly width columns: truncated when too wide (optional ellipsis), padded with spaces when too narrow
 inline std::string fit(std::string_view s, std::size_t width, std::string_view ellipsis = {}) {
     return padRight(truncateVisible(s, width, ellipsis), width);
 }

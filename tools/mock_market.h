@@ -2,6 +2,9 @@
 // mock_market.h
 // 模拟交易所的市场仿真：共享的随机游走公允价 + 各交易所独立的噪声与偶发错位；每家交易所一个真实的
 // hft::matching::MatchingEngine，由做市商（盘口阶梯报价）、深度提供者（远端流动性）与吃单者驱动。
+// Market simulation for the mock exchange: a shared random-walk fair price + independent per-venue noise
+// and occasional dislocations; each venue runs a real hft::matching::MatchingEngine, driven by market
+// makers (laddered quotes at the top of book), depth providers (distant liquidity) and takers.
 //
 
 #pragma once
@@ -23,6 +26,7 @@
 
 // ============================================================================
 // 模型概要（全部确定性：同一种子 + 同一步进序列 => 完全相同的订单流与盘口）
+// Model overview (fully deterministic: same seed + same step sequence => identical order flow and books)
 //
 // - 公允价 F：所有交易所共享的算术随机游走（波动率以"每 √秒 多少基点"给出），带极弱的向起始价回归，
 //   长时间运行价格也不会漂走。
@@ -40,6 +44,31 @@
 // - 订单 id 编码"代理 / 槽位 / 序号"：撮合引擎的监听器（Venue 本身）据此在 O(1) 内把成交、撤单、改单回报
 //   同步到槽位，槽位因此总与引擎一致（测试逐个核对）。监听器只更新槽位与统计，从不在回调里调用
 //   submit/cancel/modify（引擎的要求）。
+// - Fair price F: an arithmetic random walk shared by all venues (volatility given as "basis points per
+//   √second"), with a very weak reversion toward the start price, so the price does not drift away even
+//   over long runs.
+// - Local fair price of venue v = F × (1 + (noise_v + dislocation_v) × 1e-4): the noise is an OU process
+//   (a baseline spread of a few dollars); dislocations are Poisson-arriving jumps (small jumps of a few
+//   basis points, large jumps of 0.28%~0.45%) that decay exponentially and unfold over about 0.3 s through
+//   a first-order filter. Large jumps exceed the break-even point of the 0.1% fee on both sides (about
+//   0.2%), so the monitor also sees arbitrage signals with fee_rate = 0.001; with fee_rate = 0 the baseline
+//   noise alone is enough to make the tops of book of different venues cross often.
+// - Agents of each venue (each with its own account; STP CancelTaker between orders of the same account):
+//   * Market maker (MarketMaker): laddered quotes of L levels per side (half_spread + k × level_gap +
+//     jitter away from the fair price), requoted at a Poisson rate; deeper levels are "stickier" (they
+//     tolerate a deviation of k × gap / 2), and levels that were taken are refilled with some probability.
+//     On a rising price it moves the asks first, on a falling price the bids first, so that a new quote
+//     does not run into its own old quote that has not been moved yet.
+//   * Depth provider (DepthProvider): keeps N distant resting orders per side ([inner, outer] ticks from
+//     the fair price, denser toward the inside), cancels them once out of range (with hysteresis), tops
+//     them up within a per-step limit, and also changes quantities / cancels at random, giving the deep
+//     levels a steady stream of incremental changes.
+//   * Taker: Poisson-arriving IOC limit / market orders, with the direction biased toward "bringing the top
+//     of book back to the local fair price"; now and then a large order sweeps the book.
+// - Order ids encode "agent / slot / sequence number": from them the matching engine's listener (the Venue
+//   itself) syncs fill, cancel and modify reports to the slots in O(1), so the slots always agree with the
+//   engine (the tests check them one by one). The listener only updates slots and stats and never calls
+//   submit/cancel/modify in a callback (an engine requirement).
 // ============================================================================
 namespace mock_exchange::sim {
 
@@ -51,12 +80,14 @@ using mt::Qty;
 using mt::Side;
 
 // 价格、数量都是整数：价格单位 tick = 0.01 USDT，数量单位 lot = 0.000001 BTC
+// Prices and quantities are both integers: price unit tick = 0.01 USDT, quantity unit lot = 0.000001 BTC
 inline constexpr int kPriceDecimals = 2;
 inline constexpr Price kTicksPerUnit = 100;
 inline constexpr int kQtyDecimals = 6;
 inline constexpr Qty kLotsPerUnit = 1000000;
 
 // splitmix64：由主种子派生各子种子（相邻种子也得到互不相关的序列）
+// splitmix64: derives the sub-seeds from the master seed (adjacent seeds also give uncorrelated sequences)
 constexpr std::uint64_t splitmix64(std::uint64_t x) noexcept {
     x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -66,6 +97,10 @@ constexpr std::uint64_t splitmix64(std::uint64_t x) noexcept {
 
 // 确定性随机数：std::mt19937_64 的输出序列由标准规定；分布变换自己实现
 // （标准库各分布的算法由实现决定，换标准库就会得到不同的序列）
+// Deterministic random numbers: the standard specifies the output sequence of std::mt19937_64; the
+// distribution transforms are implemented here
+// (the algorithms of the standard library's distributions are implementation-defined, so switching
+// standard libraries would give different sequences)
 class Random {
 public:
     explicit Random(std::uint64_t seed) : engine_(seed) {}
@@ -75,6 +110,7 @@ public:
     double uniform(double lo, double hi) { return lo + (hi - lo) * uniform(); }
 
     // [lo, hi] 上的均匀整数（取模偏差 < 2^-40，可忽略）
+    // Uniform integer on [lo, hi] (modulo bias < 2^-40, negligible)
     std::int64_t uniformInt(std::int64_t lo, std::int64_t hi) {
         if (hi <= lo) return lo;
         const std::uint64_t span = static_cast<std::uint64_t>(hi - lo) + 1;
@@ -84,6 +120,7 @@ public:
     bool chance(double p) { return uniform() < p; }
 
     // 标准正态（Box-Muller，成对生成，第二个值缓存到下一次调用）
+    // Standard normal (Box-Muller, generated in pairs, the second value cached for the next call)
     double normal() {
         if (has_spare_) {
             has_spare_ = false;
@@ -107,60 +144,96 @@ private:
 
 // ---------------------------------------------------------------------------
 // 参数
+// Parameters
 // ---------------------------------------------------------------------------
 
 struct FairValueParams {
     double start_price = 65000.0;            // USDT
     double volatility_bps = 0.4;             // 每 √秒 的标准差（基点；0.4 bp/√s 约合日波动 1.2%）
+                                             // standard deviation per √second (basis points;
+                                             // 0.4 bp/√s is about 1.2% daily volatility)
     double reversion_per_s = 1.0 / 1800.0;   // 向起始价的弱均值回归
+                                             // weak mean reversion toward the start price
 };
 
 struct OffsetParams {
     double noise_bps = 0.4;                  // 常态噪声（OU 过程）的平稳标准差
+                                             // stationary standard deviation of the baseline noise (OU process)
     double noise_reversion_per_s = 0.8;
     double small_jump_rate_per_s = 0.12;     // 小错位的泊松到达率
+                                             // Poisson arrival rate of small dislocations
     double small_jump_min_bps = 1.5;
     double small_jump_max_bps = 6.0;
     double large_jump_rate_per_s = 1.0 / 45.0;   // 大错位：扣除 0.1% 双边手续费后仍有利润
+                                                 // large dislocations: still profitable after
+                                                 // the 0.1% fee on both sides
     double large_jump_min_bps = 28.0;
     double large_jump_max_bps = 45.0;
     double jump_decay_s = 1.6;               // 错位目标的指数衰减时间常数
+                                             // exponential decay time constant of the dislocation target
     double jump_rise_s = 0.15;               // 实际错位追随目标的时间常数
+                                             // time constant of the actual dislocation following the target
 };
 
 struct MakerParams {
     int levels = 8;                 // 每侧档数
+                                    // levels per side
     Price half_spread = 1;          // 第 0 档离公允价的 tick 数（>= 1，保证自己的买卖报价不交叉）
+                                    // ticks between level 0 and the fair price
+                                    // (>= 1, so its own bid and ask never cross)
     Price level_gap = 3;            // 相邻档的间距（tick）
+                                    // spacing between adjacent levels (ticks)
     Price jitter = 2;               // 每次挪单时随机外移 [0, jitter] tick
+                                    // random outward shift of [0, jitter] ticks on each move
     Qty base_size = 20000;          // 第 0 档的典型数量（lot）
+                                    // typical quantity at level 0 (lots)
     double size_growth = 0.5;       // 每深一档数量增加的比例
+                                    // fraction by which the quantity grows per level deeper
     double requote_rate_per_s = 12; // 重新报价的泊松频率
+                                    // Poisson rate of requotes
     double refill_prob = 0.8;       // 被吃光的档位在一次重新报价中补回的概率
+                                    // probability that a fully taken level is refilled in one requote
     double resize_prob = 0.05;      // 未挪动的档位随机改量的概率
+                                    // probability of a random quantity change for a level that is not moved
 };
 
 struct DepthParams {
     int orders_per_side = 1000;     // 每侧维持的挂单数
+                                    // resting orders kept per side
     Price inner = 30;               // 离公允价最近的距离（tick）
+                                    // closest distance from the fair price (ticks)
     Price outer = 3500;             // 最远的距离（tick）
+                                    // farthest distance (ticks)
     double inner_bias = 1.5;        // 距离 = inner + (outer - inner) × u^bias：越大越集中在内侧
+                                    // distance = inner + (outer - inner) × u^bias:
+                                    // larger values concentrate more on the inside
     Qty base_size = 40000;          // 典型数量（lot），越深越大
+                                    // typical quantity (lots), growing with depth
     int max_adds_per_step = 40;     // 每步每侧最多补单数
+                                    // maximum orders added per side per step
     double churn_per_s = 40;        // 每秒随机改量/撤单次数
+                                    // random quantity changes/cancels per second
 };
 
 struct TakerParams {
     double rate_per_s = 12;         // 主动单的泊松频率
+                                    // Poisson rate of aggressive orders
     Qty median_size = 6000;         // 数量中位数（lot），对数正态
+                                    // median quantity (lots), log-normal
     double size_sigma = 1.1;
     double whale_prob = 0.02;       // 大单概率
+                                    // probability of a large order
     Qty whale_min = 300000;
     Qty whale_max = 2500000;
     double market_prob = 0.1;       // 市价单比例（其余为 IOC 限价单）
+                                    // share of market orders (the rest are IOC limit orders)
     Price max_slippage = 200;       // IOC 限价最多越过对手最优价的 tick 数
+                                    // max ticks an IOC limit price goes past the opposite best price
     double pressure = 0.7;          // 方向偏置强度：0 = 随机，1 = 完全由"本地公允价 - 盘口中价"决定
+                                    // direction bias strength: 0 = random,
+                                    // 1 = decided entirely by "local fair price - top-of-book mid"
     double pressure_scale = 30;     // 偏置的价差尺度（tick）
+                                    // price-gap scale of the bias (ticks)
 };
 
 struct VenueParams {
@@ -175,11 +248,17 @@ struct MarketParams {
     FairValueParams fair;
     std::vector<VenueParams> venues;
     double step_s = 0.005;               // 仿真步长（秒）
+                                         // simulation step (seconds)
 };
 
 // 默认的三家交易所（顺序固定：Binance、OKX、Bybit，与 Exchange 枚举一致）。
 // "性格"各不相同：Binance 价差最窄、深度最深；OKX 居中；Bybit 价差稍宽、深度较浅、错位更频繁。
 // 深度提供者的挂单数保证每侧档位数超过各自的发布窗口（1000 / 400 / 50），窗口边界上的进出也被覆盖。
+// The three default venues (fixed order: Binance, OKX, Bybit, matching the Exchange enum).
+// Their "personalities" differ: Binance has the tightest spread and the deepest book; OKX sits in the
+// middle; Bybit has a slightly wider spread, a shallower book and more frequent dislocations.
+// The depth providers' order counts keep the levels per side above each venue's publish window
+// (1000 / 400 / 50), so levels entering and leaving at the window edge are covered too.
 inline MarketParams defaultMarketParams() {
     MarketParams m;
     auto maker = [](int levels, Price half_spread, Price gap, Qty size, double rate) {
@@ -225,6 +304,7 @@ inline MarketParams defaultMarketParams() {
 
 // ---------------------------------------------------------------------------
 // 价格过程
+// Price process
 // ---------------------------------------------------------------------------
 
 class FairValue {
@@ -244,6 +324,8 @@ private:
 };
 
 // 交易所偏移（基点）：OU 噪声 + 泊松跳跃错位（目标值指数衰减，实际值一阶追随目标）
+// Venue offset (basis points): OU noise + Poisson-jump dislocation (the target decays exponentially, and
+// the actual value follows the target as a first-order lag)
 class OffsetProcess {
 public:
     explicit OffsetProcess(const OffsetParams& p) : p_(p) {}
@@ -280,11 +362,13 @@ private:
 
 // ---------------------------------------------------------------------------
 // 订单 id 编码：代理（8 位）| 槽位（20 位）| 序号（36 位）
+// Order id encoding: agent (8 bits) | slot (20 bits) | sequence number (36 bits)
 // ---------------------------------------------------------------------------
 
 inline constexpr unsigned kSerialBits = 36;
 inline constexpr unsigned kSlotBits = 20;
 inline constexpr std::uint32_t kNoSlot = (1u << kSlotBits) - 1;  // 不占槽位的订单（吃单者）
+                                                                 // orders without a slot (takers)
 
 constexpr OrderId makeOrderId(std::uint32_t agent, std::uint32_t slot, std::uint64_t serial) noexcept {
     return (OrderId{agent} << (kSlotBits + kSerialBits)) | (OrderId{slot & kNoSlot} << kSerialBits) |
@@ -298,25 +382,33 @@ constexpr std::uint32_t slotOf(OrderId id) noexcept {
 }
 
 // 一个报价槽位：同一时刻最多一张活动订单
+// A quote slot: at most one live order at a time
 struct Slot {
     OrderId id = 0;      // 当前订单（live 时有效）
+                         // current order (valid while live)
     Price price = 0;
     Qty qty = 0;         // 剩余数量（成交回报同步）
+                         // remaining quantity (synced from fill reports)
     Side side = Side::Buy;
     bool live = false;
 };
 
 struct VenueStats {
     std::uint64_t book_events = 0;       // 受理 / 成交 / 撤单 / 改单回调总数（推进各协议的更新号）
+                                         // total accept / fill / cancel / modify callbacks
+                                         // (advances each protocol's update ids)
     std::uint64_t trades = 0;
     std::uint64_t rejects = 0;           // 引擎拒单（代理只发合法请求，正常应为 0）
+                                         // engine rejects (agents only send valid requests, so normally 0)
     Qty volume = 0;                      // 成交量（lot）
+                                         // traded volume (lots)
 };
 
 class Venue;
 
 // ---------------------------------------------------------------------------
 // 代理
+// Agents
 // ---------------------------------------------------------------------------
 
 class Agent {
@@ -330,6 +422,7 @@ public:
     virtual void step(Venue& venue, double dt) = 0;
 
     // 监听器：订单的剩余量变化（<= 0 表示订单已不在簿上）
+    // Listener: an order's remaining quantity changed (<= 0 means the order is no longer in the book)
     void onRemaining(std::uint32_t slot, OrderId id, Qty remaining) noexcept {
         if (Slot* s = liveSlot(slot, id)) {
             if (remaining <= 0) {
@@ -352,6 +445,8 @@ public:
 
 protected:
     // 下单 / 改单 / 撤单（调用方保证槽位状态与参数合法）；槽位随后由监听器按引擎回报更新
+    // Place / modify / cancel (the caller ensures the slot state and arguments are valid); the listener then
+    // updates the slot from the engine's reports
     inline void place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty);
     inline void move(Venue& v, std::uint32_t slot, Price price, Qty qty);
     inline void cancel(Venue& v, std::uint32_t slot);
@@ -360,6 +455,7 @@ protected:
     std::uint32_t index_;
     AccountId account_;
     std::vector<Slot> slots_;   // 构造后大小固定（引用稳定）
+                                // size fixed after construction (stable references)
     std::uint64_t serial_ = 0;
 
 private:
@@ -386,6 +482,7 @@ private:
 
     MakerParams p_;
     std::vector<Price> jitter_;   // 每个槽位当前的随机外移
+                                  // current random outward shift of each slot
     double last_fair_ = 0.0;
 };
 
@@ -403,6 +500,7 @@ private:
 
     DepthParams p_;
     std::vector<std::uint32_t> free_;   // 每步重建的空闲槽位表（复用容量）
+                                        // free slot list rebuilt every step (capacity reused)
 };
 
 class Taker final : public Agent {
@@ -417,6 +515,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // 交易所：撮合引擎 + 代理 + 偏移过程；同时是撮合引擎的监听器
+// Venue: matching engine + agents + offset process; also the matching engine's listener
 // ---------------------------------------------------------------------------
 
 class Venue {
@@ -428,12 +527,16 @@ public:
     static constexpr AccountId kMakerAccountBase = 1;
     static constexpr AccountId kTakerAccount = 200;
     static constexpr std::size_t kReserveOrders = 8192;   // 撮合引擎预留的订单容量（活动订单约 3000 张）
+                                                          // order capacity reserved by the matching engine
+                                                          // (about 3000 live orders)
 
     Venue(const VenueParams& params, std::uint64_t seed)
         : name_(params.name), rng_(seed), offset_(params.offset), engine_(*this) {
         symbol_ = engine_.addSymbol("BTCUSDT", 0, kReserveOrders);
         std::uint32_t index = 0;
         // 顺序即每步的执行顺序：先撤掉越界的远端挂单，再让做市商重新报价，最后是吃单者
+        // The order here is the execution order of each step: first the out-of-range distant resting orders are
+        // cancelled, then the market makers requote, and the takers go last
         agents_.push_back(std::make_unique<DepthProvider>(index++, kDepthAccount, params.depth));
         for (std::size_t i = 0; i < params.makers.size(); ++i) {
             agents_.push_back(std::make_unique<MarketMaker>(index++, kMakerAccountBase + static_cast<AccountId>(i),
@@ -446,6 +549,7 @@ public:
     Venue& operator=(const Venue&) = delete;
 
     // 推进一步：偏移过程 → 本地公允价 → 各代理依次行动
+    // Advances one step: offset process → local fair price → each agent acts in turn
     void step(double dt, double market_fair) {
         offset_.step(dt, rng_);
         fair_ticks_ = market_fair * (1.0 + offset_.bps() * 1e-4) * static_cast<double>(kTicksPerUnit);
@@ -465,6 +569,8 @@ public:
     const VenueStats& stats() const noexcept { return stats_; }
 
     // 一致性检查（测试用）：引擎不变量；每个槽位的活动订单都在引擎中且价格/剩余量一致；数量相等；无拒单
+    // Consistency check (for tests): engine invariants; every slot's live order is in the engine with the same
+    // price/remaining quantity; equal counts; no rejects
     bool checkConsistency(std::string* why = nullptr) const {
         auto fail = [why](const std::string& msg) {
             if (why != nullptr) *why = msg;
@@ -494,11 +600,13 @@ public:
     }
 
     // ---- 代理使用 ----
+    // ---- Used by the agents ----
     Engine& engine() noexcept { return engine_; }
     mt::SymbolId symbol() const noexcept { return symbol_; }
     Random& rng() noexcept { return rng_; }
 
     // ---- 撮合引擎监听器：只更新槽位与统计（不得在回调里调用 submit/cancel/modify）----
+    // ---- Matching engine listener: only updates slots and stats (never call submit/cancel/modify in a callback) ----
     void onAccepted(mt::SymbolId, const mt::OrderRequest&) noexcept { ++stats_.book_events; }
     void onRejected(mt::SymbolId, OrderId id, mt::RequestType request, mt::RejectReason) noexcept {
         ++stats_.rejects;
@@ -541,6 +649,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // 市场：共享公允价 + 多家交易所
+// Market: shared fair price + several venues
 // ---------------------------------------------------------------------------
 
 class Market {
@@ -559,8 +668,11 @@ public:
     }
 
     // 推进 seconds 秒（按步长取整）
+    // Advances by seconds seconds (rounded to a whole number of steps)
     void advance(double seconds) {
         if (!(seconds > 0.0)) return;  // 负数与 NaN：不推进（llround 的结果转无符号会变成巨大的步数）
+                                       // negative or NaN: no advance (llround's result
+                                       // cast to unsigned would be a huge step count)
         const auto n = static_cast<std::uint64_t>(std::llround(seconds / step_s_));
         for (std::uint64_t i = 0; i < n; ++i) step();
     }
@@ -576,17 +688,23 @@ private:
     Random rng_;
     FairValue fair_;
     std::deque<Venue> venues_;   // 元素地址稳定（引擎持有 Venue 监听器的引用）
+                                 // stable element addresses (the engines hold references to the Venue listeners)
     std::uint64_t steps_ = 0;
 };
 
 // ===========================================================================
 // 实现：代理的公共操作
+// Implementation: common agent operations
 // ===========================================================================
 
 inline void Agent::place(Venue& v, std::uint32_t slot, Side side, Price price, Qty qty) {
     Slot& s = slots_[slot];
     s = Slot{makeOrderId(index_, slot, ++serial_), price, qty, side, true};  // 先登记：撮合过程中的回报据此更新槽位
+                                                                             // register first: reports during matching
+                                                                             // rely on it to update the slot
     // GTC 限价单；STP CancelTaker：不与自己的挂单成交，撞上时撤掉新单
+    // GTC limit order; STP CancelTaker: never trades against its own resting orders; on a collision the new
+    // order is cancelled
     const mt::OrderRequest req{s.id, account_, side, mt::OrderType::Limit, mt::TimeInForce::GTC, price, qty, false,
                                mt::StpMode::CancelTaker};
     v.engine().submit(v.symbol(), req);
@@ -601,6 +719,7 @@ inline void Agent::cancel(Venue& v, std::uint32_t slot) { v.engine().cancel(v.sy
 
 // ===========================================================================
 // 实现：做市商
+// Implementation: market maker
 // ===========================================================================
 
 inline Price MarketMaker::target(Side side, int level, double fair) const noexcept {
@@ -631,6 +750,7 @@ inline void MarketMaker::quoteSide(Venue& v, Side side, double fair) {
             move(v, idx, target(side, k, fair), size(k, rng));
         } else if (rng.chance(p_.resize_prob)) {
             move(v, idx, s.price, size(k, rng));  // 改量：变小时原地修改（保留时间优先级）
+                                                  // resize: a decrease is modified in place (keeps time priority)
         }
     }
 }
@@ -642,6 +762,7 @@ inline void MarketMaker::step(Venue& v, double dt) {
     const bool rising = fair >= last_fair_;
     last_fair_ = fair;
     // 先挪"让开"的一侧：上行时先挪卖单，下行时先挪买单
+    // Move the side that "gets out of the way" first: the asks first when rising, the bids first when falling
     const Side first = rising ? Side::Sell : Side::Buy;
     quoteSide(v, first, fair);
     quoteSide(v, first == Side::Buy ? Side::Sell : Side::Buy, fair);
@@ -649,6 +770,7 @@ inline void MarketMaker::step(Venue& v, double dt) {
 
 // ===========================================================================
 // 实现：深度提供者
+// Implementation: depth provider
 // ===========================================================================
 
 inline Price DepthProvider::placementPrice(Side side, Price floor_fair, Price ceil_fair, Random& rng) const {
@@ -664,6 +786,8 @@ inline void DepthProvider::step(Venue& v, double dt) {
     const Price fb = static_cast<Price>(std::floor(fair));
     const Price fa = static_cast<Price>(std::ceil(fair));
     // 保留区间带滞回：内侧放宽到 inner / 2，外侧放宽到 outer × 1.25（补单仍在 [inner, outer] 内）
+    // The keep range has hysteresis: relaxed to inner / 2 on the inside and to outer × 1.25 on the outside
+    // (top-up orders are still placed within [inner, outer])
     const Price keep_inner = p_.inner / 2;
     const Price keep_outer = p_.outer + p_.outer / 4;
     int live_bids = 0;
@@ -696,6 +820,8 @@ inline void DepthProvider::step(Venue& v, double dt) {
         }
     }
     // 随机扰动：改量或撤单（撤掉的会在之后的步骤里换个价格补回）
+    // Random churn: change the quantity or cancel
+    // (cancelled orders are refilled at another price in later steps)
     const double churn = p_.churn_per_s * dt;
     const int events = static_cast<int>(churn) + (rng.chance(churn - std::floor(churn)) ? 1 : 0);
     for (int e = 0; e < events; ++e) {
@@ -713,6 +839,7 @@ inline void DepthProvider::step(Venue& v, double dt) {
 
 // ===========================================================================
 // 实现：吃单者
+// Implementation: taker
 // ===========================================================================
 
 inline void Taker::step(Venue& v, double dt) {
@@ -728,6 +855,7 @@ inline void Taker::step(Venue& v, double dt) {
     const Side side = rng.chance(p_buy) ? Side::Buy : Side::Sell;
     const std::optional<Price> opposite = side == Side::Buy ? ask : bid;
     if (!opposite) return;  // 对手方为空：这次不下单
+                            // the opposite side is empty: no order this time
     Qty qty = 0;
     if (rng.chance(p_.whale_prob)) {
         qty = rng.uniformInt(p_.whale_min, p_.whale_max);
@@ -735,6 +863,7 @@ inline void Taker::step(Venue& v, double dt) {
         qty = static_cast<Qty>(std::llround(static_cast<double>(p_.median_size) * std::exp(p_.size_sigma * rng.normal())));
     }
     // IOC：市价单，或越过对手最优价至多 max_slippage tick 的限价单
+    // IOC: a market order, or a limit order at most max_slippage ticks past the opposite best price
     mt::OrderRequest req{nextTakerId(), account_, side, mt::OrderType::Market, mt::TimeInForce::IOC, 0,
                          std::max<Qty>(1, qty)};
     if (!rng.chance(p_.market_prob)) {

@@ -2,11 +2,17 @@
 // test_framework.h
 // 极简的头文件测试框架：零依赖，提供用例注册、断言宏与运行器。
 // 用法：
+// Minimal header-only test framework: zero dependencies; provides test case registration, assertion
+// macros and a runner.
+// Usage:
 //   TEST_CASE("orderbook: upsert keeps order") { CHECK_EQ(1 + 1, 2); }
 //   int main(int argc, char** argv) { return hft_test::runAll(argc, argv); }
 // 运行参数：
 //   <exe> [子串过滤...]   只运行名称包含任一子串的用例
 //   <exe> --list         列出所有用例
+// Run arguments:
+//   <exe> [substring filter...]   run only the cases whose name contains any of the substrings
+//   <exe> --list                  list all cases
 //
 
 #pragma once
@@ -29,6 +35,7 @@
 namespace hft_test {
 
 // 单个测试用例
+// A single test case
 struct TestCase {
     std::string name;
     std::function<void()> fn;
@@ -37,24 +44,28 @@ struct TestCase {
 };
 
 // 全局用例注册表（函数内静态变量，避免静态初始化顺序问题）
+// Global test case registry (a function-local static, avoiding static initialization order problems)
 inline std::vector<TestCase>& registry() {
     static std::vector<TestCase> cases;
     return cases;
 }
 
 // 当前用例的失败计数
+// Failure count of the current case
 inline int& currentFailures() {
     static int failures = 0;
     return failures;
 }
 
 // 动态注册用例（模板化测试套件可在运行前批量注册）
+// Registers a case dynamically (templated test suites can register cases in bulk before running)
 inline void registerTest(std::string name, std::function<void()> fn,
                          const char* file = "", int line = 0) {
     registry().push_back({std::move(name), std::move(fn), file, line});
 }
 
 // 静态注册辅助对象：TEST_CASE 宏使用
+// Static registration helper object: used by the TEST_CASE macro
 struct Registrar {
     Registrar(const char* name, void (*fn)(), const char* file, int line) {
         registerTest(name, fn, file, line);
@@ -62,11 +73,13 @@ struct Registrar {
 };
 
 // REQUIRE 失败时抛出，终止当前用例
+// Thrown when a REQUIRE fails, ending the current case
 struct RequireFailure : std::exception {
     const char* what() const noexcept override { return "REQUIRE failed"; }
 };
 
 // 将任意值转成字符串用于失败信息；不可输出的类型显示占位符
+// Converts any value into a string for failure messages; types that cannot be streamed show a placeholder
 template <class T, class = void>
 struct IsStreamable : std::false_type {};
 template <class T>
@@ -90,12 +103,14 @@ std::string toString(const T& v) {
 }
 
 // 记录一次断言失败
+// Records one assertion failure
 inline void reportFailure(const char* file, int line, const std::string& msg) {
     ++currentFailures();
     std::cerr << "    " << file << ":" << line << ": FAILED: " << msg << std::endl;
 }
 
 // 运行所有（或匹配过滤条件的）用例，返回进程退出码
+// Runs all cases (or those matching the filters) and returns the process exit code
 inline int runAll(int argc, char** argv) {
     std::vector<std::string> filters;
     for (int i = 1; i < argc; ++i) {
@@ -112,6 +127,8 @@ inline int runAll(int argc, char** argv) {
     int run = 0, failed = 0;
     const auto total_start = std::chrono::steady_clock::now();
     // 按下标遍历并拷贝用例：允许用例在运行期间动态注册新用例而不使迭代器失效
+    // Iterate by index and copy each case: this lets a case register new cases while running without
+    // invalidating any iterator
     for (std::size_t idx = 0; idx < registry().size(); ++idx) {
         const TestCase tc = registry()[idx];
         const auto matches = [&tc](const std::string& f) { return tc.name.find(f) != std::string::npos; };
@@ -123,6 +140,7 @@ inline int runAll(int argc, char** argv) {
             tc.fn();
         } catch (const RequireFailure&) {
             // 失败信息已在断言处输出
+            // The failure message was already printed at the assertion
         } catch (const std::exception& e) {
             reportFailure(tc.file, tc.line, std::string("unexpected exception: ") + e.what());
         } catch (...) {
@@ -150,6 +168,7 @@ inline int runAll(int argc, char** argv) {
 #define HFT_TEST_CONCAT(a, b) HFT_TEST_CONCAT_INNER(a, b)
 
 // 定义并注册一个测试用例
+// Defines and registers a test case
 #define TEST_CASE(name)                                                              \
     static void HFT_TEST_CONCAT(hft_test_fn_, __LINE__)();                           \
     static ::hft_test::Registrar HFT_TEST_CONCAT(hft_test_reg_, __LINE__)(           \
@@ -157,12 +176,14 @@ inline int runAll(int argc, char** argv) {
     static void HFT_TEST_CONCAT(hft_test_fn_, __LINE__)()
 
 // 断言：失败后继续执行
+// Assertion: execution continues after a failure
 #define CHECK(cond)                                                                  \
     do {                                                                             \
         if (!(cond)) ::hft_test::reportFailure(__FILE__, __LINE__, "CHECK(" #cond ")"); \
     } while (0)
 
 // 断言：失败后终止当前用例
+// Assertion: a failure ends the current case
 #define REQUIRE(cond)                                                                \
     do {                                                                             \
         if (!(cond)) {                                                               \
@@ -196,6 +217,7 @@ inline int runAll(int argc, char** argv) {
 #define REQUIRE_GE(a, b) HFT_TEST_CMP_IMPL(a, b, >=, true)
 
 // 浮点近似比较
+// Approximate floating-point comparison
 #define CHECK_NEAR(a, b, eps)                                                        \
     do {                                                                             \
         const double hft_test_x_ = static_cast<double>(a);                           \
@@ -209,6 +231,7 @@ inline int runAll(int argc, char** argv) {
     } while (0)
 
 // 期望表达式抛出异常
+// Expects the expression to throw an exception
 #define CHECK_THROWS(expr)                                                           \
     do {                                                                             \
         bool hft_test_threw_ = false;                                                \
@@ -218,6 +241,7 @@ inline int runAll(int argc, char** argv) {
     } while (0)
 
 // 无条件失败（附带说明）
+// Unconditional failure (with a message)
 #define FAIL(msg)                                                                    \
     do {                                                                             \
         ::hft_test::reportFailure(__FILE__, __LINE__, std::string("FAIL: ") + (msg)); \

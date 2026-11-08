@@ -11,6 +11,21 @@
 //   --quick  规模缩小 10 倍（冒烟运行）
 //   --pin    把基准线程绑定到 CPU 0
 //   --reps   吞吐量测量的重复次数（取中位数，默认 3）
+// Matching engine benchmark. Note: this program directly includes and tests the real optimized engine
+// under include/matching/ (LimitOrderBook, not a separately written copy); the baseline is the reference
+// model in tests/reference_order_book.h (std::map + std::list + unordered_map).
+// Four workloads: (a) passive adds + cancels near the touch; (b) realistic mixed flow from the random
+// generator (including rejects, STP, FOK, modifies);
+// (c) aggressive orders that sweep several price levels at once; (d) market-maker-style passive repricing
+// (a reprice/quantity increase loses time priority, a quantity decrease modifies in place).
+// Each reports the mean ns/op, p50/p99/p99.9 (per-operation rdtsc timing, converted with hft::TscClock),
+// Mops/s and heap allocations per operation (counting global operator new, counted only inside the timed
+// regions). The event streams of the two implementations on the same command stream must match event by
+// event (checked with an FNV-1a hash; on a mismatch the program exits with a non-zero code).
+// Usage: ./build/matching_engine_benchmark [--quick] [--pin] [--reps N]
+//   --quick  10 times smaller scale (smoke run)
+//   --pin    pin the benchmark thread to CPU 0
+//   --reps   repetitions of the throughput measurement (the median is taken, default 3)
 //
 
 #include "hft/alloc_counter.h"
@@ -20,6 +35,7 @@
 #include "matching/types.h"
 
 #include "matching_test_util.h"      // tests/（CMake 为本目标加入的 include 目录）
+                                     // tests/ (an include directory CMake adds for this target)
 #include "reference_order_book.h"
 
 #include <algorithm>
@@ -39,11 +55,15 @@ using hft::matching::test::apply;
 using hft::matching::test::Command;
 using hft::matching::test::CountingListener;
 using hft::alloc_counter::total;  // 堆分配计数（计数版全局 operator new，本程序唯一包含它的翻译单元）
+                                  // heap allocation count (counting global operator new; the only
+                                  // translation unit of this program that includes it)
 
 // 编译器屏障：不让被测代码跨过计时点重排
+// Compiler barrier: keeps the code under test from being reordered across the timing points
 inline void compilerBarrier() { __asm__ __volatile__("" : : : "memory"); }
 
 // 校验用的监听器：对每个事件的全部字段做 FNV-1a 哈希（不计时）
+// Listener for verification: an FNV-1a hash over all fields of every event (not timed)
 struct HashListener {
     std::uint64_t hash = 1469598103934665603ULL;
     std::uint64_t events = 0;
@@ -63,6 +83,8 @@ struct HashListener {
 };
 
 // 一个负载：setup 不计时；steps 中 timed == false 的步骤（例如扫单之后补回流动性）也不计时
+// A workload: setup is not timed; steps with timed == false (e.g. replenishing liquidity after a sweep)
+// are not timed either
 struct Step {
     Command cmd;
     bool timed;
@@ -71,6 +93,7 @@ struct Step {
 struct Workload {
     std::string name;
     std::string unit;  // 每个计时操作是什么
+                       // what each timed operation is
     std::vector<Command> setup;
     std::vector<Step> steps;
     std::size_t reserve_orders = 4096;
@@ -86,6 +109,10 @@ OrderRequest limitOrder(OrderId id, bool is_buy, Price price, Qty qty, AccountId
 // ---------------------------------------------------------------------------
 // (a) 盘口附近的被动挂单 + 撤单：两侧各 20 档底仓（价差 6 tick，永不撤），新单落在离盘口 -2..+4 tick 内
 //     （价差内的价位会被反复新建与删除），活动新单维持在几百到两千之间，撤单随机挑一个活动新单。
+// (a) Passive adds + cancels near the touch: 20 levels of base liquidity on each side (6-tick spread,
+//     never cancelled), new orders land within -2..+4 ticks of the touch (price levels inside the
+//     spread are created and deleted over and over), live new orders stay between a few hundred and
+//     two thousand, and a cancel picks a random live new order.
 // ---------------------------------------------------------------------------
 Workload makePassive(std::size_t ops) {
     Workload w;
@@ -106,6 +133,7 @@ Workload makePassive(std::size_t ops) {
         if (add) {
             const bool is_buy = rng() % 2 == 0;
             const Price offset = static_cast<Price>(rng() % 7) - 2;  // -2..4：负数 = 价差内
+                                                                     // -2..4: negative = inside the spread
             const Price price = is_buy ? kMid - 3 - offset : kMid + 3 + offset;
             const Qty qty = 1 + static_cast<Qty>(rng() % 10);
             const AccountId account = static_cast<AccountId>(3 + rng() % 8);
@@ -125,6 +153,10 @@ Workload makePassive(std::size_t ops) {
 // (b) 混合真实流量：tests/matching_test_util.h 的随机命令生成器（默认参数：中间价随机游走、
 //     盘口附近成簇的被动单、两成主动单、全部订单类型/TIF/post-only/STP、撤单改单命中活动与失效 id、
 //     少量非法请求）。先不计时地跑 20k 条进入稳态。
+// (b) Realistic mixed flow: the random command generator of tests/matching_test_util.h (default
+//     parameters: random-walk mid price, passive orders clustered near the touch, 20% aggressive
+//     orders, all order types/TIF/post-only/STP, cancels and modifies hitting both live and stale ids,
+//     a few invalid requests). First runs 20k commands untimed to reach steady state.
 // ---------------------------------------------------------------------------
 Workload makeMixed(std::size_t ops) {
     Workload w;
@@ -139,6 +171,9 @@ Workload makeMixed(std::size_t ops) {
 // ---------------------------------------------------------------------------
 // (c) 主动扫单：两侧各 200 档、每档 2 单。每次扫单是一张 IOC 限价单，恰好吃光最优的 kSweepLevels 档
 //     （2 * kSweepLevels 笔成交），然后不计时地按原样补回这些价位；买卖两侧交替扫。
+// (c) Aggressive sweeps: 200 levels on each side, 2 orders per level. Each sweep is one IOC limit order
+//     that exactly clears the best kSweepLevels levels (2 * kSweepLevels fills), after which those price
+//     levels are replenished as they were, untimed; the buy and sell sides take turns sweeping.
 // ---------------------------------------------------------------------------
 constexpr Price kSweepLevels = 20;
 
@@ -163,12 +198,14 @@ Workload makeSweeps(std::size_t sweeps) {
     }
     for (std::size_t s = 0; s < sweeps; ++s) {
         const bool buy_side_taker = s % 2 == 0;  // 买单扫卖盘 / 卖单扫买盘
+                                                 // a buy sweeps the asks / a sell sweeps the bids
         const Qty qty = 2 * kLot * kSweepLevels;
         const OrderRequest taker = buy_side_taker
                                        ? test::buy(next_id++, kMid + kSweepLevels, qty).ioc().account(9)
                                        : test::sell(next_id++, kMid - kSweepLevels, qty).ioc().account(9);
         w.steps.push_back({Command::newOrder(taker), true});
         // 由远及近补回被吃掉的价位：每次新建的都是新的最优档
+        // Replenish the consumed price levels from far to near: each one created is the new best level
         for (Price d = kSweepLevels; d >= 1; --d) {
             for (int k = 0; k < 2; ++k) {
                 w.steps.push_back({buy_side_taker ? maker(false, kMid + d) : maker(true, kMid - d), false});
@@ -182,6 +219,11 @@ Workload makeSweeps(std::size_t sweeps) {
 // (d) 被动改价：两侧各 1000 张挂单分布在离中间价 1..20 tick 内；每次改单随机挑一张，改到本侧
 //     1..20 tick 内的随机价位、数量 1..10（改价或加量失去时间优先级并重新挂单，同价减量原地修改），
 //     永不穿价——做市商挪动报价的典型流量。
+// (d) Passive repricing: 1000 resting orders per side spread within 1..20 ticks of the mid price; each
+//     modify picks one at random and moves it to a random price within 1..20 ticks on its own side,
+//     quantity 1..10 (a reprice or quantity increase loses time priority and re-rests, a quantity
+//     decrease at the same price modifies in place), never crossing — the typical flow of a market
+//     maker moving its quotes.
 // ---------------------------------------------------------------------------
 Workload makeReprice(std::size_t ops) {
     Workload w;
@@ -193,6 +235,7 @@ Workload makeReprice(std::size_t ops) {
         return is_buy ? kMid - offset : kMid + offset;
     };
     constexpr OrderId kOrders = 2000;  // 奇数 id 为买单
+                                       // odd ids are buy orders
     for (OrderId id = 1; id <= kOrders; ++id) {
         const bool is_buy = id % 2 == 1;
         w.setup.push_back(Command::newOrder(limitOrder(id, is_buy, price(is_buy), 5, is_buy ? 1 : 2)));
@@ -217,6 +260,8 @@ struct Result {
 };
 
 // 吞吐量：整段循环只在两端取时间，没有逐条计时开销（仅用于全部步骤都计时的负载）
+// Throughput: the time is taken only at the two ends of the whole loop, with no per-operation timing
+// overhead (only for workloads whose steps are all timed)
 template <template <class> class BookT>
 void throughputPass(const Workload& w, double& mean_ns, double& allocs_per_op) {
     CountingListener l;
@@ -233,6 +278,8 @@ void throughputPass(const Workload& w, double& mean_ns, double& allocs_per_op) {
 }
 
 // 逐条计时：rdtsc 开始、rdtscp 结束，记入直方图（单位 tick）；同时统计计时区间内的分配次数
+// Per-operation timing: rdtsc at the start, rdtscp at the end, recorded in a histogram (in ticks); also
+// counts the allocations inside the timed regions
 template <template <class> class BookT>
 Result latencyPass(const Workload& w) {
     CountingListener l;
@@ -281,6 +328,8 @@ Result measure(const Workload& w, int reps) {
     Result r = latencyPass<BookT>(w);
     if (w.all_timed) {
         // 均值与分配次数改用无逐条计时开销的吞吐量测量（重复 reps 次取中位数）
+        // The mean and the allocation count come from the throughput measurement instead, which has no
+        // per-operation timing overhead (median of reps repetitions)
         std::vector<double> means;
         double allocs = 0;
         for (int i = 0; i < reps; ++i) {
@@ -296,6 +345,8 @@ Result measure(const Workload& w, int reps) {
 }
 
 // 事件流校验：两个实现在同一命令流上的全部事件哈希必须相同
+// Event stream check: the hashes of all events of the two implementations on the same command stream
+// must be identical
 template <template <class> class BookT>
 HashListener eventDigest(const Workload& w) {
     HashListener l;
@@ -306,6 +357,7 @@ HashListener eventDigest(const Workload& w) {
 }
 
 // 计时器自身开销（空区间）
+// Overhead of the timer itself (empty region)
 double timerOverheadNs() {
     hft::LatencyHistogram hist;
     for (int i = 0; i < 200'000; ++i) {

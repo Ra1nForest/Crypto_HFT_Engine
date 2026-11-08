@@ -2,6 +2,10 @@
 // matching_test_util.h
 // 撮合引擎测试公共工具：事件记录、命令回放、随机命令生成器、两个订单簿的状态比对与断言宏。
 // 对任何满足 docs/MATCHING_ENGINE.md 所述接口的订单簿都适用（参考模型、优化引擎、朴素模型）。
+// Shared matching engine test utilities: event recording, command replay, a random command generator,
+// state comparison of two order books and assertion macros.
+// They work with any order book that has the interface described in docs/MATCHING_ENGINE.md (reference
+// model, optimized engine, naive model).
 //
 
 #pragma once
@@ -24,6 +28,8 @@ namespace hft::matching::test {
 
 // ============================================================================
 // 字符串化（测试失败信息用）。统一命名为 str()，避免与 hft::matching::toString 重名遮蔽。
+// Stringification (for test failure messages). Uniformly named str(), so that nothing shadows
+// hft::matching::toString.
 // ============================================================================
 
 inline std::string str(const OrderRequest& r) {
@@ -67,6 +73,7 @@ inline std::string str(const std::optional<Price>& p) { return p ? std::to_strin
 inline std::string str(const std::optional<OrderInfo>& o) { return o ? str(*o) : "none"; }
 
 // 请求逐字段相等（OrderRequest 本身不定义 operator==）
+// Field-by-field request equality (OrderRequest itself defines no operator==)
 inline bool sameRequest(const OrderRequest& a, const OrderRequest& b) {
     return a.id == b.id && a.account == b.account && a.side == b.side && a.type == b.type &&
            a.tif == b.tif && a.price == b.price && a.qty == b.qty && a.post_only == b.post_only &&
@@ -75,6 +82,7 @@ inline bool sameRequest(const OrderRequest& a, const OrderRequest& b) {
 
 // ============================================================================
 // 事件：监听器每个回调对应一个 Event；比较时只比较该类事件的相关字段
+// Events: one Event per listener callback; comparison looks only at the fields relevant to that kind of event
 // ============================================================================
 
 struct Event {
@@ -82,12 +90,17 @@ struct Event {
 
     Kind kind = Kind::Accepted;
     OrderId id = 0;                                              // 订单 id（Trade 事件为 taker_id）
+                                                                 // order id (taker_id for Trade events)
     OrderRequest request{};                                      // Accepted：原样回显的请求
+                                                                 // Accepted: the request echoed verbatim
     RequestType request_type = RequestType::New;                 // Rejected
     RejectReason reject_reason = RejectReason::InvalidQuantity;  // Rejected
     Trade trade{};                                               // Trade
     Price price = 0;                                             // Modified：新价格
+                                                                 // Modified: new price
     Qty qty = 0;                                                 // Cancelled：撤销量；Modified：新数量
+                                                                 // Cancelled: cancelled quantity;
+                                                                 // Modified: new quantity
     CancelReason cancel_reason = CancelReason::UserRequested;    // Cancelled
 
     std::string toString() const {
@@ -133,6 +146,7 @@ inline bool operator!=(const Event& a, const Event& b) { return !(a == b); }
 inline std::string str(const Event& e) { return e.toString(); }
 
 // ---- 事件构造函数（测试中写期望序列用）----
+// ---- Event constructors (for writing expected sequences in tests) ----
 
 inline Event accepted(const OrderRequest& r) {
     Event e;
@@ -168,6 +182,7 @@ inline Event trade(const Trade& t) {
     return e;
 }
 // 参数顺序与 Trade 字段顺序一致
+// Parameter order matches the Trade field order
 inline Event trade(TradeId trade_id, OrderId maker_id, OrderId taker_id, AccountId maker_account,
                    AccountId taker_account, Side taker_side, Price price, Qty qty,
                    Qty maker_remaining, Qty taker_remaining) {
@@ -195,6 +210,7 @@ inline Event modified(OrderId id, Price price, Qty qty) {
 
 // ============================================================================
 // 记录型监听器：把所有回调按顺序记成 Event
+// Recording listener: records every callback, in order, as an Event
 // ============================================================================
 
 struct RecordingListener {
@@ -213,11 +229,13 @@ struct RecordingListener {
     }
 
     // 取走已记录的事件并清空
+    // Take the recorded events, leaving the list empty
     std::vector<Event> take() { return std::exchange(events, {}); }
     void clear() { events.clear(); }
 };
 
 // 只计数的监听器：不分配、不哈希（零分配测试与基准测试用）
+// Counting-only listener: no allocation, no hashing (for zero-allocation tests and benchmarks)
 struct CountingListener {
     std::uint64_t events = 0;
     std::uint64_t trades = 0;
@@ -236,14 +254,19 @@ struct CountingListener {
 
 // ============================================================================
 // 命令：New / Cancel / Modify，可回放到任意订单簿
+// Commands: New / Cancel / Modify, replayable on any order book
 // ============================================================================
 
 struct Command {
     RequestType type = RequestType::New;
     OrderRequest order{};  // New：完整请求
+                           // New: the full request
     OrderId id = 0;        // 目标订单 id（New 时等于 order.id）
+                           // target order id (equals order.id for New)
     Price price = 0;       // Modify：新价格
+                           // Modify: new price
     Qty qty = 0;           // Modify：新数量
+                           // Modify: new quantity
 
     static Command newOrder(const OrderRequest& r) {
         Command c;
@@ -293,6 +316,8 @@ void apply(Book& book, const Command& cmd) {
 // ============================================================================
 // 订单请求链式构造器：默认限价 GTC、账户 1、非 post-only、无 STP
 // 例：buy(7, 100, 5).account(2).ioc().stp(StpMode::CancelMaker)
+// Chainable order request builder: defaults to limit GTC, account 1, not post-only, no STP
+// Example: buy(7, 100, 5).account(2).ioc().stp(StpMode::CancelMaker)
 // ============================================================================
 
 class Req {
@@ -315,6 +340,7 @@ public:
     Req& price(Price p) { r_.price = p; return *this; }
 
     operator OrderRequest() const { return r_; }  // NOLINT: 允许隐式转换，测试书写更简洁
+                                                  // NOLINT: implicit conversion allowed, so tests are shorter to write
 
 private:
     OrderRequest r_;
@@ -323,10 +349,12 @@ private:
 inline Req buy(OrderId id, Price price, Qty qty) { return Req(id, Side::Buy, price, qty); }
 inline Req sell(OrderId id, Price price, Qty qty) { return Req(id, Side::Sell, price, qty); }
 // 市价单：price 字段为 0（规范规定市价单忽略价格）
+// Market orders: the price field is 0 (the spec says market orders ignore the price)
 inline Req marketBuy(OrderId id, Qty qty) { return Req(id, Side::Buy, 0, qty).market(); }
 inline Req marketSell(OrderId id, Qty qty) { return Req(id, Side::Sell, 0, qty).market(); }
 
 // 由请求推出它挂单后的查询行
+// Derive a request's query row once it rests on the book
 inline OrderInfo infoOf(const OrderRequest& r, Qty remaining) {
     return OrderInfo{r.id, r.account, r.side, r.price, remaining, r.post_only, r.stp};
 }
@@ -334,6 +362,7 @@ inline OrderInfo infoOf(const OrderRequest& r) { return infoOf(r, r.qty); }
 
 // ============================================================================
 // 列表字符串化与比较/断言辅助
+// List stringification and comparison/assertion helpers
 // ============================================================================
 
 template <class T>
@@ -348,6 +377,8 @@ std::string str(const std::vector<T>& v) {
 }
 
 // 两个事件序列逐条比较；不同则返回 false，并在 why 中给出带标记的逐行对照
+// Compare two event sequences entry by entry; if they differ, return false and give a marked line-by-line
+// comparison in why
 inline bool sameEvents(const std::vector<Event>& actual, const std::vector<Event>& expected,
                        std::string* why = nullptr) {
     if (actual == expected) return true;
@@ -409,6 +440,7 @@ bool checkOrder(const Book& book, OrderId id, const std::optional<OrderInfo>& ex
 
 // ============================================================================
 // 状态快照：用于断言"某操作没有任何副作用"
+// State snapshot: for asserting "this operation had no side effects at all"
 // ============================================================================
 
 struct StateSnapshot {
@@ -418,6 +450,7 @@ struct StateSnapshot {
     std::vector<LevelInfo> bids;
     std::vector<LevelInfo> asks;
     std::vector<OrderInfo> bid_orders;  // 按档位（优先级）与 FIFO 顺序展开的全部挂单
+                                        // all resting orders, flattened in level (priority) and FIFO order
     std::vector<OrderInfo> ask_orders;
     TradeId last_trade_id = 0;
 };
@@ -467,6 +500,9 @@ bool checkUnchanged(const StateSnapshot& before, const Book& book, const char* f
 // 两个订单簿的完整状态比对（差分测试用）
 // 比较：最优价、订单数、各侧档位数、两侧完整深度、每个档位的 FIFO 订单列表与 volumeAt、
 // 每个挂单的 findOrder，以及 lastTradeId。
+// Full state comparison of two order books (for differential tests)
+// Compares: best prices, order count, level count per side, full depth of both sides, each level's FIFO
+// order list and volumeAt, findOrder of every resting order, and lastTradeId.
 // ============================================================================
 
 template <class BookA, class BookB>
@@ -520,6 +556,10 @@ bool sameState(const BookA& a, const BookB& b, std::string* why) {
 // 单个订单簿各查询接口之间的一致性（与实现无关，可发现缓存的档位总量/计数错误）：
 // depth 与 levelCount/bestBid/bestAsk/volumeAt/ordersAt/findOrder/orderCount 互相印证，
 // depth(side, k) 是完整深度的前缀，两侧价格分离且不交叉。
+// Consistency between the query interfaces of a single order book (implementation-independent; catches wrong
+// cached level totals/counts):
+// depth and levelCount/bestBid/bestAsk/volumeAt/ordersAt/findOrder/orderCount corroborate each other,
+// depth(side, k) is a prefix of the full depth, and the prices of the two sides are disjoint and uncrossed.
 // ============================================================================
 
 template <class Book>
@@ -578,6 +618,8 @@ bool queriesConsistent(const Book& book, std::string* why) {
                     return fail("findOrder(" + std::to_string(o.id) + ") = " + str(found) +
                                 " but ordersAt lists " + str(o));
                 // 被检查的簿可能有错：累加前先判断是否越界（sum >= 0 且 remaining > 0，减法不会溢出）
+                // The book under test may be wrong: check for overflow before adding (sum >= 0 and remaining > 0, so
+                // the subtraction cannot overflow)
                 if (o.remaining > std::numeric_limits<Qty>::max() - sum)
                     return fail(name + ": orders at " + std::to_string(level.price) + " sum past INT64_MAX");
                 sum += o.remaining;
@@ -590,6 +632,9 @@ bool queriesConsistent(const Book& book, std::string* why) {
         if (!levels.empty()) {
             // 最差档之外的价格必须没有档位。最差卖价为 INT64_MAX（或最差买价为 INT64_MIN）时其外没有
             // 可表示的价格，不再探测（否则 price + 1 有符号溢出）
+            // Prices beyond the worst level must have no level. When the worst ask is INT64_MAX (or the worst bid is
+            // INT64_MIN), no representable price lies beyond it, so nothing is probed (price + 1 would be signed
+            // overflow)
             const Price worst = levels.back().price;
             const bool has_beyond = side == Side::Buy ? worst > std::numeric_limits<Price>::min()
                                                       : worst < std::numeric_limits<Price>::max();
@@ -611,6 +656,9 @@ bool queriesConsistent(const Book& book, std::string* why) {
 // ============================================================================
 // 随机命令生成器（mt19937_64，给定种子完全可复现；只使用标准化的引擎原始输出，
 // 不依赖各标准库实现不同的 std::uniform_int_distribution）
+// Random command generator (mt19937_64, fully reproducible for a given seed; uses only the standardized raw
+// engine output and does not depend on std::uniform_int_distribution, which differs between standard
+// library implementations)
 //
 // 模拟的市场：中间价随机游走；被动单集中在中间价附近几十个 tick 内，少量主动单越过
 // 中间价成交；数量以小单为主、偶有扫多档的大单；少数账户（STP 经常触发）；全部订单
@@ -618,21 +666,40 @@ bool queriesConsistent(const Book& book, std::string* why) {
 // 重复 id、id 复用以及 0 / UINT64_MAX 这样的边界 id。
 // 生成器跟踪自己发出的限价 GTC 订单（"候选挂单"），数量超过 max_live 时强制撤最旧的一个，
 // 因而活动挂单数有上界，簿规模保持在几百单以内。
+// Simulated market: the mid price does a random walk; passive orders cluster within a few dozen ticks of the
+// mid, a few aggressive orders cross the mid and trade; quantities are mostly small, with occasional large
+// orders that sweep several levels; few accounts (STP triggers often); all order types/TIFs/post-only/STP
+// modes; cancels and modifies hit both live orders and finished/unknown ones; a few invalid requests,
+// duplicate ids, reused ids and edge ids such as 0 / UINT64_MAX.
+// The generator tracks the limit GTC orders it sends ("candidate resting orders"); when there are more than
+// max_live of them it force-cancels the oldest, so the number of live resting orders is bounded and the
+// book stays within a few hundred orders.
 // ============================================================================
 
 struct GeneratorConfig {
     Price initial_mid = 10'000;         // 初始中间价（tick）
+                                        // initial mid price (ticks)
     Price passive_ticks = 25;           // 被动单离中间价最远的 tick 数
+                                        // farthest distance of passive orders from the mid, in ticks
     Price aggressive_ticks = 4;         // 主动单最多越过中间价的 tick 数
+                                        // maximum ticks by which aggressive orders cross the mid
     std::size_t max_live = 300;         // 候选挂单上限（超过则强制撤最旧的）
+                                        // cap on candidate resting orders (beyond it the oldest is force-cancelled)
     std::uint64_t id_space = 4096;      // 新单 id 在 [1, id_space] 中循环分配（0 = 只增不循环）
+                                        // new order ids cycle through [1, id_space] (0 = only increase, never wrap)
     std::uint32_t accounts = 4;         // 账户取 [1, accounts]
+                                        // accounts are drawn from [1, accounts]
     std::uint32_t weight_new = 60;      // 命令类型权重
+                                        // command type weights
     std::uint32_t weight_cancel = 22;
     std::uint32_t weight_modify = 18;
     double invalid_rate = 0.03;         // 非法新单比例（数量/价格/标志）
+                                        // share of invalid new orders (quantity/price/flags)
     double duplicate_rate = 0.03;       // 新单故意复用候选挂单 id 的比例（多半触发 DuplicateOrderId）
+                                        // share of new orders that deliberately reuse a candidate
+                                        // resting order's id (usually triggers DuplicateOrderId)
     double drift_rate = 0.05;           // 每条命令中间价 ±1 tick 的概率
+                                        // probability per command that the mid moves ±1 tick
 };
 
 class RandomCommandGenerator {
@@ -645,6 +712,8 @@ public:
     Command next() {
         drift();
         if (tracked_.size() > cfg_.max_live) return cancelTracked(0);  // 强制撤最旧的候选挂单
+                                                                       // force-cancel the oldest
+                                                                       // candidate resting order
         const std::uint64_t w_new = cfg_.weight_new;
         const std::uint64_t w_cancel = cfg_.weight_cancel;
         const std::uint64_t total = w_new + w_cancel + cfg_.weight_modify;
@@ -659,6 +728,8 @@ public:
 
 private:
     struct Tracked {  // 生成器记下的候选挂单（不一定仍活动：可能已成交或被拒）
+                      // a candidate resting order recorded by the generator (not necessarily
+                      // still live: it may have been filled or rejected)
         OrderId id;
         Side side;
         Price price;
@@ -667,14 +738,18 @@ private:
 
     // ---- 随机原语 ----
     // [0, n)：直接取模，n 很小时偏差可忽略
+    // ---- Random primitives ----
+    // [0, n): plain modulo; the bias is negligible when n is small
     std::uint64_t below(std::uint64_t n) { return n == 0 ? 0 : rng_() % n; }
     // [lo, hi]，要求 lo <= hi
+    // [lo, hi], requires lo <= hi
     std::int64_t range(std::int64_t lo, std::int64_t hi) {
         return lo + static_cast<std::int64_t>(below(static_cast<std::uint64_t>(hi - lo) + 1));
     }
     bool chance(double p) { return static_cast<double>(rng_() >> 11) * 0x1.0p-53 < p; }
 
     // ---- 市场状态 ----
+    // ---- Market state ----
     Price minMid() const {
         return std::max<Price>(1, cfg_.passive_ticks) + std::max<Price>(0, cfg_.aggressive_ticks) + 1;
     }
@@ -698,6 +773,7 @@ private:
             case 4: return StpMode::CancelMaker;
             case 5: return StpMode::CancelBoth;
             default: return StpMode::None;  // 一半订单不启用 STP
+                                            // half of the orders use no STP
         }
     }
 
@@ -706,14 +782,17 @@ private:
         if (roll < 70) return range(1, 10);
         if (roll < 93) return range(11, 40);
         return range(41, 200);  // 偶尔扫多档
+                                // occasionally sweeps several levels
     }
 
     // 限价：45% 在盘口附近，35% 更深，20% 越过中间价（主动成交）
+    // Limit price: 45% near the touch, 35% deeper, 20% across the mid (aggressive, trades)
     Price limitPrice(Side side) {
         const Price passive = std::max<Price>(1, cfg_.passive_ticks);
         const Price aggressive = std::max<Price>(0, cfg_.aggressive_ticks);
         const std::uint64_t roll = below(100);
         Price offset;  // > 0：远离对手方；<= 0：越过中间价
+                       // > 0: away from the opposite side; <= 0: across the mid
         if (roll < 45) offset = range(1, std::min<Price>(5, passive));
         else if (roll < 80) offset = range(1, passive);
         else offset = -range(0, aggressive);
@@ -721,10 +800,12 @@ private:
     }
 
     // 市价单的 price 字段被忽略：随便给一个（常常是 0 或负数）
+    // A market order's price field is ignored: give it any value (often 0 or negative)
     Price marketPrice() { return chance(0.5) ? 0 : range(-5, 2 * mid_); }
 
     OrderId freshId() {
         // 极少数用边界 id，检查实现是否把 0 或 ~0 当作哨兵
+        // Very rarely use an edge id, to check whether the implementation treats 0 or ~0 as a sentinel
         if (chance(0.002)) {
             static constexpr OrderId kEdge[] = {0, UINT64_MAX, UINT64_MAX - 1};
             return kEdge[below(3)];
@@ -735,6 +816,7 @@ private:
     }
 
     // 已结束或从未用过的 id（也可能恰好仍是活动订单）
+    // An id that is finished or was never used (it may also happen to be a live order)
     OrderId deadOrRandomId() {
         if (!history_.empty() && chance(0.6)) return history_[below(history_.size())];
         if (cfg_.id_space != 0) return static_cast<OrderId>(range(1, static_cast<std::int64_t>(cfg_.id_space)));
@@ -752,6 +834,7 @@ private:
     }
 
     // 把一个合法请求改成非法：数量、价格或标志
+    // Turn a valid request into an invalid one: quantity, price or flags
     void corrupt(OrderRequest& r) {
         switch (below(3)) {
             case 0:
@@ -786,6 +869,7 @@ private:
         const std::uint64_t kind = below(100);
         if (kind < 52) {
             // 普通限价 GTC
+            // Plain limit GTC
         } else if (kind < 64) {
             r.post_only = true;
         } else if (kind < 76) {
@@ -820,6 +904,7 @@ private:
         const std::uint64_t roll = below(100);
         if (tracked_.empty() || roll < 15) return Command::cancel(deadOrRandomId());
         if (roll < 30) return cancelTracked(0);  // 最旧的
+                                                 // the oldest
         return cancelTracked(below(tracked_.size()));
     }
 
@@ -834,13 +919,17 @@ private:
         const std::uint64_t roll = below(100);
         if (roll < 30) {
             q = range(1, std::max<Qty>(1, t.qty));          // 同价减量或不变：原地修改
+                                                            // same price, quantity reduced or kept: modified in place
         } else if (roll < 45) {
             q = std::max<Qty>(1, t.qty) + range(1, 10);     // 同价加量：失去时间优先级
+                                                            // same price, quantity increased: loses time priority
         } else if (roll < 88) {
             p = limitPrice(t.side);                         // 改价：可能变成主动单而成交
+                                                            // reprice: may become aggressive and trade
             q = randomQty();
         } else {
             if (chance(0.5)) q = range(-3, 0);              // 非法改单（不更新跟踪信息）
+                                                            // invalid modify (tracking info not updated)
             else p = range(-3, 0);
             return Command::modify(t.id, p, q);
         }
@@ -854,7 +943,9 @@ private:
     Price mid_;
     std::uint64_t id_counter_ = 0;
     std::vector<Tracked> tracked_;   // 候选挂单（最旧的在前）
+                                     // candidate resting orders (oldest first)
     std::vector<OrderId> history_;   // 最近结束/撤销/非挂单类订单的 id（环形）
+                                     // ids of recently finished/cancelled/non-resting orders (ring buffer)
     std::size_t history_pos_ = 0;
 };
 
@@ -862,9 +953,11 @@ private:
 
 // ============================================================================
 // 断言宏（失败时报告调用处的文件与行号；期望列表用花括号逐项书写）
+// Assertion macros (failures report the call site's file and line; expected lists are written out in braces)
 // ============================================================================
 
 // CHECK_EVENTS(h.submit(r), accepted(r), trade(...), ...)：完整事件序列必须逐条相等
+// CHECK_EVENTS(h.submit(r), accepted(r), trade(...), ...): the full event sequence must match entry by entry
 #define CHECK_EVENTS(actual, ...)                                                          \
     ::hft::matching::test::checkEvents((actual),                                           \
         std::vector<::hft::matching::test::Event>{__VA_ARGS__}, __FILE__, __LINE__)
@@ -874,6 +967,7 @@ private:
                                        __FILE__, __LINE__)
 
 // CHECK_DEPTH(book, Side::Buy, {100, 5, 1}, {99, 3, 2})：完整深度（最优在前）
+// CHECK_DEPTH(book, Side::Buy, {100, 5, 1}, {99, 3, 2}): the full depth (best first)
 #define CHECK_DEPTH(book, side, ...)                                                       \
     ::hft::matching::test::checkList((book).depth(side),                                   \
         std::vector<::hft::matching::LevelInfo>{__VA_ARGS__}, #book ".depth(" #side ")",    \
@@ -884,6 +978,7 @@ private:
                                      #book ".depth(" #side ")", __FILE__, __LINE__)
 
 // CHECK_ORDERS_AT(book, Side::Sell, 101, infoOf(r1, 2), infoOf(r2))：该价位 FIFO 顺序
+// CHECK_ORDERS_AT(book, Side::Sell, 101, infoOf(r1, 2), infoOf(r2)): FIFO order at that price level
 #define CHECK_ORDERS_AT(book, side, price, ...)                                            \
     ::hft::matching::test::checkList((book).ordersAt(side, price),                         \
         std::vector<::hft::matching::OrderInfo>{__VA_ARGS__},                               \
@@ -895,6 +990,7 @@ private:
         __FILE__, __LINE__)
 
 // CHECK_TOP(book, 100, std::nullopt)：最优买价/卖价（std::nullopt 表示该侧为空）
+// CHECK_TOP(book, 100, std::nullopt): best bid/ask (std::nullopt means that side is empty)
 #define CHECK_TOP(book, bid, ask)                                                          \
     ::hft::matching::test::checkTop((book), (bid), (ask), __FILE__, __LINE__)
 
@@ -907,5 +1003,6 @@ private:
                                       __FILE__, __LINE__)
 
 // CHECK_UNCHANGED(before, book)：与先前的 snapshotOf(book) 完全相同
+// CHECK_UNCHANGED(before, book): exactly the same as the earlier snapshotOf(book)
 #define CHECK_UNCHANGED(before, book)                                                      \
     ::hft::matching::test::checkUnchanged((before), (book), __FILE__, __LINE__)

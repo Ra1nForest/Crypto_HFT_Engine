@@ -3,6 +3,11 @@
 // 离线模拟交易所：Binance / OKX / Bybit 三家的订单簿来自真实的撮合引擎与模拟交易者，按真实协议经 TLS WebSocket 推送
 // （Binance 增量深度 + REST 快照、OKX books 序列号与 checksum、Bybit orderbook snapshot/delta），让监控程序完全离线运行。
 // 用法：./build/mock_exchange [--binance-port N] [--okx-port N] [--bybit-port N] [--duration S] [--seed X] [--help]
+// Offline mock exchange: the order books of the three venues Binance / OKX / Bybit come from real
+// matching engines and simulated traders and are pushed over TLS WebSockets in the real protocols
+// (Binance diff depth + REST snapshot, OKX books sequence numbers and checksum, Bybit orderbook
+// snapshot/delta), so the monitor can run completely offline.
+// Usage: ./build/mock_exchange [--binance-port N] [--okx-port N] [--bybit-port N] [--duration S] [--seed X] [--help]
 //
 
 #include "cli_util.h"
@@ -36,7 +41,9 @@ struct Options {
     MockExchangeOptions ex;
     std::string ca_out = "/tmp/mock_exchange_ca.pem";
     double duration_s = 0.0;          // 0 = 直到 Ctrl+C / SIGTERM
+                                      // 0 = until Ctrl+C / SIGTERM
     double status_interval_s = 5.0;   // 0 = 不打印状态行
+                                      // 0 = no status lines
     bool verbose = false;
 };
 
@@ -87,6 +94,7 @@ bool parseSeconds(const char* text, double& out) {
 }
 
 // 返回 0 = 继续运行，1 = 已打印帮助，2 = 参数错误
+// Returns 0 = keep running, 1 = help printed, 2 = bad arguments
 int parseOptions(int argc, char** argv, Options& o) {
     auto bad = [](const std::string& msg) {
         std::fprintf(stderr, "mock_exchange: %s\n(try --help)\n", msg.c_str());
@@ -140,12 +148,15 @@ int parseOptions(int argc, char** argv, Options& o) {
         }
     }
     // 端口 0（临时端口）可以重复
+    // Port 0 (an ephemeral port) may appear more than once
     const unsigned short b = o.ex.binance_port, k = o.ex.okx_port, y = o.ex.bybit_port;
     if ((b != 0 && (b == k || b == y)) || (k != 0 && k == y)) return bad("the three venues need different ports");
     return 0;
 }
 
 // 连接事件日志：整行一次写出（多个连接线程的输出不会交错）
+// Connection event log: each line is written whole in one go (the output of several connection threads
+// does not interleave)
 void logLine(const std::string& line) {
     static std::mutex mutex;
     const auto now = std::chrono::system_clock::now();
@@ -219,6 +230,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGPIPE, SIG_IGN);  // 写已断开的连接只应返回错误
+                                    // writing to a closed connection should only return an error
     if (o.verbose) o.ex.log = logLine;
 
     std::unique_ptr<MockExchange> ex;

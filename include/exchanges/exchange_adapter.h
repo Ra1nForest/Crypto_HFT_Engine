@@ -1,6 +1,8 @@
 //
 // exchange_adapter.h
 // 交易所协议适配器接口：纯协议状态机（不含网络），由行情 feed 驱动；定义 Exchange 枚举、配置、统计与处理结果。
+// Exchange protocol adapter interface: a pure protocol state machine (no networking) driven by the market
+// data feed; defines the Exchange enum, the configuration, the statistics and the processing result.
 //
 
 #pragma once
@@ -17,9 +19,11 @@
 #include <vector>
 
 // 支持的交易所（从 market_data_feed.h 移到这里；保留旧的全大写拼写）
+// Supported exchanges (moved here from market_data_feed.h; the old all-caps spelling is kept)
 enum class Exchange { BINANCE, OKX, BYBIT };
 
 // 交易所显示名称
+// Display name of an exchange
 inline const char* exchangeName(Exchange exchange) noexcept {
     switch (exchange) {
         case Exchange::BINANCE: return "Binance";
@@ -30,12 +34,18 @@ inline const char* exchangeName(Exchange exchange) noexcept {
 }
 
 // 适配器配置
+// Adapter configuration
 struct AdapterConfig {
     std::string name;            // 显示名称，如 "OKX"
+                                 // display name, e.g. "OKX"
     std::string symbol;          // 交易对显示标签
+                                 // display label of the trading pair
     std::string subscribe_msg;   // 连接后发送的原始订阅 JSON（"" = 不发送）
+                                 // raw subscribe JSON sent after connecting ("" = send nothing)
     bool verify_checksum = true; // 是否校验 OKX books 的 checksum
+                                 // whether to verify the checksum of OKX books
     std::size_t max_buffered_events = 2000; // Binance 同步前事件缓冲上限
+                                            // Binance: maximum number of events buffered before sync
 };
 
 // 适配器统计：普通计数器，只由行情线程写入（feed 每条消息后复制到原子变量供其他线程读取）。
@@ -47,22 +57,49 @@ struct AdapterConfig {
 // - gaps：序列号缺口（含 Binance 同步前缓冲区溢出）；checksum_failures：OKX 校验和不符
 // - resyncs：发起的重同步次数（缺口、校验和不符、交叉簿）；rest_snapshots：成功解析的 REST 快照数
 // - crossed_books：应用更新后出现交叉簿的次数
+// Adapter statistics: plain counters written only by the feed thread (after every message the feed copies
+// them into atomics for other threads to read).
+// Meaning:
+// - messages: onMessage calls; book_updates: messages that changed the book (including rebuilds and
+//   clears caused by a resync)
+// - snapshots: times the book was rebuilt from a snapshot (WS snapshot, Binance partial depth, applied
+//   REST snapshot)
+// - deltas: incremental updates applied (including buffered events replayed after sync)
+// - ignored: valid but irrelevant messages (subscribe acks, pongs, stale/unsynced deltas, etc.);
+//   parse_errors: malformed messages
+// - gaps: sequence number gaps (including a Binance buffer overflow before sync); checksum_failures: OKX
+//   checksum mismatches
+// - resyncs: resyncs initiated (gap, checksum mismatch, crossed book); rest_snapshots: REST snapshots
+//   parsed successfully
+// - crossed_books: times the book was crossed after applying an update
 struct AdapterStats {            // 普通计数器，只由行情线程写入
+                                 // plain counters, written only by the feed thread
     std::uint64_t messages = 0, book_updates = 0, snapshots = 0, deltas = 0, ignored = 0,
                   parse_errors = 0, gaps = 0, checksum_failures = 0, resyncs = 0,
                   rest_snapshots = 0, crossed_books = 0;
 };
 
 // 单条消息的处理结果：feed 复用同一个对象，每条消息前调用 reset()
+// Processing result of a single message: the feed reuses the same object and calls reset() before every
+// message
 struct AdapterResult {           // 每条消息复用；使用前先调用 reset()
+                                 // reused for every message; call reset() before use
     bool book_updated = false;        // 簿发生变化：需要发布快照
+                                      // the book changed: a snapshot must be published
     bool need_rest_snapshot = false;  // feed 需拉取 REST 快照并调用 onRestSnapshot
+                                      // the feed must fetch a REST snapshot and call onRestSnapshot
     bool reconnect = false;           // 断开当前连接并重连
+                                      // drop the current connection and reconnect
     std::vector<std::string> send;    // 需要立即发送的文本帧（如 unsubscribe + subscribe）
+                                      // text frames to send immediately (e.g. unsubscribe + subscribe)
     std::int64_t exchange_ts_ms = 0;  // 本条消息的交易所时间戳（毫秒，无则为 0）
+                                      // exchange timestamp of this message (ms, 0 if none)
     std::string error;                // 可读的问题描述（空 = 无）；本身不是致命错误
+                                      // human-readable problem description (empty = none);
+                                      // not a fatal error by itself
 
     // 清空全部字段（保留 send/error 的容量，不分配内存）
+    // Clears all fields (keeps the capacity of send/error, does not allocate memory)
     void reset() noexcept {
         book_updated = false;
         need_rest_snapshot = false;
@@ -75,6 +112,10 @@ struct AdapterResult {           // 每条消息复用；使用前先调用 rese
 
 // 由订阅消息推导退订消息：把 "op":"subscribe" 换成 "op":"unsubscribe"（冒号两侧允许空白）。
 // 订阅消息里没有这个记号时返回空串（调用方改为重连）。OKX 与 Bybit 共用。
+// Derives the unsubscribe message from the subscribe message: replaces "op":"subscribe" with
+// "op":"unsubscribe" (whitespace is allowed on both sides of the colon).
+// Returns an empty string when the subscribe message lacks this token (the caller reconnects instead).
+// Shared by OKX and Bybit.
 inline std::string makeUnsubscribeMessage(std::string_view subscribe_msg) {
     constexpr std::string_view kOpKey = "\"op\"";
     constexpr std::string_view kSubscribe = "\"subscribe\"";
@@ -111,9 +152,29 @@ inline std::string makeUnsubscribeMessage(std::string_view subscribe_msg) {
 // - 基类持有子类共用的状态：本地簿、同步标志 synced_、JSON 解析器与当前消息的档位暂存、退订帧。
 // - book() 是完整的本地簿（行情线程私有，其他线程不得直接读取；跨线程用 BookSnapshot 传递）。
 // - 统计在适配器的整个生命周期内累计（onConnected 不清零）。
+// Adapter base class (non-virtual interface: the base class implements the public entry points once, and
+// each exchange's protocol logic goes in protected virtual functions):
+// - At the start of every connection the feed calls onConnected() (resets all protocol state and returns
+//   the frames to send, usually the subscribe message), then calls onMessage() once per text message read.
+// - onMessage / onRestSnapshot are non-virtual and never throw: they call the subclass's handleMessage /
+//   handleRestSnapshot inside the same guard layer (runGuarded) and maintain the messages / book_updates
+//   counters in one place. Subclasses report malformed input by calling malformed(), which counts it in
+//   stats().parse_errors; any exception thrown during processing (e.g. out of memory) is caught by the
+//   base class: it is counted in parse_errors, the book and all protocol state are cleared, and a
+//   reconnect is requested. A new exchange therefore need not (and cannot) write this guard again.
+// - Subclasses must implement exchange(), handleMessage(), resetState(); they override as needed
+//   onConnected() (default: reset the state and send the subscribe message), handleRestSnapshot()
+//   (default: ignore), pingMessage() / pingIntervalMs(), trimBook().
+// - The base class holds the state shared by the subclasses: the local book, the sync flag synced_, the
+//   JSON parser and the current message's level scratch buffers, the unsubscribe frame.
+// - book() is the full local book (private to the feed thread, other threads must not read it directly;
+//   across threads it is passed as a BookSnapshot).
+// - Statistics accumulate over the adapter's whole lifetime (onConnected does not reset them).
 class ExchangeAdapter {
 public:
     // 重同步之后持续收到增量却迟迟没有新快照（连续超过这么多条）时要求重连（OKX 与 Bybit，见 ignoreUnsynced）
+    // Requests a reconnect when, after a resync, deltas keep arriving but no new snapshot does (more than
+    // this many in a row) (OKX and Bybit, see ignoreUnsynced)
     static constexpr std::size_t kMaxUnsyncedUpdates = 500;
 
     virtual ~ExchangeAdapter() = default;
@@ -123,6 +184,8 @@ public:
     virtual Exchange exchange() const = 0;
 
     // 新连接：重置全部协议状态，返回要发送的帧（默认：配置了订阅消息就发送它；Binance 通过 URL 路径订阅，通常为空）
+    // New connection: resets all protocol state and returns the frames to send (default: the subscribe
+    // message if one is configured; Binance subscribes via the URL path, so it is usually empty)
     virtual std::vector<std::string> onConnected() {
         reset();
         std::vector<std::string> frames;
@@ -131,39 +194,54 @@ public:
     }
 
     // 一条 WebSocket 文本消息
+    // One WebSocket text message
     void onMessage(std::string_view payload, AdapterResult& out) noexcept {
         ++stats_.messages;
         runGuarded(out, [&] { handleMessage(payload, out); });
     }
 
     // REST 快照响应体（feed 在 need_rest_snapshot 后调用；只有 Binance 增量深度模式需要，其他交易所忽略）
+    // REST snapshot response body (the feed calls this after need_rest_snapshot; only Binance's incremental
+    // depth mode needs it, other exchanges ignore it)
     void onRestSnapshot(std::string_view body, AdapterResult& out) noexcept {
         runGuarded(out, [&] { handleRestSnapshot(body, out); });
     }
 
     virtual std::string pingMessage() const { return std::string(); }  // 应用层心跳消息（"" = 无）
+                                                                       // application-level heartbeat message
+                                                                       // ("" = none)
     virtual int pingIntervalMs() const { return 0; }                    // 心跳间隔毫秒（0 = 无）
+                                                                        // heartbeat interval in ms (0 = none)
 
     bool synced() const noexcept { return synced_; }            // 本地簿已与交易所同步
+                                                                // the local book is in sync with the exchange
     const OrderBook& book() const noexcept { return book_; }    // 完整本地簿（行情线程私有）
+                                                                // full local book (private to the feed thread)
     const AdapterStats& stats() const noexcept { return stats_; }
     const AdapterConfig& config() const noexcept { return cfg_; }
     // 由订阅消息推导出的退订帧（"" = 推导不出：重同步改为重连）
+    // Unsubscribe frame derived from the subscribe message ("" = cannot be derived: a resync reconnects
+    // instead)
     const std::string& unsubscribeMessage() const noexcept { return unsubscribe_msg_; }
 
 protected:
     explicit ExchangeAdapter(AdapterConfig cfg)
         : cfg_(std::move(cfg)), unsubscribe_msg_(makeUnsubscribeMessage(cfg_.subscribe_msg)) {
         // 与旧 feed 的约定一致：簿标签为 "<name>:<symbol>"
+        // Same convention as the old feed: the book label is "<name>:<symbol>"
         book_.setSymbol(cfg_.name + ":" + cfg_.symbol);
     }
 
     // ---------------- 子类实现的协议逻辑 ----------------
+    // ---------------- Protocol logic implemented by subclasses ----------------
 
     // 处理一条消息。可以抛异常（由 onMessage 捕获并按内部错误处理）；格式错误用 malformed() 报告
+    // Handles one message. May throw (caught by onMessage and handled as an internal error); report malformed
+    // input with malformed()
     virtual void handleMessage(std::string_view payload, AdapterResult& out) = 0;
 
     // 处理 REST 快照响应体（默认：忽略）。异常处理同 handleMessage
+    // Handles a REST snapshot response body (default: ignore). Exceptions are handled as for handleMessage
     virtual void handleRestSnapshot(std::string_view body, AdapterResult& out) {
         (void)body;
         (void)out;
@@ -171,16 +249,27 @@ protected:
 
     // 重置子类自己的协议状态（丢弃缓冲、序列号等）；簿、synced_ 与未同步计数由基类同时清空。
     // onConnected()、dropBook() 与内部错误时调用
+    // Resets the subclass's own protocol state (drops buffers, sequence numbers, etc.); the base class clears
+    // the book, synced_ and the unsynced counter at the same time.
+    // Called by onConnected(), dropBook() and on internal errors
     virtual void resetState() noexcept = 0;
 
     // 每侧只保留最优的 kMaxBookLevels 档：增量协议会不断带来快照范围之外的远端档位。
     // 子类可扩展（OKX 同步删除被裁掉档位的原始字符串），扩展时最后调用 ExchangeAdapter::trimBook()
+    // Keeps only the best kMaxBookLevels levels per side: incremental protocols keep bringing in distant
+    // levels outside the snapshot's range.
+    // Subclasses may extend it (OKX also deletes the original strings of trimmed levels); an extension calls
+    // ExchangeAdapter::trimBook() last
     virtual void trimBook() { book_.truncate(adapter_detail::kMaxBookLevels); }
 
     // ---------------- 子类共用的辅助 ----------------
+    // ---------------- Helpers shared by subclasses ----------------
 
     // 用两侧档位整体替换簿：逐档 upsert（数量为 0 的跳过，同价以后出现者为准，快照有序时每档走尾部快路径）
     // 后裁剪；更新号归零
+    // Replaces the whole book with the levels of both sides: upserts level by level (zero quantities are
+    // skipped, the later one wins for the same price, and a sorted snapshot takes the tail fast path for
+    // every level), then trims; the update id is reset to zero
     void replaceBook(const adapter_detail::RawLevel* bids, std::size_t nb, const adapter_detail::RawLevel* asks,
                      std::size_t na) {
         book_.clear();
@@ -191,6 +280,8 @@ protected:
 
     // 应用一条增量的两侧后裁剪；返回簿是否变化。一条增量常有上百档变化：批量排序 + 归并，
     // 避免逐档 memmove（见 OrderBook::applyLevels）
+    // Applies both sides of one delta, then trims; returns whether the book changed. A single delta often
+    // changes hundreds of levels: batch sort + merge avoids a memmove per level (see OrderBook::applyLevels)
     template <class Level>
     bool updateBook(const Level* bids, std::size_t nb, const Level* asks, std::size_t na) {
         bool changed = book_.applyLevels(BookSide::Bid, bids, nb, batch_);
@@ -200,12 +291,16 @@ protected:
     }
 
     // 丢弃本地簿与全部协议状态；簿原本非空时置 book_updated（消费者随之看到空簿）
+    // Drops the local book and all protocol state; sets book_updated if the book was non-empty (consumers
+    // then see an empty book)
     void dropBook(AdapterResult& out) noexcept {
         if (!book_.empty()) out.book_updated = true;
         reset();
     }
 
     // 未同步时收到的增量：忽略；重同步之后迟迟没有新快照（连续超过 kMaxUnsyncedUpdates 条）时要求重连
+    // Delta received while unsynced: ignored; if no new snapshot arrives for too long after a resync (more
+    // than kMaxUnsyncedUpdates in a row), requests a reconnect
     void ignoreUnsynced(AdapterResult& out) {
         ++stats_.ignored;
         if (++unsynced_updates_ <= kMaxUnsyncedUpdates) return;
@@ -215,6 +310,7 @@ protected:
     }
 
     // 格式错误：parse_errors++，error = "<交易所>: <what> (<bytes> bytes)"
+    // Malformed input: parse_errors++, error = "<exchange>: <what> (<bytes> bytes)"
     void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
         ++stats_.parse_errors;
         out.error =
@@ -223,6 +319,9 @@ protected:
 
     // 重同步时重新订阅：send = {unsubscribe, subscribe}（同一条消息里已安排过就不重复）；
     // 没有订阅消息或推导不出退订帧时改为要求重连
+    // Resubscribes on a resync: send = {unsubscribe, subscribe} (not repeated if already scheduled in the same
+    // message); when there is no subscribe message or no unsubscribe frame can be derived, requests a
+    // reconnect instead
     void requestResubscribe(AdapterResult& out) {
         if (cfg_.subscribe_msg.empty() || unsubscribe_msg_.empty()) {
             out.reconnect = true;
@@ -236,15 +335,23 @@ protected:
 
     OrderBook book_;
     LevelBatchScratch batch_;                     // book_.applyLevels 的工作区（增量消息批量应用，稳态零分配）
+                                                  // scratch space for book_.applyLevels (batched application
+                                                  // of deltas, zero allocations in steady state)
     AdapterStats stats_;
     AdapterConfig cfg_;
     adapter_detail::JsonReader reader_;           // 各子类 parse() 共用的 JSON 解析器
+                                                  // JSON parser shared by the parse() of every subclass
     std::vector<adapter_detail::RawLevel> bids_;  // 当前消息的买档暂存（OKX 多个条目时按条目顺序连续存放）
+                                                  // bid level scratch for the current message (several OKX
+                                                  // entries are stored contiguously in entry order)
     std::vector<adapter_detail::RawLevel> asks_;  // 当前消息的卖档暂存
+                                                  // ask level scratch for the current message
     bool synced_ = false;                         // 本地簿已与交易所同步
+                                                  // the local book is in sync with the exchange
 
 private:
     // 清空簿、同步状态与未同步计数，再重置子类的协议状态
+    // Clears the book, the sync state and the unsynced counter, then resets the subclass's protocol state
     void reset() noexcept {
         book_.clear();
         synced_ = false;
@@ -253,6 +360,8 @@ private:
     }
 
     // onMessage / onRestSnapshot 共用的保护层：任何异常都转为 internalError；之后若簿有变化则 book_updates++
+    // Guard layer shared by onMessage / onRestSnapshot: any exception becomes an internalError; afterwards
+    // book_updates++ if the book changed
     template <class Body>
     void runGuarded(AdapterResult& out, Body&& body) noexcept {
         try {
@@ -266,6 +375,8 @@ private:
     }
 
     // 内部异常（如内存不足）：状态可能不一致，清空一切并要求重连
+    // Internal exception (e.g. out of memory): the state may be inconsistent, so clear everything and request
+    // a reconnect
     void internalError(AdapterResult& out, const char* what) noexcept {
         ++stats_.parse_errors;
         dropBook(out);
@@ -277,5 +388,8 @@ private:
     }
 
     std::string unsubscribe_msg_;       // 由订阅消息推导出的退订帧（"" = 推导不出）
+                                        // unsubscribe frame derived from the subscribe message
+                                        // ("" = cannot be derived)
     std::size_t unsynced_updates_ = 0;  // 未同步期间连续收到的增量条数（见 ignoreUnsynced）
+                                        // deltas received in a row while unsynced (see ignoreUnsynced)
 };

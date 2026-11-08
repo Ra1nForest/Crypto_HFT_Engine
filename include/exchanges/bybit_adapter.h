@@ -1,6 +1,8 @@
 //
 // bybit_adapter.h
 // Bybit v5 现货深度适配器：orderbook.{depth}.{symbol} 的 snapshot/delta 按更新号 u 衔接，缺口时退订 + 重订阅。
+// Bybit v5 spot depth adapter: orderbook.{depth}.{symbol} snapshots/deltas are chained by the update id u;
+// on a gap, unsubscribe + resubscribe.
 //
 
 #pragma once
@@ -18,6 +20,11 @@
 // 消息类型：
 // - {"success":true,"ret_msg":"subscribe",...,"op":"subscribe"} → 忽略；"success":false → error。
 //   pong（现货 {"op":"pong",...}；合约 {"success":true,"ret_msg":"pong",...}）→ 忽略。
+// Spot public channel wss://stream.bybit.com:443/v5/public/spot, subscription
+// {"op":"subscribe","args":["orderbook.50.BTCUSDT"]}.
+// Message types:
+// - {"success":true,"ret_msg":"subscribe",...,"op":"subscribe"} → ignore; "success":false → error.
+//   pong (spot {"op":"pong",...}; derivatives {"success":true,"ret_msg":"pong",...}) → ignore.
 // - {"topic":"orderbook.50.BTCUSDT","type":"snapshot","ts":ms,"data":{"s":..,"b":[[p,q]],"a":[[p,q]],"u":N,"seq":S}}
 //   → 替换整簿，last_u = u（即 book().getUpdateId()），已同步。
 // - "type":"delta" → 未同步时忽略；u == 1 视为快照（服务重启，按文档覆盖本地簿）；u <= last_u 忽略（过期）；
@@ -28,6 +35,20 @@
 //   快照后第一条 delta 正常衔接、或由其他原因触发的重同步，都会把连续计数清零。
 // - 应用每条更新（含快照）后若簿交叉 → crossed_books++，按缺口方式重同步。
 // - 重同步之后若持续收到 delta 却迟迟没有新快照（超过 kMaxUnsyncedUpdates 条），要求重连。
+// - "type":"snapshot" → replace the whole book, last_u = u (i.e. book().getUpdateId()), synced.
+// - "type":"delta" → ignore while unsynced; u == 1 is treated as a snapshot (service restart: overwrite the
+//   local book, as documented); u <= last_u → ignore (stale);
+//   u != last_u + 1 → gap: gaps++, resyncs++, clear, unsynced, send = {unsubscribe, subscribe};
+//   otherwise upsert level by level (size "0" deletes), last_u = u. exchange_ts_ms = top-level ts.
+// - Safety valve: the docs only say u "is a sequence" and do not guarantee strict +1 on spot. If 3 resyncs
+//   in a row were all triggered by "the first delta after a new snapshot", the strict +1 check is turned
+//   off (error is set only once); the stale check and the crossed-book check stay.
+//   A first delta after a snapshot that chains correctly, or a resync triggered by anything else, resets
+//   the streak.
+// - If the book is crossed after applying any update (snapshots included) → crossed_books++, resync as for
+//   a gap.
+// - If deltas keep arriving after a resync but no new snapshot shows up (more than kMaxUnsyncedUpdates of
+//   them), request a reconnect.
 class BybitAdapter final : public ExchangeAdapter {
 public:
     static constexpr int kStrictCheckStrikes = 3;
@@ -44,6 +65,7 @@ public:
     int pingIntervalMs() const override { return 20000; }
 
     // ---------------- 诊断（测试用） ----------------
+    // ---------------- Diagnostics (for tests) ----------------
     bool strictSequence() const noexcept { return strict_; }
     std::uint64_t lastUpdateId() const noexcept { return book_.getUpdateId(); }
 
@@ -70,8 +92,11 @@ private:
     };
 
     // ---------------- 解析 ----------------
+    // ---------------- Parsing ----------------
 
     // 单遍解析整条消息（档位写入 bids_ / asks_）；JSON 错误、根不是对象、尾随内容、重复的关键字段都返回 false
+    // Parse the whole message in a single pass (levels go into bids_ / asks_); JSON errors, a root that is
+    // not an object, trailing content and duplicate relevant fields all return false
     bool parse(std::string_view payload, Msg& m) {
         using namespace adapter_detail;
         bids_.clear();
@@ -85,6 +110,7 @@ private:
             const std::string_view key = field.escaped_key();
             od::value& v = field.value();
             bool ok = true;  // cts / conn_id / req_id / args 等无关字段不读取
+                             // irrelevant fields such as cts / conn_id / req_id / args are not read
             if (key == "topic") ok = firstSeen(m.seen, kTopic) && readString(v, m.topic);
             else if (key == "type") ok = firstSeen(m.seen, kType) && readString(v, m.type);
             else if (key == "ts") ok = firstSeen(m.seen, kTs) && readInt(v, m.ts);
@@ -98,6 +124,8 @@ private:
     }
 
     // data 对象。已知是其他主题（Bybit 总是先发 topic）：data 的形状可能完全不同，不解析，迭代器自动跳过
+    // The data object. If it is already known to belong to another topic (Bybit always sends topic first),
+    // data may have an entirely different shape, so it is not parsed and the iterator skips it automatically
     bool parseData(adapter_detail::od::value& v, Msg& m) {
         using namespace adapter_detail;
         if ((m.seen & kTopic) != 0 && !isOrderbookTopic(m.topic)) return true;
@@ -109,6 +137,7 @@ private:
             const std::string_view key = field.escaped_key();
             od::value& fv = field.value();
             bool ok = true;  // s / seq 等
+                             // s / seq, etc.
             if (key == "b") ok = firstSeen(m.seen, kBids) && parseLevels(fv, bids_);
             else if (key == "a") ok = firstSeen(m.seen, kAsks) && parseLevels(fv, asks_);
             else if (key == "u") ok = firstSeen(m.seen, kUpdateId) && readInt(fv, m.u);
@@ -120,12 +149,14 @@ private:
     static bool isOrderbookTopic(std::string_view topic) noexcept { return topic.substr(0, 10) == "orderbook."; }
 
     // ---------------- 处理 ----------------
+    // ---------------- Processing ----------------
 
     void handleMessage(std::string_view payload, AdapterResult& out) override {
         Msg m;
         if (!parse(payload, m)) return malformed(out, "malformed message", payload.size());
         if ((m.seen & kSuccess) != 0) {
             ++stats_.ignored;  // 订阅/退订回执、合约 pong
+                               // subscribe/unsubscribe acks, derivatives pong
             if (!m.success) {
                 out.error = adapter_detail::concat({"Bybit ", m.op.empty() ? std::string_view("request") : m.op,
                                                     " failed: ", m.ret_msg});
@@ -135,6 +166,7 @@ private:
         if ((m.seen & kTopic) == 0) {
             if ((m.seen & kData) != 0) return malformed(out, "data without topic", payload.size());
             ++stats_.ignored;  // 现货 pong {"op":"pong",...} 等
+                               // spot pong {"op":"pong",...}, etc.
             return;
         }
         if (!isOrderbookTopic(m.topic)) {
@@ -166,6 +198,7 @@ private:
     void applyDelta(std::uint64_t u, AdapterResult& out) {
         if (!synced_) return ignoreUnsynced(out);
         if (u == 1) return applySnapshot(u, out);  // 服务重启：这条 delta 实际是完整快照
+                                                   // service restart: this delta is actually a full snapshot
         const std::uint64_t last_u = book_.getUpdateId();
         if (u <= last_u) {
             ++stats_.ignored;
@@ -188,6 +221,7 @@ private:
         const bool changed = updateBook(bids_.data(), bids_.size(), asks_.data(), asks_.size());
         book_.setUpdateId(u);
         if (first_delta_) streak_ = 0;  // 快照后第一条 delta 正常衔接
+                                        // the first delta after the snapshot chained correctly
         first_delta_ = false;
         ++stats_.deltas;
         if (changed) out.book_updated = true;
@@ -195,6 +229,8 @@ private:
     }
 
     // 应用更新后簿交叉 → crossed_books++，按缺口方式重同步（不算"快照后第一条 delta 的缺口"，连续计数清零）
+    // Book crossed after applying an update → crossed_books++, resync as for a gap (it does not count as a
+    // "gap on the first delta after a snapshot": the streak is reset)
     void resyncIfCrossed(AdapterResult& out, const char* error) {
         if (!book_.isCrossed()) return;
         ++stats_.crossed_books;
@@ -204,6 +240,8 @@ private:
     }
 
     // 重同步：清空簿并发送 unsubscribe + subscribe（推导不出退订帧时要求重连）
+    // Resync: clear the book and send unsubscribe + subscribe (request a reconnect if no unsubscribe frame can
+    // be derived)
     void resync(AdapterResult& out) {
         ++stats_.resyncs;
         dropBook(out);
@@ -211,9 +249,14 @@ private:
     }
 
     // 只有快照能让适配器进入已同步状态（并设置 first_delta_），因此没有需要在这里清除的协议状态
+    // Only a snapshot can put the adapter into the synced state (and set first_delta_), so there is no
+    // protocol state to clear here
     void resetState() noexcept override {}
 
     bool first_delta_ = false;  // 下一条被应用的 delta 是最近一次快照之后的第一条
+                                // the next applied delta is the first one after the latest snapshot
     int streak_ = 0;            // 连续"快照后第一条 delta 即缺口"的重同步次数
+                                // number of consecutive resyncs where "the first delta after a snapshot is a gap"
     bool strict_ = true;        // 严格 +1 检查（安全阀触发后永久关闭）
+                                // strict +1 check (permanently off once the safety valve trips)
 };

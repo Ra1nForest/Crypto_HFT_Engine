@@ -2,6 +2,9 @@
 // config.h
 // 配置加载：从 JSON 逐字段读取交易所 / 套利 / 显示 / 连接配置；缺失、类型错误或越界的字段回退到该字段的默认值
 // （或钳制到合法范围）并给出指明字段的告警。
+// Config loading: reads the venue / arbitrage / display / connection config from JSON field by field;
+// a missing, mistyped or out-of-range field falls back to that field's default (or is clamped to the
+// valid range) with a warning that names the field.
 //
 
 #pragma once
@@ -30,55 +33,87 @@
 #include <vector>
 
 // 单个交易所（venue）的连接配置
+// Connection config of a single exchange (venue)
 struct VenueConfig {
     Exchange exchange = Exchange::BINANCE;
     std::string key;             // JSON 中的键："binance" / "okx" / "bybit"
+                                 // key in the JSON: "binance" / "okx" / "bybit"
     std::string name;            // 显示名称："Binance" / "OKX" / "Bybit"
+                                 // display name: "Binance" / "OKX" / "Bybit"
     bool enabled = true;
     std::string host, port, path;
     std::string symbol;          // 只是显示标签：真正订阅的品种来自 path（Binance）或 subscribe（OKX / Bybit）
+                                 // only a display label: the instrument actually subscribed comes
+                                 // from path (Binance) or subscribe (OKX / Bybit)
     std::string subscribe_msg;   // 连接后发送的订阅 JSON（Binance 通过 URL 路径订阅，默认为空，可选）
+                                 // subscription JSON sent after connecting (Binance subscribes via
+                                 // the URL path: empty by default, optional)
     std::string rest_host, rest_port = "443", snapshot_path;  // 只有 Binance 增量深度（@depth）需要 REST 快照
+                                                              // only Binance diff depth (@depth) needs a REST snapshot
     std::optional<double> fee_rate;  // 该交易所的单边手续费，覆盖全局 arbitrage.fee_rate（可选）
+                                     // this venue's per-side fee, overrides the global arbitrage.fee_rate (optional)
 };
 
 // 套利参数
+// Arbitrage parameters
 struct ArbitrageConfig {
     double fee_rate = 0.001;   // 全局单边手续费（taker），0.001 = 0.1%
+                               // global per-side fee (taker), 0.001 = 0.1%
     double min_profit = 0.01;  // 触发信号的最小净利润（报价货币）
+                               // minimum net profit that triggers a signal (in the quote currency)
     double max_qty = 0.0;      // 单次扫单的数量上限（0 = 不限）
+                               // quantity cap of a single sweep (0 = unlimited)
     int max_levels = 20;       // 扫单时每侧最多走的档位数
+                               // maximum number of levels walked per side in a sweep
 };
 
 // 终端显示参数
+// Terminal display parameters
 struct DisplayConfig {
     int refresh_ms = 200;          // 刷新周期（同时是 checkHealth 的周期）
+                                   // refresh period (also the checkHealth period)
     int levels = 5;                // 每个订单簿显示的档位数
+                                   // number of levels shown per order book
     int spread_log_interval = 50;  // 每这么多次刷新写一次价差日志（次数，不是时间）
+                                   // log the spreads once every this many refreshes (a count, not a time)
 };
 
 // 连接参数（对所有交易所生效）
+// Connection parameters (apply to all venues)
 struct ConnectionConfig {
     bool tls_verify = true;          // 校验证书链与主机名
+                                     // verify the certificate chain and the host name
     std::string ca_file;             // 额外信任的 CA（PEM）；"" = 只用系统 CA（离线模拟交易所演示用）
+                                     // additionally trusted CA (PEM), used by the offline mock
+                                     // exchange demo; "" = system CAs only
     int stall_timeout_ms = 15000;    // 已连接但这么久没有收到任何帧（含心跳回应）→ 踢断重连
+                                     // connected but no frame received for this long (including
+                                     // heartbeat replies) → kick and reconnect
     int reconnect_initial_ms = 500;  // 指数退避初始值
+                                     // initial value of the exponential backoff
     int reconnect_max_ms = 30000;    // 指数退避上限
+                                     // cap of the exponential backoff
 };
 
 // 应用配置汇总
+// Aggregate application config
 struct AppConfig {
     std::vector<VenueConfig> venues;     // 固定顺序：Binance, OKX, Bybit（各自带 enabled）
+                                         // fixed order: Binance, OKX, Bybit (each with its own enabled)
     ArbitrageConfig arbitrage;
     DisplayConfig display;
     ConnectionConfig connection;
     std::vector<std::string> warnings;   // 每条是完整的一行，形如 "[Config] okx.port: ..."
+                                         // each one a complete line, like "[Config] okx.port: ..."
     std::string source;                  // 实际读取的文件；"" = 内置默认值
+                                         // the file actually read; "" = built-in defaults
 
     // 某交易所生效的手续费：单独配置的优先，否则用全局值
+    // Effective fee of a venue: its own setting takes precedence, otherwise the global value
     double feeRate(const VenueConfig& v) const { return v.fee_rate ? *v.fee_rate : arbitrage.fee_rate; }
 
     // 已启用的交易所（保持固定顺序）
+    // Enabled venues (in the fixed order)
     std::vector<const VenueConfig*> enabledVenues() const {
         std::vector<const VenueConfig*> out;
         for (const VenueConfig& v : venues) {
@@ -94,6 +129,7 @@ using simdjson::dom::element;
 using simdjson::dom::object;
 
 // double 的最短往返表示（0.001 → "0.001"）
+// Shortest round-trip representation of a double (0.001 → "0.001")
 inline std::string formatNumber(double v) {
     char buf[64];
     const auto r = std::to_chars(buf, buf + sizeof(buf), v);
@@ -104,11 +140,14 @@ inline std::string formatNumber(double v) {
 inline std::string quote(const std::string& s) { return "\"" + s + "\""; }
 
 // 一条告警："[Config] <field>: <message>"
+// One warning: "[Config] <field>: <message>"
 inline void addWarning(std::vector<std::string>& warnings, const std::string& field, const std::string& message) {
     warnings.push_back("[Config] " + field + ": " + message);
 }
 
 // 只保留字母数字并转大写："BTC-USDT" / "btcusdt@depth" 中的 "BTCUSDT" 可以直接比较
+// Keeps only letters and digits, upper-cased: the "BTCUSDT" in "BTC-USDT" / "btcusdt@depth" can then be
+// compared directly
 inline std::string normalizeSymbol(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -120,6 +159,7 @@ inline std::string normalizeSymbol(std::string_view s) {
 }
 
 // 端口：1-65535 的十进制数字串
+// Port: a decimal digit string in 1-65535
 inline bool validPort(std::string_view s) {
     if (s.empty() || s.size() > 5) return false;
     unsigned value = 0;
@@ -129,6 +169,9 @@ inline bool validPort(std::string_view s) {
 
 // 主机名：不含空白 / 控制字符与 '/'（常见错误是写成 URL，如 "wss://ws.okx.com/ws"）。
 // 允许 ':'，以便使用 IPv6 字面量。
+// Host name: no whitespace / control characters and no '/' (a common mistake is writing a URL, e.g.
+// "wss://ws.okx.com/ws").
+// ':' is allowed so that IPv6 literals can be used.
 inline bool validHost(std::string_view s) {
     if (s.empty()) return false;
     for (char c : s) {
@@ -139,6 +182,8 @@ inline bool validHost(std::string_view s) {
 }
 
 // Binance 路径是否订阅了增量深度流（"@depth" 后面不是档位数字；"@depth20" 是部分深度快照流）
+// Whether a Binance path subscribes to the diff depth stream ("@depth" not followed by a level-count
+// digit; "@depth20" is a partial depth snapshot stream)
 inline bool isBinanceDiffDepthPath(std::string_view path) {
     constexpr std::string_view kToken = "@depth";
     for (std::size_t pos = path.find(kToken); pos != std::string_view::npos; pos = path.find(kToken, pos + 1)) {
@@ -151,6 +196,11 @@ inline bool isBinanceDiffDepthPath(std::string_view path) {
 // 一个配置块（顶层对象的子对象，如 "display"）的逐字段读取器。构造时取出该块：缺失或不是对象时告警一次
 // （整块用默认值），operator bool 为 false。每个读取函数在字段缺失 / 类型错误 / 校验失败时保留默认值
 // （或钳制到合法范围）并记录一条告警 "[Config] <块>.<键>: ..."。value 参数进来时就是默认值。
+// Field-by-field reader for one config block (a child of the top-level object, e.g. "display"). The
+// constructor looks up the block: if it is missing or not an object, it warns once (the whole block
+// keeps its defaults) and operator bool is false. On a missing field / wrong type / failed validation,
+// each read function keeps the default (or clamps to the valid range) and records a warning
+// "[Config] <block>.<key>: ...". The value parameter holds the default on entry.
 class FieldReader {
 public:
     static constexpr double kMaxFeeRate = 0.1;
@@ -181,6 +231,8 @@ public:
     }
 
     // 字符串。required = false 时缺失不告警；allow_empty = false 时空串告警并用默认值
+    // String. With required = false a missing field does not warn; with allow_empty = false an empty string
+    // warns and the default is used
     void readString(const char* key, std::string& value, bool required = true, bool allow_empty = false) {
         const std::string def = quote(value);
         element el;
@@ -192,6 +244,7 @@ public:
     }
 
     // URL 路径：非空且以 '/' 开头
+    // URL path: non-empty and starting with '/'
     void readPath(const char* key, std::string& value) {
         readChecked(key, value, true, false, [](const std::string& s) {
             return s.front() == '/' ? std::string() : quote(s) + " must start with '/'";
@@ -199,6 +252,7 @@ public:
     }
 
     // 主机名（见 validHost）。allow_empty：空串合法（如可选的 rest_host）
+    // Host name (see validHost). allow_empty: the empty string is valid (e.g. the optional rest_host)
     void readHost(const char* key, std::string& value, bool allow_empty = false) {
         readChecked(key, value, true, allow_empty, [](const std::string& s) {
             return validHost(s) ? std::string()
@@ -208,9 +262,13 @@ public:
 
     // 订阅消息（键 "subscribe"）：必须是合法 JSON（拼写错误时交易所会静默不推送数据，所以在这里拦住）。
     // required = false 时可以缺失或为空
+    // Subscription message (key "subscribe"): must be valid JSON (with a typo the exchange silently pushes
+    // no data, so it is caught here).
+    // With required = false it may be missing or empty
     void readSubscribe(std::string& value, bool required) {
         readChecked("subscribe", value, required, !required, [](const std::string& s) {
             simdjson::dom::parser check;  // 独立的解析器：不能使配置文档的元素失效
+                                          // a separate parser: must not invalidate the config document's elements
             const simdjson::padded_string padded(s);
             element el;
             return check.parse(padded).get(el) == simdjson::SUCCESS ? std::string() : std::string("is not valid JSON");
@@ -218,6 +276,7 @@ public:
     }
 
     // 端口：JSON 字符串或整数，取值 1-65535
+    // Port: a JSON string or integer, value 1-65535
     void readPort(const char* key, std::string& value) {
         const std::string def = quote(value);
         element el;
@@ -237,6 +296,8 @@ public:
     }
 
     // 数字，钳制到 [lo, hi]（hi 为 double 最大值时显示为 inf）。int 字段也接受值为整数的小数（如 200.0），拒绝 2.5
+    // Number, clamped to [lo, hi] (hi is shown as inf when it is the maximum double). int fields also
+    // accept decimals whose value is an integer (e.g. 200.0), but reject 2.5
     template <class T>
     void readNumber(const char* key, T& value, T lo, T hi) {
         constexpr bool kInt = std::is_integral_v<T>;
@@ -248,6 +309,7 @@ public:
         }
         element el;
         double d = 0.0;  // get_double 也接受 JSON 整数（int64 / uint64 换算成 double）
+                         // get_double also accepts JSON integers (int64 / uint64 converted to double)
         if (!find(key, el, def)) return;
         if (el.get_double().get(d) != simdjson::SUCCESS || (kInt && d != std::floor(d))) {
             return reject(key, kInt ? "expected an integer" : "expected a number", def);
@@ -266,6 +328,10 @@ public:
     // 手续费（键 "fee_rate"）：[0, 0.1)。负数钳制为 0；>= 0.1（10%）几乎一定是单位写错（0.001 = 0.1%），
     // 上界是开区间无法钳制到边界，改用 fallback 描述的值（如 "default 0.001" 或 "the global fee_rate"）。
     // 返回读到的可用值；缺失（required 时告警）或不可用时返回 nullopt。
+    // Fee (key "fee_rate"): [0, 0.1). A negative value is clamped to 0; >= 0.1 (10%) is almost certainly
+    // a unit mistake (0.001 = 0.1%), and since the upper bound is open it cannot be clamped to the bound,
+    // so the value described by fallback is used instead (e.g. "default 0.001" or "the global fee_rate").
+    // Returns the usable value read; returns nullopt when missing (warns if required) or unusable.
     std::optional<double> readFeeRate(bool required, const std::string& fallback) {
         element el;
         double d = 0.0;
@@ -291,11 +357,13 @@ public:
 
 private:
     // 字段不可用："<problem>, using default <def>"（def 是默认值的显示形式）
+    // Field unusable: "<problem>, using default <def>" (def is the display form of the default)
     void reject(const char* key, const std::string& problem, const std::string& def) {
         warn(key, problem + ", using default " + def);
     }
 
     // 查找字段；缺失时（required）告警 "missing, using default <def>"
+    // Looks up the field; when missing (and required) warns "missing, using default <def>"
     bool find(const char* key, element& el, const std::string& def, bool required = true) {
         if (o_.at_key(key).get(el) == simdjson::SUCCESS) return true;
         if (required) warn(key, "missing, using default " + def);
@@ -303,6 +371,8 @@ private:
     }
 
     // 字符串字段，取值变化且非空时再校验：check 返回问题描述（空串 = 通过），不通过时保留默认值
+    // String field, additionally validated when the value changed and is non-empty: check returns a
+    // description of the problem (empty string = passed); on failure the default is kept
     template <class Check>
     void readChecked(const char* key, std::string& value, bool required, bool allow_empty, Check check) {
         std::string candidate = value;
@@ -333,16 +403,39 @@ private:
 //   各交易所的 symbol 是否相同（不同则套利比较的是不同品种），Binance 增量深度流是否配置了 REST 快照。
 // - 默认值 = 仓库里的 config.json，只有全局 fee_rate 的默认值是 0.001（config.json 里是 0.0）。
 // - 告警按读取顺序排列：各交易所（固定顺序，块内按字段）、arbitrage、display、connection，最后是一致性检查。
+// Config reader:
+// - Field-by-field loading: a missing or mistyped field falls back to that field's default with a
+//   warning (the warning names the field, e.g.
+//   "[Config] okx.port: expected string or integer, using default \"8443\""); a whole missing block
+//   warns only once.
+// - Out-of-range numbers are clamped to the valid range with a warning (see the kMin* / kMax* constants
+//   below); for the fee_rate rules see FieldReader::readFeeRate.
+// - File unreadable / not valid JSON / top level not an object → all defaults, with a warning. Unknown
+//   keys are silently ignored.
+// - Each venue's enabled takes effect (for a disabled venue the other fields are neither read nor warned
+//   about); the optional per-venue fee_rate overrides the global one; port / rest_port may be a string or
+//   an integer; host must not be written as a URL.
+// - Consistency checks (warnings only, values unchanged): whether an enabled venue's symbol appears in
+//   the path / subscribe it actually subscribes with, whether all venues have the same symbol (otherwise
+//   the arbitrage compares different instruments), and whether the Binance diff depth stream has a REST
+//   snapshot configured.
+// - Defaults = the repository's config.json, except that the global fee_rate defaults to 0.001 (it is
+//   0.0 in config.json).
+// - Warnings are in reading order: the venues (fixed order, by field within a block), arbitrage,
+//   display, connection, and finally the consistency checks.
 class ConfigReader {
 public:
     static constexpr int kMinRefreshMs = 10, kMaxRefreshMs = 10000;
     static constexpr int kMinLevels = 1, kMaxLevels = BookSnapshot::kMaxLevels;
     static constexpr int kMinSpreadLogInterval = 1, kMaxSpreadLogInterval = 1000000;
     static constexpr int kMinMaxLevels = 1, kMaxMaxLevels = BookSnapshot::kMaxLevels;  // 快照每侧最多 20 档
+                                                                                       // at most 20 levels per side
+                                                                                       // in a snapshot
     static constexpr int kMinStallTimeoutMs = 1000, kMaxStallTimeoutMs = 3600000;
     static constexpr int kMinReconnectMs = 10, kMaxReconnectMs = 600000;
 
     // 读取并解析配置文件。print = true 时调用 printReport()。
+    // Reads and parses the config file. Calls printReport() when print = true.
     static AppConfig load(const std::string& filepath, bool print = true) {
         AppConfig config;
         std::string text;
@@ -358,6 +451,8 @@ public:
     }
 
     // 成功读到文件时在 stdout 打印 "[Config] Loaded: <path>"；告警逐行写到 stderr；最后在 stdout 打印一行摘要
+    // Prints "[Config] Loaded: <path>" to stdout when the file was read successfully; writes the warnings to
+    // stderr one per line; finally prints a one-line summary to stdout
     static void printReport(const AppConfig& config) {
         if (!config.source.empty()) std::cout << "[Config] Loaded: " << config.source << std::endl;
         for (const std::string& w : config.warnings) std::cerr << w << std::endl;
@@ -365,6 +460,8 @@ public:
     }
 
     // 从 JSON 文本解析（不打印）。source 用于告警文本，并在解析成功时记入 AppConfig::source。
+    // Parses JSON text (prints nothing). source is used in the warning text and, when parsing succeeds, is
+    // stored in AppConfig::source.
     static AppConfig parse(std::string_view json, const std::string& source = "<string>") {
         using namespace config_detail;
         AppConfig config = getDefaults();
@@ -407,6 +504,8 @@ public:
             r.readNumber("stall_timeout_ms", c.stall_timeout_ms, kMinStallTimeoutMs, kMaxStallTimeoutMs);
             r.readNumber("reconnect_initial_ms", c.reconnect_initial_ms, kMinReconnectMs, kMaxReconnectMs);
             // 上限不能小于初始值（给出的值按此钳制；缺失时默认值也可能小于给出的初始值）
+            // The cap must not be below the initial value (a given value is clamped accordingly; when it is
+            // missing, the default may also be below the given initial value)
             r.readNumber("reconnect_max_ms", c.reconnect_max_ms, c.reconnect_initial_ms, kMaxReconnectMs);
             if (c.reconnect_max_ms < c.reconnect_initial_ms) {
                 r.warn("reconnect_max_ms", std::to_string(c.reconnect_max_ms) +
@@ -415,6 +514,8 @@ public:
                 c.reconnect_max_ms = c.reconnect_initial_ms;
             }
             // CA 文件读不了时每次连接都会在 TLS 设置阶段失败：提前告警（值保留）
+            // If the CA file cannot be read, every connection fails during TLS setup: warn in advance
+            // (the value is kept)
             if (!c.ca_file.empty() && !std::ifstream(c.ca_file).is_open()) {
                 r.warn("ca_file", "cannot read " + quote(c.ca_file) + ", every TLS connection will fail");
             }
@@ -425,6 +526,7 @@ public:
     }
 
     // 内置默认值（与仓库里的 config.json 相同，只是全局 fee_rate = 0.001）
+    // Built-in defaults (the same as the repository's config.json, except global fee_rate = 0.001)
     static AppConfig getDefaults() {
         auto venue = [](Exchange e, const char* key, const char* host, const char* port, const char* path,
                         const char* subscribe) {
@@ -454,6 +556,8 @@ public:
     }
 
     // 一行摘要，如 "Venues: Binance, OKX, Bybit (disabled)  Fee: 0.100% (OKX 0.080%)  Min profit: 0.01  Refresh: 200ms"
+    // One-line summary, e.g.
+    // "Venues: Binance, OKX, Bybit (disabled)  Fee: 0.100% (OKX 0.080%)  Min profit: 0.01  Refresh: 200ms"
     static std::string summary(const AppConfig& c) {
         auto percent = [](double fee) {
             char buf[64];
@@ -494,6 +598,10 @@ private:
 
     // 一个交易所块。enabled 为 false 时其余字段不读取也不校验（保持默认值）：
     // "bybit": {"enabled": false} 就是关闭 Bybit 的完整写法，不会产生一串 "missing" 告警。
+    // One venue block. When enabled is false the other fields are neither read nor validated (they keep
+    // their defaults):
+    // "bybit": {"enabled": false} is all it takes to disable Bybit and produces no series of
+    // "missing" warnings.
     static void readVenue(config_detail::FieldReader r, VenueConfig& v) {
         using config_detail::quote;
         if (!r) return;
@@ -504,10 +612,14 @@ private:
         r.readPath("path", v.path);
         r.readString("symbol", v.symbol);
         // Binance 通过 URL 路径订阅：subscribe 可选（例如组合流 /ws 上发 SUBSCRIBE）
+        // Binance subscribes through the URL path: subscribe is optional (e.g. to send SUBSCRIBE on the
+        // combined stream /ws)
         const bool binance = v.exchange == Exchange::BINANCE;
         r.readSubscribe(v.subscribe_msg, !binance);
         if (binance) {
             // rest_host / snapshot_path 只有增量深度流需要，可以为空（见 checkBinanceRest）
+            // rest_host / snapshot_path are needed only by the diff depth stream and may be empty
+            // (see checkBinanceRest)
             r.readHost("rest_host", v.rest_host, true);
             r.readPort("rest_port", v.rest_port);
             r.readString("snapshot_path", v.snapshot_path, true, true);
@@ -521,6 +633,9 @@ private:
 
     // Binance 增量深度流（path 含 "@depth" / "@depth@100ms"）必须先拉 REST 快照才能同步：缺少 rest_host 或
     // snapshot_path 时 feed 每个会话都会以错误结束并重连，这里提前告警
+    // The Binance diff depth stream (path contains "@depth" / "@depth@100ms") needs a REST snapshot first
+    // to sync: without rest_host or snapshot_path every feed session ends with an error and reconnects,
+    // so warn about it here in advance
     static void checkBinanceRest(AppConfig& c) {
         for (const VenueConfig& v : c.venues) {
             if (v.exchange != Exchange::BINANCE || !v.enabled) continue;
@@ -535,6 +650,7 @@ private:
     }
 
     // 一致性检查：symbol 只是标签，真正订阅的品种来自 path / subscribe
+    // Consistency check: symbol is only a label; the instrument actually subscribed comes from path / subscribe
     static void checkSymbols(AppConfig& c) {
         using config_detail::addWarning;
         using config_detail::normalizeSymbol;
