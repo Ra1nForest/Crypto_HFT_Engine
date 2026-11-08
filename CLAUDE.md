@@ -21,7 +21,7 @@ Builds on Linux (Ubuntu 22.04+ / WSL2), not natively on Windows: POSIX sockets a
 ```bash
 bash Setup.sh                                   # apt deps + simdjson v5.1.1 into third_party/
 cmake -S . -B build && cmake --build build -j   # app, exchange_sim, mock_exchange, 7 tests, 5 benchmarks
-ctest --test-dir build --output-on-failure      # 670 cases, about 2 min
+ctest --test-dir build --output-on-failure      # 641 cases, about 2 min
 ./build/crypto_hft_engine                       # must run from the repo root
 ```
 
@@ -266,7 +266,7 @@ N-venue generic (the detector accepts at most 16 venues).
 
 ## Conventions
 
-- Hot paths are `receiveLoop` → adapter → `applyLevels`/snapshot publish, and the matching
+- Hot paths are the feed's `onRead` → adapter → `applyLevels`/snapshot publish, and the matching
   engine's `submit/cancel/modify`. Perf changes ship with a benchmark (the three real-header
   benchmarks have sections to extend) and before→after numbers in the commit message.
   Allocation-freedom is asserted in tests, so keep it.

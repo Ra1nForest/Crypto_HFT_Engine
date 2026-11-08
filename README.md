@@ -87,7 +87,7 @@ Linux (Ubuntu 22.04+ or WSL2), g++ 11+ (C++17 with floating-point `std::from_cha
 ```bash
 bash Setup.sh                                   # apt deps + simdjson v5.1.1 into third_party/
 cmake -S . -B build && cmake --build build -j
-ctest --test-dir build --output-on-failure      # 7 suites, 670 test cases, ~2 min
+ctest --test-dir build --output-on-failure      # 7 suites, 641 test cases, ~2 min
 ./build/crypto_hft_engine                       # run from the repo root (config.json, logs/)
 ```
 
@@ -233,13 +233,13 @@ The v1 benchmarks remain in `benchmark/orderbook_benchmark.cpp` (`std::map` vs f
 
 | Suite | Cases | Covers |
 |-------|------:|--------|
-| `test_hft` | 65 | SPSC (incl. 2-thread stress), object pool, flat hash map (differential vs `std::unordered_map`), histogram error bounds |
+| `test_hft` | 57 | SPSC (incl. 2-thread stress), object pool, flat hash map (differential vs `std::unordered_map`), histogram error bounds |
 | `test_matching` | 373 | Normative spec suite on three implementations, millions of differential-fuzz commands |
 | `test_engine_runner` | 23 | Concurrent gateways replayed on a single-threaded engine, back-pressure, shutdown |
-| `test_market_data` | 78 | L2 book, CRC32, every Binance/OKX/Bybit adapter branch, malformed input |
-| `test_feed_integration` | 47 | Real feeds against an in-process TLS mock: sync, resync, reconnect, stall kick, keepalive pings, per-address connect deadlines, prompt stop, TLS failures |
+| `test_market_data` | 76 | L2 book, CRC32, every Binance/OKX/Bybit adapter branch, malformed input |
+| `test_feed_integration` | 40 | Real feeds against an in-process TLS mock: sync, resync, reconnect, stall kick, keepalive pings, per-address connect deadlines, prompt stop, TLS failures |
 | `test_mock_exchange` | 24 | Mock wire formats round-trip through the real adapters and feeds |
-| `test_app` | 60 | Config fallback, sweep math, dedup, display alignment, signal handling, end-to-end monitor runs |
+| `test_app` | 48 | Config fallback, sweep math, dedup, display alignment, signal handling, end-to-end monitor runs |
 
 ```bash
 ctest --test-dir build --output-on-failure
