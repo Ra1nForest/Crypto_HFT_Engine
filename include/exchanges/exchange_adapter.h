@@ -11,7 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -74,19 +73,49 @@ struct AdapterResult {           // 每条消息复用；使用前先调用 rese
     }
 };
 
+// 由订阅消息推导退订消息：把 "op":"subscribe" 换成 "op":"unsubscribe"（冒号两侧允许空白）。
+// 订阅消息里没有这个记号时返回空串（调用方改为重连）。OKX 与 Bybit 共用。
+inline std::string makeUnsubscribeMessage(std::string_view subscribe_msg) {
+    constexpr std::string_view kOpKey = "\"op\"";
+    constexpr std::string_view kSubscribe = "\"subscribe\"";
+    const auto skipSpace = [&](std::size_t i) {
+        while (i < subscribe_msg.size() && (subscribe_msg[i] == ' ' || subscribe_msg[i] == '\t' ||
+                                            subscribe_msg[i] == '\n' || subscribe_msg[i] == '\r')) {
+            ++i;
+        }
+        return i;
+    };
+    for (std::size_t pos = subscribe_msg.find(kOpKey); pos != std::string_view::npos;
+         pos = subscribe_msg.find(kOpKey, pos + 1)) {
+        std::size_t i = skipSpace(pos + kOpKey.size());
+        if (i >= subscribe_msg.size() || subscribe_msg[i] != ':') continue;
+        i = skipSpace(i + 1);
+        if (subscribe_msg.substr(i, kSubscribe.size()) != kSubscribe) continue;
+        std::string out(subscribe_msg.substr(0, i));
+        out += "\"unsubscribe\"";
+        out += subscribe_msg.substr(i + kSubscribe.size());
+        return out;
+    }
+    return std::string();
+}
+
 // 适配器基类（非虚接口：公有入口由基类统一实现，各交易所的协议逻辑写在受保护的虚函数里）：
 // - 每个连接开始时 feed 调用 onConnected()（重置全部协议状态并返回要发送的帧，通常是订阅消息），
 //   之后每读到一条文本消息调用一次 onMessage()。
 // - onMessage / onRestSnapshot 是非虚函数，从不抛异常：它们在同一个保护层（runGuarded）里调用子类的
 //   handleMessage / handleRestSnapshot，并统一维护 messages / book_updates 计数。格式错误由子类调用
 //   malformed() 计入 stats().parse_errors；处理中抛出的任何异常（如内存不足）由基类捕获：计入 parse_errors、
-//   resetState() 清空簿与协议状态、要求重连。新交易所因此无需（也无法）自己再写一遍这层保护。
-// - 子类必须实现 exchange()、synced()、handleMessage()、resetState()；按需覆盖 onConnected()（默认：重置状态并
+//   清空簿与全部协议状态、要求重连。新交易所因此无需（也无法）自己再写一遍这层保护。
+// - 子类必须实现 exchange()、handleMessage()、resetState()；按需覆盖 onConnected()（默认：重置状态并
 //   发送订阅消息）、handleRestSnapshot()（默认：忽略）、pingMessage() / pingIntervalMs()、trimBook()。
+// - 基类持有子类共用的状态：本地簿、同步标志 synced_、JSON 解析器与当前消息的档位暂存、退订帧。
 // - book() 是完整的本地簿（行情线程私有，其他线程不得直接读取；跨线程用 BookSnapshot 传递）。
 // - 统计在适配器的整个生命周期内累计（onConnected 不清零）。
 class ExchangeAdapter {
 public:
+    // 重同步之后持续收到增量却迟迟没有新快照（连续超过这么多条）时要求重连（OKX 与 Bybit，见 ignoreUnsynced）
+    static constexpr std::size_t kMaxUnsyncedUpdates = 500;
+
     virtual ~ExchangeAdapter() = default;
     ExchangeAdapter(const ExchangeAdapter&) = delete;
     ExchangeAdapter& operator=(const ExchangeAdapter&) = delete;
@@ -95,7 +124,7 @@ public:
 
     // 新连接：重置全部协议状态，返回要发送的帧（默认：配置了订阅消息就发送它；Binance 通过 URL 路径订阅，通常为空）
     virtual std::vector<std::string> onConnected() {
-        resetState();
+        reset();
         std::vector<std::string> frames;
         if (!cfg_.subscribe_msg.empty()) frames.push_back(cfg_.subscribe_msg);
         return frames;
@@ -114,14 +143,17 @@ public:
 
     virtual std::string pingMessage() const { return std::string(); }  // 应用层心跳消息（"" = 无）
     virtual int pingIntervalMs() const { return 0; }                    // 心跳间隔毫秒（0 = 无）
-    virtual bool synced() const = 0;
 
+    bool synced() const noexcept { return synced_; }            // 本地簿已与交易所同步
     const OrderBook& book() const noexcept { return book_; }    // 完整本地簿（行情线程私有）
     const AdapterStats& stats() const noexcept { return stats_; }
     const AdapterConfig& config() const noexcept { return cfg_; }
+    // 由订阅消息推导出的退订帧（"" = 推导不出：重同步改为重连）
+    const std::string& unsubscribeMessage() const noexcept { return unsubscribe_msg_; }
 
 protected:
-    explicit ExchangeAdapter(AdapterConfig cfg) : cfg_(std::move(cfg)) {
+    explicit ExchangeAdapter(AdapterConfig cfg)
+        : cfg_(std::move(cfg)), unsubscribe_msg_(makeUnsubscribeMessage(cfg_.subscribe_msg)) {
         // 与旧 feed 的约定一致：簿标签为 "<name>:<symbol>"
         book_.setSymbol(cfg_.name + ":" + cfg_.symbol);
     }
@@ -137,19 +169,50 @@ protected:
         (void)out;
     }
 
-    // 重置全部协议状态（清空簿、回到未同步、丢弃缓冲）。onConnected() 与内部错误时调用
+    // 重置子类自己的协议状态（丢弃缓冲、序列号等）；簿、synced_ 与未同步计数由基类同时清空。
+    // onConnected()、dropBook() 与内部错误时调用
     virtual void resetState() noexcept = 0;
 
     // 每侧只保留最优的 kMaxBookLevels 档：增量协议会不断带来快照范围之外的远端档位。
     // 子类可扩展（OKX 同步删除被裁掉档位的原始字符串），扩展时最后调用 ExchangeAdapter::trimBook()
-    virtual void trimBook() {
-        if (static_cast<std::size_t>(book_.getBidCount()) > adapter_detail::kMaxBookLevels ||
-            static_cast<std::size_t>(book_.getAskCount()) > adapter_detail::kMaxBookLevels) {
-            book_.truncate(adapter_detail::kMaxBookLevels);
-        }
-    }
+    virtual void trimBook() { book_.truncate(adapter_detail::kMaxBookLevels); }
 
     // ---------------- 子类共用的辅助 ----------------
+
+    // 用两侧档位整体替换簿：逐档 upsert（数量为 0 的跳过，同价以后出现者为准，快照有序时每档走尾部快路径）
+    // 后裁剪；更新号归零
+    void replaceBook(const adapter_detail::RawLevel* bids, std::size_t nb, const adapter_detail::RawLevel* asks,
+                     std::size_t na) {
+        book_.clear();
+        for (std::size_t i = 0; i < nb; ++i) book_.setLevel(BookSide::Bid, bids[i].price, bids[i].quantity);
+        for (std::size_t i = 0; i < na; ++i) book_.setLevel(BookSide::Ask, asks[i].price, asks[i].quantity);
+        trimBook();
+    }
+
+    // 应用一条增量的两侧后裁剪；返回簿是否变化。一条增量常有上百档变化：批量排序 + 归并，
+    // 避免逐档 memmove（见 OrderBook::applyLevels）
+    template <class Level>
+    bool updateBook(const Level* bids, std::size_t nb, const Level* asks, std::size_t na) {
+        bool changed = book_.applyLevels(BookSide::Bid, bids, nb, batch_);
+        changed |= book_.applyLevels(BookSide::Ask, asks, na, batch_);
+        trimBook();
+        return changed;
+    }
+
+    // 丢弃本地簿与全部协议状态；簿原本非空时置 book_updated（消费者随之看到空簿）
+    void dropBook(AdapterResult& out) noexcept {
+        if (!book_.empty()) out.book_updated = true;
+        reset();
+    }
+
+    // 未同步时收到的增量：忽略；重同步之后迟迟没有新快照（连续超过 kMaxUnsyncedUpdates 条）时要求重连
+    void ignoreUnsynced(AdapterResult& out) {
+        ++stats_.ignored;
+        if (++unsynced_updates_ <= kMaxUnsyncedUpdates) return;
+        unsynced_updates_ = 0;
+        out.reconnect = true;
+        out.error = adapter_detail::concat({exchangeName(exchange()), ": no snapshot after resubscribing, reconnecting"});
+    }
 
     // 格式错误：parse_errors++，error = "<交易所>: <what> (<bytes> bytes)"
     void malformed(AdapterResult& out, const char* what, std::size_t bytes) {
@@ -159,24 +222,36 @@ protected:
     }
 
     // 重同步时重新订阅：send = {unsubscribe, subscribe}（同一条消息里已安排过就不重复）；
-    // 没有订阅消息或推导不出退订帧时改为要求重连。unsubscribe_msg 通常来自 makeUnsubscribeMessage
-    void requestResubscribe(AdapterResult& out, const std::string& unsubscribe_msg) {
-        if (cfg_.subscribe_msg.empty() || unsubscribe_msg.empty()) {
+    // 没有订阅消息或推导不出退订帧时改为要求重连
+    void requestResubscribe(AdapterResult& out) {
+        if (cfg_.subscribe_msg.empty() || unsubscribe_msg_.empty()) {
             out.reconnect = true;
             return;
         }
         if (out.send.empty()) {
-            out.send.push_back(unsubscribe_msg);
+            out.send.push_back(unsubscribe_msg_);
             out.send.push_back(cfg_.subscribe_msg);
         }
     }
 
     OrderBook book_;
-    LevelBatchScratch batch_;   // book_.applyLevels 的工作区（增量消息批量应用，稳态零分配）
+    LevelBatchScratch batch_;                     // book_.applyLevels 的工作区（增量消息批量应用，稳态零分配）
     AdapterStats stats_;
     AdapterConfig cfg_;
+    adapter_detail::JsonReader reader_;           // 各子类 parse() 共用的 JSON 解析器
+    std::vector<adapter_detail::RawLevel> bids_;  // 当前消息的买档暂存（OKX 多个条目时按条目顺序连续存放）
+    std::vector<adapter_detail::RawLevel> asks_;  // 当前消息的卖档暂存
+    bool synced_ = false;                         // 本地簿已与交易所同步
 
 private:
+    // 清空簿、同步状态与未同步计数，再重置子类的协议状态
+    void reset() noexcept {
+        book_.clear();
+        synced_ = false;
+        unsynced_updates_ = 0;
+        resetState();
+    }
+
     // onMessage / onRestSnapshot 共用的保护层：任何异常都转为 internalError；之后若簿有变化则 book_updates++
     template <class Body>
     void runGuarded(AdapterResult& out, Body&& body) noexcept {
@@ -193,36 +268,14 @@ private:
     // 内部异常（如内存不足）：状态可能不一致，清空一切并要求重连
     void internalError(AdapterResult& out, const char* what) noexcept {
         ++stats_.parse_errors;
-        if (!book_.empty()) out.book_updated = true;
-        resetState();
+        dropBook(out);
         out.reconnect = true;
         try {
             out.error = std::string(exchangeName(exchange())) + ": internal error: " + what;
         } catch (...) {
         }
     }
-};
 
-// 由订阅消息推导退订消息：把 "op":"subscribe" 换成 "op":"unsubscribe"（冒号两侧允许空白）。
-// 订阅消息里没有这个记号时返回空串（调用方改为重连）。OKX 与 Bybit 共用。
-inline std::string makeUnsubscribeMessage(std::string_view subscribe_msg) {
-    constexpr std::string_view kOpKey = "\"op\"";
-    constexpr std::string_view kSubscribe = "\"subscribe\"";
-    auto isSpace = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    for (std::size_t pos = subscribe_msg.find(kOpKey); pos != std::string_view::npos;
-         pos = subscribe_msg.find(kOpKey, pos + 1)) {
-        std::size_t i = pos + kOpKey.size();
-        while (i < subscribe_msg.size() && isSpace(subscribe_msg[i])) ++i;
-        if (i >= subscribe_msg.size() || subscribe_msg[i] != ':') continue;
-        ++i;
-        while (i < subscribe_msg.size() && isSpace(subscribe_msg[i])) ++i;
-        if (subscribe_msg.substr(i, kSubscribe.size()) != kSubscribe) continue;
-        std::string out;
-        out.reserve(subscribe_msg.size() + 2);
-        out.append(subscribe_msg.substr(0, i));
-        out.append("\"unsubscribe\"");
-        out.append(subscribe_msg.substr(i + kSubscribe.size()));
-        return out;
-    }
-    return std::string();
-}
+    std::string unsubscribe_msg_;       // 由订阅消息推导出的退订帧（"" = 推导不出）
+    std::size_t unsynced_updates_ = 0;  // 未同步期间连续收到的增量条数（见 ignoreUnsynced）
+};

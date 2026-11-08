@@ -18,10 +18,11 @@
 //   2. 旧流程 vs 新流程：同一批 Binance depth20 消息，端到端耗时与每条消息的堆分配次数；以及只看缓冲区处理的耗时。
 //      两种流程在同一条消息上交替计时（A/B 交错，奇偶轮换先后），共享 CPU 上的噪声对两者影响相同。
 //      旧流程使用的是升级后的 OrderBook（尾部快路径），因此差异只来自消息处理方式。
-// 注意：机器上的 CPU 由多个进程共享，单次运行的绝对值可能有 ±50% 的波动；比较请看同一次运行内的相对值。
 //   3. OrderBook upsert 微基准：400 档簿上的顶部更新（原地改量、顶部插入/删除、随机档位、旧式整簿重建）
 //   4. 一条增量应用到深簿：逐档 setLevel vs 批量 applyLevels（最优在前 / 打乱两种顺序）。生成器保持簿深度等于标签、
 //      插入/删除/改量各约 1/3，实测的平均深度与变化构成打印在每行旁边。
+// 注意：机器上的 CPU 由多个进程共享，单次运行的绝对值可能有 ±50% 的波动；比较请看同一次运行内的相对值，
+// 或把新旧两个二进制交替运行多次。代码布局也会让个别小消息的行（如 bbo-tbt）在不同构建间相差 10-20%。
 // 自检（行情流失去同步或校验和失败、簿不一致、深度或构成偏离标签等）失败时打印 "!!"，程序以非零状态退出。
 // 用法：./build/market_data_benchmark [--quick] [--cold]
 //
@@ -231,6 +232,26 @@ Levels sideLevels(const std::map<std::int64_t, std::string>& side, bool bid, int
     } else {
         for (auto it = side.begin(); it != side.end() && out.size() < max_levels; ++it)
             out.push_back({fmt(it->first, decimals), it->second});
+    }
+    return out;
+}
+
+// 一条随机增量：k 次 randomChange（同一档位以最后一次为准），按价格排好分成 {买盘, 卖盘}；
+// 删除的档位数量写作 zero
+template <class QtyFn>
+std::pair<Levels, Levels> randomDiff(SimBook& book, std::mt19937_64& rng, std::size_t target_levels, std::size_t k,
+                                     QtyFn&& qty, const char* zero, std::string (*fmt)(std::int64_t, int), int decimals) {
+    std::map<std::pair<bool, std::int64_t>, std::string> agg;
+    for (std::size_t c = 0; c < k; ++c) {
+        bool bid;
+        std::int64_t tick;
+        std::string q;
+        randomChange(book, rng, target_levels, qty, bid, tick, q);
+        agg[{bid, tick}] = q == "0" ? zero : q;
+    }
+    std::pair<Levels, Levels> out;
+    for (const auto& kv : agg) {
+        (kv.first.first ? out.first : out.second).push_back({fmt(kv.first.second, decimals), kv.second});
     }
     return out;
 }
@@ -488,8 +509,8 @@ std::vector<ParsedLevels> parseMessages(const std::vector<std::string>& msgs) {
                         collectLevels(obj, b, a, true);
         check(ok, "cannot extract the levels of a benchmark message");
         ParsedLevels p;
-        for (const adapter_detail::RawLevel& l : b) p.bids.push_back({l.price, l.qty});
-        for (const adapter_detail::RawLevel& l : a) p.asks.push_back({l.price, l.qty});
+        for (const adapter_detail::RawLevel& l : b) p.bids.push_back({l.price, l.quantity});
+        for (const adapter_detail::RawLevel& l : a) p.asks.push_back({l.price, l.quantity});
         out.push_back(std::move(p));
     }
     return out;
@@ -502,12 +523,7 @@ double averageLevels(const std::vector<ParsedLevels>& msgs, std::size_t begin, s
 }
 
 // 与适配器相同：每侧超过 kMaxBookLevels 时裁掉远端档位
-void trimLikeAdapters(OrderBook& book) {
-    if (static_cast<std::size_t>(book.getBidCount()) > adapter_detail::kMaxBookLevels ||
-        static_cast<std::size_t>(book.getAskCount()) > adapter_detail::kMaxBookLevels) {
-        book.truncate(adapter_detail::kMaxBookLevels);
-    }
-}
+void trimLikeAdapters(OrderBook& book) { book.truncate(adapter_detail::kMaxBookLevels); }
 
 // ---------------------------------------------------------------------------
 // 模拟交易所的行情流：与离线演示中监控程序收到的报文以同样的方式生成
@@ -1019,19 +1035,10 @@ int main(int argc, char** argv) {
         auto makeEvents = [&](std::size_t count) {
             std::vector<std::string> out;
             for (std::size_t i = 0; i < count; ++i) {
-                std::map<std::pair<bool, std::int64_t>, std::string> agg;
                 const std::size_t k = 10 + rng() % 30;
                 const std::uint64_t first = id + 1;
-                for (std::size_t c = 0; c < k; ++c) {
-                    bool bid;
-                    std::int64_t tick;
-                    std::string q;
-                    randomChange(book, rng, 1000, qty8, bid, tick, q);
-                    agg[{bid, tick}] = q == "0" ? "0.00000000" : q;
-                    ++id;
-                }
-                Levels b, a;
-                for (const auto& kv : agg) (kv.first.first ? b : a).push_back({fixedTicks(kv.first.second, 2), kv.second});
+                const auto [b, a] = randomDiff(book, rng, 1000, k, qty8, "0.00000000", fixedTicks, 2);
+                id += k;
                 out.push_back("{\"e\":\"depthUpdate\",\"E\":1700000000000,\"s\":\"BTCUSDT\",\"U\":" + std::to_string(first) +
                               ",\"u\":" + std::to_string(id) + ",\"b\":" + levelsJson(b) + ",\"a\":" + levelsJson(a) + "}");
             }
@@ -1073,17 +1080,7 @@ int main(int argc, char** argv) {
         auto makeUpdates = [&](std::size_t count) {
             std::vector<std::string> v;
             for (std::size_t i = 0; i < count; ++i) {
-                std::map<std::pair<bool, std::int64_t>, std::string> agg;
-                const std::size_t k = 2 + rng() % 12;
-                for (std::size_t c = 0; c < k; ++c) {
-                    bool bid;
-                    std::int64_t tick;
-                    std::string q;
-                    randomChange(book, rng, 400, okxQty, bid, tick, q);
-                    agg[{bid, tick}] = q;
-                }
-                Levels b, as;
-                for (const auto& kv : agg) (kv.first.first ? b : as).push_back({okxPx(kv.first.second, 1), kv.second});
+                const auto [b, as] = randomDiff(book, rng, 400, 2 + rng() % 12, okxQty, "0", okxPx, 1);
                 const std::int64_t prev = seq++;
                 v.push_back("{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"update\",\"data\":[{\"asks\":" +
                             levelsJson(as, true) + ",\"bids\":" + levelsJson(b, true) +
@@ -1127,17 +1124,7 @@ int main(int argc, char** argv) {
         auto makeDeltas = [&](std::size_t count) {
             std::vector<std::string> v;
             for (std::size_t i = 0; i < count; ++i) {
-                std::map<std::pair<bool, std::int64_t>, std::string> agg;
-                const std::size_t k = 3 + rng() % 10;
-                for (std::size_t c = 0; c < k; ++c) {
-                    bool bid;
-                    std::int64_t tick;
-                    std::string q;
-                    randomChange(book, rng, 50, bybitQty, bid, tick, q);
-                    agg[{bid, tick}] = q;
-                }
-                Levels b, as;
-                for (const auto& kv : agg) (kv.first.first ? b : as).push_back({fixedTicks(kv.first.second, 2), kv.second});
+                const auto [b, as] = randomDiff(book, rng, 50, 3 + rng() % 10, bybitQty, "0", fixedTicks, 2);
                 ++u;
                 v.push_back(msg("delta", b, as));
             }

@@ -1,6 +1,6 @@
 //
 // orderbook.h
-// L2 订单簿：买卖盘各一个按价格严格有序的扁平 vector（下标 0 为最优档），支持按价格 upsert/删除、截断与自检。
+// L2 订单簿：买卖盘各一个按价格严格有序的扁平 vector（下标 0 为最优档），支持按价格 upsert/删除、批量应用、截断与自检。
 //
 
 #pragma once
@@ -9,8 +9,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -54,7 +52,7 @@ struct LevelBatchScratch {
 class OrderBook {
 public:
     // 默认构造：symbol 为空
-    OrderBook() : symbol_("") { reserve(20); }
+    OrderBook() : OrderBook(std::string()) {}
 
     // 指定交易对构造（保持隐式转换，与旧接口一致）
     OrderBook(const std::string& symbol) : symbol_(symbol) { reserve(20); }
@@ -99,22 +97,16 @@ public:
     //   也这样发送）：收集条目时顺带检查，已有序就直接归并，O(档数 + n)；否则先按价格排序（下标作次序键，
     //   std::sort 原地进行、不分配内存）、同价只保留最后一条，O(档数 + n log n)。两条路径的结果完全相同。
     //   此时返回"最终状态是否与之前不同"：先改后又改回原值的档位不算变化（逐档调用会报告变化）。
-    // levels 不得指向本簿自身的存储；qty_of(level) 取出数量（适配器的原始档位类型字段名不同）。
-    template <class Level, class QtyOf>
-    bool applyLevels(BookSide side, const Level* levels, std::size_t n, LevelBatchScratch& scratch,
-                     QtyOf qty_of) {
+    // Level 是带 price 与 quantity 字段的档位类型（PriceLevel、适配器的原始档位）；levels 不得指向本簿自身的存储。
+    template <class Level>
+    bool applyLevels(BookSide side, const Level* levels, std::size_t n, LevelBatchScratch& scratch) {
         if (n <= kBatchThreshold) {
             bool changed = false;
-            for (std::size_t i = 0; i < n; ++i) changed |= setLevel(side, levels[i].price, qty_of(levels[i]));
+            for (std::size_t i = 0; i < n; ++i) changed |= setLevel(side, levels[i].price, levels[i].quantity);
             return changed;
         }
-        if (side == BookSide::Bid) return applyBatch<true>(bids_, levels, n, scratch, qty_of);
-        return applyBatch<false>(asks_, levels, n, scratch, qty_of);
-    }
-
-    // PriceLevel 数组的便捷重载
-    bool applyLevels(BookSide side, const PriceLevel* levels, std::size_t n, LevelBatchScratch& scratch) {
-        return applyLevels(side, levels, n, scratch, [](const PriceLevel& l) { return l.quantity; });
+        if (side == BookSide::Bid) return applyBatch<true>(bids_, levels, n, scratch);
+        return applyBatch<false>(asks_, levels, n, scratch);
     }
 
     // 用 levels[0, n) 整体替换某一侧（应为最优在前的有序档位；levels 不得指向本簿自身的存储）。
@@ -182,15 +174,6 @@ public:
         return !bids_.empty() && !asks_.empty() && bids_[0].price >= asks_[0].price;
     }
 
-    // 某一侧前 levels 档的累计数量
-    double cumulativeQty(BookSide side, std::size_t levels) const noexcept {
-        const std::vector<PriceLevel>& v = this->levels(side);
-        const std::size_t n = std::min(levels, v.size());
-        double sum = 0.0;
-        for (std::size_t i = 0; i < n; ++i) sum += v[i].quantity;
-        return sum;
-    }
-
     // 基本访问器
     const std::string& getSymbol() const noexcept { return symbol_; }
 
@@ -209,29 +192,6 @@ public:
         return validateSide(bids_, true, why) && validateSide(asks_, false, why);
     }
 
-    // 简单打印：用于调试/控制台展示
-    void print(int levels = 5) const {
-        std::cout << std::fixed;
-        std::cout << "  " << symbol_ << std::endl;
-        int show = std::min(levels, static_cast<int>(std::max(bids_.size(), asks_.size())));
-        for (int i = 0; i < show; ++i) {
-            if (i < static_cast<int>(bids_.size())) {
-                std::cout << "  " << std::setw(8) << std::setprecision(4) << bids_[i].quantity
-                          << "  " << std::setw(10) << std::setprecision(2) << bids_[i].price;
-            } else {
-                std::cout << std::setw(20) << " ";
-            }
-            std::cout << " | ";
-            if (i < static_cast<int>(asks_.size())) {
-                std::cout << std::setw(10) << std::setprecision(2) << asks_[i].price
-                          << "  " << std::setw(8) << std::setprecision(4) << asks_[i].quantity;
-            } else {
-                std::cout << std::setw(20) << " ";
-            }
-            std::cout << std::endl;
-        }
-    }
-
     // applyLevels 改走排序 + 归并的批量阈值（条数）
     static constexpr std::size_t kBatchThreshold = 8;
 
@@ -239,40 +199,44 @@ private:
     // upsert 头部顺序查找的档数（之后改用二分查找）
     static constexpr std::size_t kLinearProbe = 8;
 
-    // 批量路径：过滤掉非有限值的条目放进 scratch.items（保持原始顺序），同时检查剩下的条目是否已按最优在前、
-    // 价格严格有序。kBid = true 表示买盘（降序）。
-    template <bool kBid, class Level, class QtyOf>
-    static bool applyBatch(std::vector<PriceLevel>& v, const Level* levels, std::size_t n, LevelBatchScratch& scratch,
-                           QtyOf& qty_of) {
-        std::vector<LevelBatchScratch::Item>& items = scratch.items;
+    // a 是否比 b 更优：买盘价格越高越优，卖盘价格越低越优
+    template <bool kBid>
+    static bool better(double a, double b) noexcept {
+        if constexpr (kBid) {
+            return a > b;
+        } else {
+            return a < b;
+        }
+    }
+
+    // 批量路径。kBid = true 表示买盘（降序）。
+    // 1. 过滤掉非有限值的条目放进 scratch.items（保持原始顺序），同时检查剩下的条目是否已按最优在前、价格严格有序；
+    //    是则没有同价重复、排序结果就是原序列，直接跳过排序。
+    // 2. 与现有档位线性归并到 scratch.merged，有变化时与 v 交换存储（旧存储留在 scratch 中供下次复用）。
+    template <bool kBid, class Level>
+    static bool applyBatch(std::vector<PriceLevel>& v, const Level* levels, std::size_t n,
+                           LevelBatchScratch& scratch) {
+        using Item = LevelBatchScratch::Item;
+        std::vector<Item>& items = scratch.items;
         items.clear();
         items.reserve(n);
         bool best_first = true;
         for (std::size_t i = 0; i < n; ++i) {
             const double price = levels[i].price;
-            const double qty = qty_of(levels[i]);
+            const double qty = levels[i].quantity;
             if (!std::isfinite(price) || !std::isfinite(qty)) continue;  // 与 setLevel 一致：忽略
             if (!items.empty() && !better<kBid>(items.back().price, price)) best_first = false;
             items.push_back({price, qty, static_cast<std::uint32_t>(i)});
         }
         ++scratch.batches;
-        return mergeBatch<kBid>(v, scratch, best_first);
-    }
-
-    // 批量归并实现：scratch.items 为已过滤的有效更新（原始顺序）；best_first 表示它们已按价格严格最优在前，
-    // 此时没有同价重复、排序结果就是原序列，直接跳过排序。kBid = true 表示买盘（降序）。
-    template <bool kBid>
-    static bool mergeBatch(std::vector<PriceLevel>& v, LevelBatchScratch& scratch, bool best_first) {
-        std::vector<LevelBatchScratch::Item>& items = scratch.items;
         if (items.empty()) return false;
         if (!best_first) {
             // 最优在前；同价按原始顺序，这样每个同价段的最后一条就是生效的那条
             ++scratch.sorted_batches;
-            std::sort(items.begin(), items.end(),
-                      [](const LevelBatchScratch::Item& a, const LevelBatchScratch::Item& b) {
-                          if (a.price != b.price) return better<kBid>(a.price, b.price);
-                          return a.seq < b.seq;
-                      });
+            std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+                if (a.price != b.price) return better<kBid>(a.price, b.price);
+                return a.seq < b.seq;
+            });
         }
         std::vector<PriceLevel>& out = scratch.merged;
         out.clear();
@@ -282,7 +246,7 @@ private:
         for (std::size_t j = 0; j < items.size();) {
             std::size_t last = j;
             while (last + 1 < items.size() && items[last + 1].price == items[j].price) ++last;
-            const LevelBatchScratch::Item& up = items[last];
+            const Item& up = items[last];
             j = last + 1;
             // 比该价格更优的现有档位原样保留
             while (i < v.size() && better<kBid>(v[i].price, up.price)) out.push_back(v[i++]);
@@ -303,18 +267,8 @@ private:
         }
         if (!changed) return false;
         out.insert(out.end(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
-        v.swap(out);  // 旧存储留在 scratch 中供下次复用
+        v.swap(out);
         return true;
-    }
-
-    // a 是否比 b 更优：买盘价格越高越优，卖盘价格越低越优
-    template <bool kBid>
-    static bool better(double a, double b) noexcept {
-        if constexpr (kBid) {
-            return a > b;
-        } else {
-            return a < b;
-        }
     }
 
     // upsert 实现。kBid = true 表示买盘（降序）。
@@ -341,17 +295,14 @@ private:
             it = std::lower_bound(it, v.end(), price,
                                   [](const PriceLevel& l, double p) { return better<kBid>(l.price, p); });
         }
-        if (it != v.end() && it->price == price) {
-            return applyAt(v, it, qty, remove);
-        }
+        if (it != v.end() && it->price == price) return applyAt(v, it, qty, remove);
         if (remove) return false;
         v.insert(it, {price, qty});
         return true;
     }
 
     // 对已存在的档位执行删除或改数量
-    static bool applyAt(std::vector<PriceLevel>& v, std::vector<PriceLevel>::iterator it, double qty,
-                        bool remove) {
+    static bool applyAt(std::vector<PriceLevel>& v, std::vector<PriceLevel>::iterator it, double qty, bool remove) {
         if (remove) {
             v.erase(it);
             return true;

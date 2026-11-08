@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace adapter_detail {
@@ -31,10 +32,11 @@ inline constexpr std::size_t kMaxLevelsPerArray = 200000;
 // 超出时裁掉最差的远端档位（不影响顶部；Binance 文档本来就说明快照范围外的档位不可靠）
 inline constexpr std::size_t kMaxBookLevels = 5000;
 
-// 解析出的原始档位：数值 + 原始字符串（字符串视图指向 simdjson parser 的内部缓冲区，下一次解析前有效）
+// 解析出的原始档位：数值 + 原始字符串（字符串视图指向 simdjson parser 的内部缓冲区，下一次解析前有效）。
+// 前两个字段与 PriceLevel 同名，因此可以直接交给 OrderBook::applyLevels
 struct RawLevel {
     double price;
-    double qty;
+    double quantity;
     std::string_view px;
     std::string_view sz;
 };
@@ -51,13 +53,6 @@ public:
         return simdjson::padded_string_view(buf_.get(), data.size(), capacity_);
     }
 
-    // 预留可容纳 bytes 字节消息的容量
-    void reserve(std::size_t bytes) {
-        if (bytes + simdjson::SIMDJSON_PADDING > capacity_) grow(bytes + simdjson::SIMDJSON_PADDING);
-    }
-
-    std::size_t capacity() const noexcept { return capacity_; }
-
 private:
     void grow(std::size_t need) {
         std::size_t cap = capacity_ < 4096 ? 4096 : capacity_;
@@ -70,10 +65,13 @@ private:
     std::size_t capacity_ = 0;
 };
 
-// simdjson On-Demand 解析器 + 可复用缓冲区。load 成功后 doc 及其产生的字符串视图在下一次 load 之前有效。
+// simdjson On-Demand 解析器 + 可复用缓冲区。载入成功后 doc 及其产生的字符串视图在下一次载入之前有效。
 // 使用约定（各适配器都遵守）：任何嵌套读取失败都立即中止整条消息。On-Demand 遇到致命错误（TAPE_ERROR、
 // INCOMPLETE_ARRAY_OR_OBJECT 等，除 INCORRECT_TYPE / NO_SUCH_FIELD 以外）会废弃文档，外层循环随之静默结束；
 // 此时再访问文档（例如 doc.at_end()）是空指针访问。因此 doc.at_end() 只在整个根对象成功迭代完之后调用。
+// 没有读取的值由迭代器自动跳过（结构错误仍会在下一次迭代时报告）。
+// 各适配器手写字段循环而不用回调：回调 lambda 不会被内联，每个字段都要多一次调用并把迭代器状态写回内存，
+// 小消息（bbo-tbt、books5）因此慢几个百分点。
 class JsonReader {
 public:
     simdjson::error_code load(std::string_view payload, od::document& doc) {
@@ -81,29 +79,33 @@ public:
         return parser_.iterate(buffer_.assign(payload)).get(doc);
     }
 
-    const PaddedBuffer& buffer() const noexcept { return buffer_; }
-
 private:
     od::parser parser_;
     PaddedBuffer buffer_;
 };
 
-// 10^0 .. 10^22：全部可以被 double 精确表示（5^22 < 2^53）
-inline constexpr double kExactPow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
-                                           1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+// 记录一个字段：它（或与它互斥的 conflicts 中任一字段）已经出现过时返回 false（重复字段 = 格式错误）
+inline bool firstSeen(unsigned& seen, unsigned bit, unsigned conflicts = 0) noexcept {
+    if ((seen & (bit | conflicts)) != 0) return false;
+    seen |= bit;
+    return true;
+}
+
+// 10^0 .. 10^18：快路径最多 18 位小数（总位数 <= 19 且整数部分至少 1 位），全部可以被 double 精确表示
+inline constexpr double kExactPow10[19] = {1e0, 1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+                                           1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
 
 // 慢路径：std::from_chars（正确舍入），必须整串被消费且结果为有限值（拒绝 "nan"/"inf"/前后缀垃圾）
 inline bool parseDecimalSlow(std::string_view s, double& out) noexcept {
-    if (s.empty()) return false;
-    const char* first = s.data();
-    const char* last = first + s.size();
-    const auto res = std::from_chars(first, last, out);
+    const char* const last = s.data() + s.size();
+    const auto res = std::from_chars(s.data(), last, out);
     return res.ec == std::errc() && res.ptr == last && std::isfinite(out);
 }
 
 // 把 [p, end) 开头的连续数字累加进 m（m = m * 10^n + 数字），返回第一个非数字的位置。
 // 超过 19 位时 m 会回绕，由调用方按位数判定转去慢路径。
-// （试过每次并行处理 4 位：实测没有变快，瓶颈在精确除法与循环出口分支，因此保留最简单的写法。）
+// （试过每次并行处理 4 位，以及小数部分一次 8 位的 SWAR：指令数少了，但实测没有变快——Binance 持平，
+// OKX / Bybit 反而慢 2-5%；瓶颈在精确除法与循环出口分支，因此保留最简单的写法。）
 inline const char* accumulateDigits(const char* p, const char* end, std::uint64_t& m) noexcept {
     while (p != end && static_cast<unsigned>(*p - '0') <= 9u) {
         m = m * 10 + static_cast<unsigned>(*p - '0');
@@ -113,12 +115,12 @@ inline const char* accumulateDigits(const char* p, const char* end, std::uint64_
 }
 
 // 十进制字符串 -> double，结果与 std::from_chars 逐位相同。
-// 快路径（Clinger）：交易所的数量/价格几乎都是 [0-9]+(\.[0-9]+)? 的形式。若总位数 <= 19、整数尾数 m <= 2^53、
-// 小数位 k <= 22，则 m 与 10^k 都能被 double 精确表示，IEEE 除法 m / 10^k 的结果就是精确十进制值的正确舍入，
+// 快路径（Clinger）：交易所的数量/价格几乎都是 [0-9]+(\.[0-9]+)? 的形式。若总位数 <= 19、整数尾数 m <= 2^53，
+// 则 m 与 10^k（k <= 18）都能被 double 精确表示，IEEE 除法 m / 10^k 的结果就是精确十进制值的正确舍入，
 // 与 from_chars（正确舍入）完全一致。其余情况（指数、超长、符号、"nan" 等）交给 from_chars。
 // tests/test_market_data.cpp 用 300 万个随机字符串验证与 from_chars 逐位一致。
-// 实测（g++ 13 -O2，"65000.12" / "0.12345000" 这类字符串）：from_chars 约 10.6 ns/个，快路径约 7.5 ns/个；
-// 指令数约为 from_chars 的 2/3（callgrind：约 130 vs 190 条）。depth20 一条消息有 80 个数。
+// 实测（g++ 13 -O2）：整条消息改用 from_chars 时 depth20 慢约 6%、Bybit delta 慢约 12%，指令数多 11-15%
+// （benchmark/market_data_benchmark.cpp 第 1 节）。depth20 一条消息有 80 个数。
 inline bool parseDecimal(std::string_view s, double& out) noexcept {
     const char* p = s.data();
     const char* const end = p + s.size();
@@ -126,54 +128,39 @@ inline bool parseDecimal(std::string_view s, double& out) noexcept {
     const char* const int_start = p;
     p = accumulateDigits(p, end, m);
     const int int_digits = static_cast<int>(p - int_start);
-    int digits = int_digits;
     int frac = 0;
     if (p != end && *p == '.') {
         ++p;
         const char* const frac_start = p;
         p = accumulateDigits(p, end, m);
         frac = static_cast<int>(p - frac_start);
-        digits += frac;
         if (frac == 0) return parseDecimalSlow(s, out);  // "1." 之类：交给 from_chars 判定
     }
-    if (p != end || int_digits == 0 || digits > 19 || m > (std::uint64_t{1} << 53) || frac > 22) {
+    if (p != end || int_digits == 0 || int_digits + frac > 19 || m > (std::uint64_t{1} << 53)) {
         return parseDecimalSlow(s, out);
     }
     out = static_cast<double>(m) / kExactPow10[frac];
     return true;
 }
 
-// 十进制整数字符串 -> 整数（整串消费）
+// 读取整数字段（std::int64_t 或 std::uint64_t）：接受 JSON 整数或整串都是十进制整数的字符串
+// （OKX 的 ts 是字符串，其余交易所是数字）
 template <class Int>
-inline bool parseInteger(std::string_view s, Int& out) noexcept {
-    if (s.empty()) return false;
-    const char* first = s.data();
-    const char* last = first + s.size();
-    const auto res = std::from_chars(first, last, out);
-    return res.ec == std::errc() && res.ptr == last;
-}
-
-// 读取整数字段：接受 JSON 整数或十进制整数字符串（OKX 的 ts 是字符串，其余交易所是数字）
-inline bool readInt64(od::value& v, std::int64_t& out) noexcept {
+inline bool readInt(od::value& v, Int& out) noexcept {
+    static_assert(std::is_same_v<Int, std::int64_t> || std::is_same_v<Int, std::uint64_t>);
     od::json_type t;
     if (v.type().get(t) != simdjson::SUCCESS) return false;
-    if (t == od::json_type::number) return v.get_int64().get(out) == simdjson::SUCCESS;
-    if (t == od::json_type::string) {
-        std::string_view s;
-        return v.get_string().get(s) == simdjson::SUCCESS && parseInteger(s, out);
+    if (t == od::json_type::number) {
+        if constexpr (std::is_signed_v<Int>) {
+            return v.get_int64().get(out) == simdjson::SUCCESS;
+        } else {
+            return v.get_uint64().get(out) == simdjson::SUCCESS;
+        }
     }
-    return false;
-}
-
-inline bool readUint64(od::value& v, std::uint64_t& out) noexcept {
-    od::json_type t;
-    if (v.type().get(t) != simdjson::SUCCESS) return false;
-    if (t == od::json_type::number) return v.get_uint64().get(out) == simdjson::SUCCESS;
-    if (t == od::json_type::string) {
-        std::string_view s;
-        return v.get_string().get(s) == simdjson::SUCCESS && parseInteger(s, out);
-    }
-    return false;
+    std::string_view s;
+    if (t != od::json_type::string || v.get_string().get(s) != simdjson::SUCCESS) return false;
+    const auto res = std::from_chars(s.data(), s.data() + s.size(), out);
+    return res.ec == std::errc() && res.ptr == s.data() + s.size();
 }
 
 inline bool readString(od::value& v, std::string_view& out) noexcept {
@@ -223,18 +210,11 @@ inline bool parseLevels(od::value& v, std::vector<RawLevel>& out) {
         }
         if (idx < 2) return false;
         if (!parseDecimal(r.px, r.price) || !(r.price > 0.0)) return false;
-        if (!parseDecimal(r.sz, r.qty) || r.qty < 0.0) return false;
+        if (!parseDecimal(r.sz, r.quantity) || r.quantity < 0.0) return false;
         if (++count > kMaxLevelsPerArray) return false;
         out.push_back(r);
     }
     return true;
-}
-
-// 价格的 64 位键：double 的二进制位（价格均为正的有限值，相同字符串解析出相同的位模式）
-inline std::uint64_t priceKey(double price) noexcept {
-    std::uint64_t k = 0;
-    std::memcpy(&k, &price, sizeof(k));
-    return k;
 }
 
 // 拼接错误信息（只在错误路径上调用，允许分配）

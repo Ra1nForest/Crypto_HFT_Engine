@@ -44,14 +44,9 @@
 class OkxAdapter final : public ExchangeAdapter {
 public:
     static constexpr std::size_t kChecksumLevels = 25;
-    static constexpr std::size_t kMaxUnsyncedUpdates = 500;
 
     explicit OkxAdapter(const AdapterConfig& cfg)
-        : ExchangeAdapter(cfg),
-          verify_(cfg.verify_checksum),
-          unsubscribe_msg_(makeUnsubscribeMessage(cfg.subscribe_msg)),
-          bid_text_(1024),
-          ask_text_(1024) {
+        : ExchangeAdapter(cfg), verify_(cfg.verify_checksum), bid_text_(1024), ask_text_(1024) {
         book_.reserve(1024);
         bids_.reserve(512);
         asks_.reserve(512);
@@ -62,12 +57,10 @@ public:
 
     std::string pingMessage() const override { return "ping"; }
     int pingIntervalMs() const override { return 20000; }
-    bool synced() const override { return synced_; }
 
     // ---------------- 诊断（测试用） ----------------
     bool checksumEnabled() const noexcept { return verify_; }
     std::int64_t lastSeqId() const noexcept { return seq_; }
-    const std::string& unsubscribeMessage() const noexcept { return unsubscribe_msg_; }
     // 当前簿的校验串（与计算 checksum 用的完全一致）。不维护原始字符串时返回空串：
     // 校验关闭之后，以及全量推送频道（books5 / bbo-tbt，推送不带 checksum）
     std::string checksumString() const {
@@ -129,47 +122,37 @@ private:
         std::int64_t ts = 0, checksum = 0, prev_seq = 0, seq = 0;
     };
 
+    // 价格的 64 位键：double 的二进制位（价格均为正的有限值，相同字符串解析出相同的位模式）
+    static std::uint64_t priceKey(double price) noexcept {
+        std::uint64_t k = 0;
+        std::memcpy(&k, &price, sizeof(k));
+        return k;
+    }
+
     // ---------------- 解析 ----------------
 
+    // 单遍解析整条消息（data 的条目写入 entries_，档位写入 bids_ / asks_）；
+    // JSON 错误、根不是对象、尾随内容、重复的关键字段都返回 false
     bool parse(std::string_view payload, Msg& m) {
         using namespace adapter_detail;
+        entries_.clear();
         bids_.clear();
         asks_.clear();
-        entries_.clear();
         od::document doc;
-        if (reader_.load(payload, doc) != simdjson::SUCCESS) return false;
         od::object obj;
-        if (doc.get_object().get(obj) != simdjson::SUCCESS) return false;
+        if (reader_.load(payload, doc) != simdjson::SUCCESS || doc.get_object().get(obj) != simdjson::SUCCESS) return false;
         for (auto field_result : obj) {
             od::field field;
             if (std::move(field_result).get(field) != simdjson::SUCCESS) return false;
             const std::string_view key = field.escaped_key();
             od::value& v = field.value();
-            unsigned bit = 0;
-            if (key == "event") bit = kEvent;
-            else if (key == "arg") bit = kArg;
-            else if (key == "action") bit = kAction;
-            else if (key == "data") bit = kData;
-            else if (key == "code") bit = kCode;
-            else if (key == "msg") bit = kMsgText;
-            else continue;  // connId 等
-            if ((m.seen & bit) != 0) return false;
-            m.seen |= bit;
-            bool ok = false;
-            switch (bit) {
-                case kEvent: ok = readString(v, m.event); break;
-                case kArg: ok = parseArg(v, m); break;
-                case kAction: ok = readString(v, m.action); break;
-                case kData:
-                    // 已知是其他频道（OKX 总是先发 arg）：data 的形状可能完全不同（如 K 线是数组的数组），
-                    // 不解析，迭代器自动跳过。注意不能"解析失败后继续"：simdjson On-Demand 在嵌套迭代中
-                    // 遇到致命错误会废弃整个文档，外层循环随之静默结束，所以任何嵌套解析失败都必须立即中止。
-                    ok = ((m.seen & kChannel) != 0 && !isBookChannel(m.channel)) || parseData(v);
-                    break;
-                case kCode: ok = readScalarText(v, m.code); break;
-                case kMsgText: ok = readString(v, m.text); break;
-                default: break;
-            }
+            bool ok = true;  // connId 等无关字段不读取
+            if (key == "event") ok = firstSeen(m.seen, kEvent) && readString(v, m.event);
+            else if (key == "arg") ok = firstSeen(m.seen, kArg) && parseArg(v, m);
+            else if (key == "action") ok = firstSeen(m.seen, kAction) && readString(v, m.action);
+            else if (key == "data") ok = firstSeen(m.seen, kData) && parseData(v, m);
+            else if (key == "code") ok = firstSeen(m.seen, kCode) && readScalarText(v, m.code);
+            else if (key == "msg") ok = firstSeen(m.seen, kMsgText) && readString(v, m.text);
             if (!ok) return false;
         }
         return doc.at_end();
@@ -183,22 +166,21 @@ private:
             od::field field;
             if (std::move(field_result).get(field) != simdjson::SUCCESS) return false;
             if (field.escaped_key() != "channel") continue;
-            if ((m.seen & kChannel) != 0) return false;
-            m.seen |= kChannel;
-            if (!readString(field.value(), m.channel)) return false;
+            if (!firstSeen(m.seen, kChannel) || !readString(field.value(), m.channel)) return false;
         }
         return true;
     }
 
-    bool parseData(adapter_detail::od::value& v) {
+    // data 数组。已知是其他频道（OKX 总是先发 arg）：data 的形状可能完全不同（如 K 线是数组的数组），
+    // 不解析，迭代器自动跳过
+    bool parseData(adapter_detail::od::value& v, const Msg& m) {
         using namespace adapter_detail;
+        if ((m.seen & kChannel) != 0 && !isBookChannel(m.channel)) return true;
         od::array arr;
         if (v.get_array().get(arr) != simdjson::SUCCESS) return false;
         for (auto element : arr) {
-            od::value ev;
-            if (element.get(ev) != simdjson::SUCCESS) return false;
             od::object obj;
-            if (ev.get_object().get(obj) != simdjson::SUCCESS) return false;
+            if (element.get_object().get(obj) != simdjson::SUCCESS) return false;
             Entry e;
             e.bid_begin = bids_.size();
             e.ask_begin = asks_.size();
@@ -207,26 +189,13 @@ private:
                 if (std::move(field_result).get(field) != simdjson::SUCCESS) return false;
                 const std::string_view key = field.escaped_key();
                 od::value& fv = field.value();
-                unsigned bit = 0;
-                if (key == "bids") bit = kBids;
-                else if (key == "asks") bit = kAsks;
-                else if (key == "ts") bit = kTs;
-                else if (key == "checksum") bit = kChecksum;
-                else if (key == "prevSeqId") bit = kPrevSeq;
-                else if (key == "seqId") bit = kSeq;
-                else continue;  // instId 等
-                if ((e.seen & bit) != 0) return false;
-                e.seen |= bit;
-                bool ok = false;
-                switch (bit) {
-                    case kBids: ok = parseLevels(fv, bids_); break;
-                    case kAsks: ok = parseLevels(fv, asks_); break;
-                    case kTs: ok = readInt64(fv, e.ts); break;
-                    case kChecksum: ok = readInt64(fv, e.checksum); break;
-                    case kPrevSeq: ok = readInt64(fv, e.prev_seq); break;
-                    case kSeq: ok = readInt64(fv, e.seq); break;
-                    default: break;
-                }
+                bool ok = true;  // instId 等
+                if (key == "bids") ok = firstSeen(e.seen, kBids) && parseLevels(fv, bids_);
+                else if (key == "asks") ok = firstSeen(e.seen, kAsks) && parseLevels(fv, asks_);
+                else if (key == "ts") ok = firstSeen(e.seen, kTs) && readInt(fv, e.ts);
+                else if (key == "checksum") ok = firstSeen(e.seen, kChecksum) && readInt(fv, e.checksum);
+                else if (key == "prevSeqId") ok = firstSeen(e.seen, kPrevSeq) && readInt(fv, e.prev_seq);
+                else if (key == "seqId") ok = firstSeen(e.seen, kSeq) && readInt(fv, e.seq);
                 if (!ok) return false;
             }
             e.bid_end = bids_.size();
@@ -248,31 +217,21 @@ private:
             return;
         }
         Msg m;
-        if (!parse(payload, m)) {
-            malformed(out, "malformed message", payload.size());
-            return;
-        }
-        if ((m.seen & kEvent) != 0) {
-            handleEvent(m, out);
-            return;
-        }
+        if (!parse(payload, m)) return malformed(out, "malformed message", payload.size());
+        if ((m.seen & kEvent) != 0) return handleEvent(m, out);
         if ((m.seen & kData) == 0) {
             ++stats_.ignored;  // 既不是事件也不是推送的合法 JSON
             return;
         }
-        if ((m.seen & kChannel) == 0) {
-            malformed(out, "data push without arg.channel", payload.size());
-            return;
-        }
+        if ((m.seen & kChannel) == 0) return malformed(out, "data push without arg.channel", payload.size());
         if (!isBookChannel(m.channel)) {
             ++stats_.ignored;  // 同一连接上订阅的其他频道
             return;
         }
-        for (const Entry& e : entries_) {
-            if ((e.seen & (kBids | kAsks)) != (kBids | kAsks)) {
-                malformed(out, "book entry without bids/asks", payload.size());
-                return;
-            }
+        unsigned common = ~0u;  // 每个条目都带的字段
+        for (const Entry& e : entries_) common &= e.seen;
+        if ((common & (kBids | kAsks)) != (kBids | kAsks)) {
+            return malformed(out, "book entry without bids/asks", payload.size());
         }
         if (entries_.empty()) {
             ++stats_.ignored;
@@ -280,18 +239,12 @@ private:
         }
         const bool has_action = (m.seen & kAction) != 0;
         const bool is_update = has_action && m.action == "update";
-        const bool is_snapshot = has_action && m.action == "snapshot";
-        if (has_action && !is_update && !is_snapshot) {
+        if (has_action && !is_update && m.action != "snapshot") {
             ++stats_.ignored;
             return;
         }
-        const unsigned required = is_update ? (kSeq | kPrevSeq) : is_snapshot ? kSeq : 0u;
-        for (const Entry& e : entries_) {
-            if ((e.seen & required) != required) {
-                malformed(out, "books entry without seqId/prevSeqId", payload.size());
-                return;
-            }
-        }
+        const unsigned required = is_update ? (kSeq | kPrevSeq) : has_action ? kSeq : 0u;
+        if ((common & required) != required) return malformed(out, "books entry without seqId/prevSeqId", payload.size());
         if ((entries_.front().seen & kTs) != 0) out.exchange_ts_ms = entries_.front().ts;
         incremental_ = has_action;
         for (const Entry& e : entries_) {
@@ -314,28 +267,17 @@ private:
     // 全量快照（books 的 snapshot，或 books5/bbo-tbt 的每次推送）。返回是否继续处理同一消息的后续条目。
     bool applySnapshot(const Entry& e, AdapterResult& out) {
         // 原始字符串只在用得上时维护：增量频道（之后的 update 要用它们校验），或本条目自带 checksum
-        const bool keep_texts = verify_ && (incremental_ || (e.seen & kChecksum) != 0);
-        if (keep_texts && !textsFit(e)) disableChecksum(out, "a level string is longer than 32 bytes");
-        book_.clear();
+        const bool keep_texts = incremental_ || (e.seen & kChecksum) != 0;
+        if (keep_texts) checkTextsFit(e, out);
         // 表为空时 clear() 是 O(1)；不维护字符串时也要清，丢掉之前 books 快照留下的条目
         bid_text_.clear();
         ask_text_.clear();
-        if (keep_texts && verify_) {  // verify_ 可能刚被 disableChecksum 关闭
-            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setLevel(BookSide::Bid, bids_[i]);
-            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setLevel(BookSide::Ask, asks_[i]);
-        } else {
-            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) {
-                book_.setLevel(BookSide::Bid, bids_[i].price, bids_[i].qty);
-            }
-            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) {
-                book_.setLevel(BookSide::Ask, asks_[i].price, asks_[i].qty);
-            }
-        }
-        trimBook();
+        if (keep_texts) setTexts(e);
+        replaceBook(bids_.data() + e.bid_begin, e.bid_end - e.bid_begin, asks_.data() + e.ask_begin,
+                    e.ask_end - e.ask_begin);
         seq_ = (e.seen & kSeq) != 0 ? e.seq : 0;
         book_.setUpdateId(seq_ > 0 ? static_cast<std::uint64_t>(seq_) : 0);
         synced_ = true;
-        unsynced_updates_ = 0;
         ++stats_.snapshots;
         out.book_updated = true;
         if (book_.isCrossed()) {
@@ -343,15 +285,11 @@ private:
             resync(out, "crossed book snapshot");
             return false;
         }
-        if (verify_ && (e.seen & kChecksum) != 0) {
-            std::int32_t computed = 0;
-            const bool built = computeChecksum(computed);
-            if (!built || !checksumMatches(computed, e.checksum)) {
-                ++stats_.checksum_failures;
-                disableChecksum(out, adapter_detail::concat({"snapshot checksum mismatch (expected ",
-                                                             std::to_string(e.checksum), ", computed ",
-                                                             std::to_string(computed), ")"}));
-            }
+        std::int32_t computed = 0;
+        if (!checksumOk(e, computed)) {
+            disableChecksum(out, adapter_detail::concat({"snapshot checksum mismatch (expected ",
+                                                         std::to_string(e.checksum), ", computed ",
+                                                         std::to_string(computed), ")"}));
         }
         return true;
     }
@@ -359,12 +297,7 @@ private:
     // 增量更新。返回是否继续处理同一消息的后续条目。
     bool applyUpdate(const Entry& e, AdapterResult& out) {
         if (!synced_) {
-            ++stats_.ignored;
-            if (++unsynced_updates_ > kMaxUnsyncedUpdates) {
-                unsynced_updates_ = 0;
-                out.reconnect = true;
-                out.error = "OKX: no snapshot after resubscribing, reconnecting";
-            }
+            ignoreUnsynced(out);
             return true;
         }
         if (e.prev_seq != seq_) {
@@ -374,17 +307,11 @@ private:
             resync(out, nullptr);
             return false;
         }
-        if (verify_ && !textsFit(e)) disableChecksum(out, "a level string is longer than 32 bytes");
-        bool changed = false;
-        // 簿：批量排序 + 归并（见 OrderBook::applyLevels）；原始字符串表按消息顺序逐档同步（同价以后者为准）
-        const auto qty = [](const RawLevel& l) { return l.qty; };
-        changed |= book_.applyLevels(BookSide::Bid, bids_.data() + e.bid_begin, e.bid_end - e.bid_begin, batch_, qty);
-        changed |= book_.applyLevels(BookSide::Ask, asks_.data() + e.ask_begin, e.ask_end - e.ask_begin, batch_, qty);
-        if (verify_) {
-            for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setText(BookSide::Bid, bids_[i]);
-            for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setText(BookSide::Ask, asks_[i]);
-        }
-        trimBook();
+        checkTextsFit(e, out);
+        // 原始字符串表按消息顺序逐档同步（同价以后者为准）；簿批量排序 + 归并
+        setTexts(e);
+        const bool changed = updateBook(bids_.data() + e.bid_begin, e.bid_end - e.bid_begin,
+                                        asks_.data() + e.ask_begin, e.ask_end - e.ask_begin);
         seq_ = e.seq;
         book_.setUpdateId(seq_ > 0 ? static_cast<std::uint64_t>(seq_) : 0);
         if (e.bid_begin == e.bid_end && e.ask_begin == e.ask_end) {
@@ -398,55 +325,71 @@ private:
             resync(out, "crossed book after update");
             return false;
         }
-        if (verify_ && (e.seen & kChecksum) != 0) {
-            std::int32_t computed = 0;
-            const bool built = computeChecksum(computed);
-            if (!built || !checksumMatches(computed, e.checksum)) {
-                ++stats_.checksum_failures;
-                out.error = adapter_detail::concat({"OKX: checksum mismatch after update (expected ",
-                                                    std::to_string(e.checksum), ", computed ",
-                                                    std::to_string(computed), ")"});
-                resync(out, nullptr);
-                return false;
+        std::int32_t computed = 0;
+        if (!checksumOk(e, computed)) {
+            out.error = adapter_detail::concat({"OKX: checksum mismatch after update (expected ",
+                                                std::to_string(e.checksum), ", computed ",
+                                                std::to_string(computed), ")"});
+            resync(out, nullptr);
+            return false;
+        }
+        return true;
+    }
+
+    // 校验开启且条目带 checksum 时核对当前簿（判断内联，计算在 checksumMatches 里）
+    bool checksumOk(const Entry& e, std::int32_t& computed) {
+        return !verify_ || (e.seen & kChecksum) == 0 || checksumMatches(e, computed);
+    }
+
+    // 核对 e.checksum 与当前簿；不符（或某档缺少原始字符串）时 checksum_failures++ 并返回 false，
+    // computed 为算出的值（拼不出校验串时为 0）
+    bool checksumMatches(const Entry& e, std::int32_t& computed) {
+        char buf[kChecksumBufSize];
+        std::size_t len = 0;
+        if (buildChecksumString(buf, len)) {
+            computed = hft::toSignedCrc(hft::crc32(buf, len));
+            // 文档规定 checksum 是有符号 32 位整数；为稳妥起见也接受同一 CRC 的无符号写法（比较低 32 位）
+            if (e.checksum >= std::numeric_limits<std::int32_t>::min() &&
+                e.checksum <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) &&
+                static_cast<std::uint32_t>(computed) == static_cast<std::uint32_t>(e.checksum)) {
+                return true;
             }
         }
-        return true;
+        ++stats_.checksum_failures;
+        return false;
     }
 
-    // 设置一档并同步原始字符串（数量 0 删除）。返回簿是否变化。
-    bool setLevel(BookSide side, const RawLevel& l) {
-        const bool changed = book_.setLevel(side, l.price, l.qty);
-        if (verify_) setText(side, l);
-        return changed;
+    // 校验开启时同步条目中每档的原始字符串（数量 0 删除），按消息顺序（同价以后者为准）
+    void setTexts(const Entry& e) {
+        if (!verify_) return;
+        for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) setText(bid_text_, bids_[i]);
+        for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) setText(ask_text_, asks_[i]);
     }
 
-    // 同步一档的原始字符串（数量 0 删除）；只在校验开启时调用
-    void setText(BookSide side, const RawLevel& l) {
-        TextMap& texts = side == BookSide::Bid ? bid_text_ : ask_text_;
-        const std::uint64_t key = adapter_detail::priceKey(l.price);
-        if (!(l.qty > 0.0)) {
+    static void setText(TextMap& texts, const RawLevel& l) {
+        const std::uint64_t key = priceKey(l.price);
+        if (!(l.quantity > 0.0)) {
             texts.erase(key);
-        } else {
-            LevelText& t = texts[key];  // 引用只在本语句块内使用（之后才有下一次修改）
-            std::memcpy(t.text, l.px.data(), l.px.size());
-            t.text[l.px.size()] = ':';
-            std::memcpy(t.text + l.px.size() + 1, l.sz.data(), l.sz.size());
-            t.len = static_cast<std::uint8_t>(l.px.size() + 1 + l.sz.size());
+            return;
         }
+        LevelText& t = texts[key];  // 引用只在本函数内使用（之后才有下一次修改）
+        std::memcpy(t.text, l.px.data(), l.px.size());
+        t.text[l.px.size()] = ':';
+        std::memcpy(t.text + l.px.size() + 1, l.sz.data(), l.sz.size());
+        t.len = static_cast<std::uint8_t>(l.px.size() + 1 + l.sz.size());
     }
 
-    // 条目中所有字符串都能原样存进 LevelText
-    bool textsFit(const Entry& e) const noexcept {
-        auto fits = [](const RawLevel& l) {
+    // 安全阀：条目中有字符串长到无法原样存进 LevelText 时关闭校验
+    void checkTextsFit(const Entry& e, AdapterResult& out) {
+        const auto fits = [](const RawLevel& l) {
             return l.px.size() <= LevelText::kMaxLen && l.sz.size() <= LevelText::kMaxLen;
         };
-        for (std::size_t i = e.bid_begin; i < e.bid_end; ++i) {
-            if (!fits(bids_[i])) return false;
+        const RawLevel* b = bids_.data();
+        const RawLevel* a = asks_.data();
+        if (verify_ && !(std::all_of(b + e.bid_begin, b + e.bid_end, fits) &&
+                         std::all_of(a + e.ask_begin, a + e.ask_end, fits))) {
+            disableChecksum(out, "a level string is longer than 32 bytes");
         }
-        for (std::size_t i = e.ask_begin; i < e.ask_end; ++i) {
-            if (!fits(asks_[i])) return false;
-        }
-        return true;
     }
 
     // 拼接校验串；某档缺少原始字符串（内部不一致）时返回 false
@@ -457,7 +400,7 @@ private:
         const std::size_t na = std::min(kChecksumLevels, asks.size());
         std::size_t pos = 0;
         auto append = [&](const TextMap& texts, double price) {
-            const LevelText* t = texts.find(adapter_detail::priceKey(price));
+            const LevelText* t = texts.find(priceKey(price));
             if (t == nullptr) return false;
             if (pos != 0) buf[pos++] = ':';
             std::memcpy(buf + pos, t->text, LevelText::kCapacity);  // 定长整块复制，只推进实际长度
@@ -470,23 +413,6 @@ private:
             if (i < na && !append(ask_text_, asks[i].price)) return false;
         }
         len = pos;
-        return true;
-    }
-
-    // 文档规定 checksum 是有符号 32 位整数；为稳妥起见也接受同一 CRC 的无符号写法（比较低 32 位）
-    static bool checksumMatches(std::int32_t computed, std::int64_t received) noexcept {
-        if (received < std::numeric_limits<std::int32_t>::min() ||
-            received > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-            return false;
-        }
-        return static_cast<std::uint32_t>(computed) == static_cast<std::uint32_t>(received);
-    }
-
-    bool computeChecksum(std::int32_t& out) const noexcept {
-        char buf[kChecksumBufSize];
-        std::size_t len = 0;
-        if (!buildChecksumString(buf, len)) return false;
-        out = hft::toSignedCrc(hft::crc32(buf, len));
         return true;
     }
 
@@ -504,8 +430,8 @@ private:
             const std::size_t limit = adapter_detail::kMaxBookLevels;
             const std::vector<PriceLevel>& bids = book_.getBids();
             const std::vector<PriceLevel>& asks = book_.getAsks();
-            for (std::size_t i = limit; i < bids.size(); ++i) bid_text_.erase(adapter_detail::priceKey(bids[i].price));
-            for (std::size_t i = limit; i < asks.size(); ++i) ask_text_.erase(adapter_detail::priceKey(asks[i].price));
+            for (std::size_t i = limit; i < bids.size(); ++i) bid_text_.erase(priceKey(bids[i].price));
+            for (std::size_t i = limit; i < asks.size(); ++i) ask_text_.erase(priceKey(asks[i].price));
         }
         ExchangeAdapter::trimBook();
     }
@@ -514,37 +440,20 @@ private:
     void resync(AdapterResult& out, const char* why) {
         ++stats_.resyncs;
         if (why != nullptr) out.error = std::string("OKX: ") + why + ", resyncing";
-        if (!book_.empty()) out.book_updated = true;
-        book_.clear();
-        bid_text_.clear();
-        ask_text_.clear();
-        synced_ = false;
-        seq_ = 0;
-        unsynced_updates_ = 0;
-        if (!incremental_) return;
-        requestResubscribe(out, unsubscribe_msg_);
+        dropBook(out);
+        if (incremental_) requestResubscribe(out);
     }
 
     void resetState() noexcept override {
-        book_.clear();
         bid_text_.clear();
         ask_text_.clear();
-        synced_ = false;
         seq_ = 0;
-        unsynced_updates_ = 0;
-        incremental_ = false;
     }
 
     bool verify_;                       // checksum 校验是否开启（安全阀触发后永久关闭）
-    std::string unsubscribe_msg_;        // 由订阅消息推导出的退订帧（"" = 推导不出）
-    TextMap bid_text_;                   // 买盘每档原始字符串
-    TextMap ask_text_;                   // 卖盘每档原始字符串
-    adapter_detail::JsonReader reader_;
-    std::vector<RawLevel> bids_;         // 当前消息全部条目的买档暂存
-    std::vector<RawLevel> asks_;
-    std::vector<Entry> entries_;         // 当前消息的 data 条目
-    std::int64_t seq_ = 0;               // 最近一条已应用消息的 seqId
-    std::size_t unsynced_updates_ = 0;   // 未同步期间收到的增量条数
-    bool synced_ = false;
-    bool incremental_ = false;           // 当前订阅是否为带 action 的增量频道（决定重同步方式）
+    TextMap bid_text_;                  // 买盘每档原始字符串
+    TextMap ask_text_;                  // 卖盘每档原始字符串
+    std::vector<Entry> entries_;        // 当前消息的 data 条目
+    std::int64_t seq_ = 0;              // 最近一条已应用消息的 seqId
+    bool incremental_ = false;          // 当前消息是否来自带 action 的增量频道（每条订单簿消息都先设置；决定重同步方式）
 };
