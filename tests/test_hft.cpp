@@ -1132,9 +1132,9 @@ TEST_CASE("flat_map: differential vs std::unordered_map, high-bit-only keys (1M 
 }
 
 TEST_CASE("flat_map: differential vs std::unordered_map, erase-heavy churn with growth phases (1M ops)") {
-    // 交替的增长期与删除期：表反复增长到约 2 万个元素再被删到接近空（删除发生在已扩容的大表中）
-    // Alternating growth and erase phases: the map repeatedly grows to about 20,000 elements and is then
-    // erased down to nearly empty (the erases happen in a large, already grown table)
+    // 交替的增长期与删除期：表反复增至约 3 万个元素再删到约 1 万（删除发生在已扩容的大表中）
+    // Alternating growth and erase phases: the map repeatedly grows to about 30,000 elements and is then
+    // erased down to about 10,000 (the erases happen in a large, already grown table)
     runDifferential<std::uint32_t>(
         17, 1'000'000, 0, [](std::mt19937_64& rng) { return static_cast<std::uint32_t>(rng() % 40'000); },
         [](std::size_t op) { return (op / 100'000) % 2 == 0 ? OpMix{65, 20} : OpMix{10, 75}; });
@@ -1259,8 +1259,8 @@ TEST_CASE("flat_map: backward-shift deletion moves exactly the entries that may 
     CHECK_EQ(*m.find(b), 2);
     CHECK_EQ(*m.find(c), 3);
     CHECK_EQ(*m.find(d), 4);
-    // 再删 C（位于表头）：没有后继可移动；再删 B：D 前移到 62
-    // Then erase C (at the table start): there is no successor to move; then erase B: D shifts back to 62
+    // 再删 C（位于表头）：没有后继可移动；再删 B：D 留在 63
+    // Then erase C (at the table start): there is no successor to move; then erase B: D stays at 63
     REQUIRE(m.erase(c));
     if (!m.checkInvariants(&why)) FAIL(why);
     REQUIRE(m.erase(b));

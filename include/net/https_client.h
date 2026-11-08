@@ -108,11 +108,11 @@ public:
         for (std::size_t i = 0; i < count_; ++i) ::close(entries_[i].kick_fd);
     }
 
-    // 登记套接字 fd，返回注销用的令牌。已被踢断/已关闭时立即 shutdown 该套接字并返回 0
-    // （调用方应放弃本次操作）；登记表已满或复制 fd 失败时也返回 0。
-    // Registers a socket fd and returns the token used to unregister it. If already kicked/closed, shuts the
-    // socket down immediately and returns 0 (the caller should give up on this operation); also returns 0
-    // when the registry is full or duplicating the fd fails.
+    // 登记套接字 fd，返回注销用的令牌。已被踢断/已关闭或登记表已满时立即 shutdown
+    // 该套接字并返回 0（调用方应放弃本次操作）；复制 fd 失败时也返回 0。
+    // Registers a socket fd and returns the token used to unregister it. If already kicked/closed or the
+    // registry is full, shuts the socket down immediately and returns 0 (the caller should give up on this
+    // operation); also returns 0 when duplicating the fd fails.
     Token add(int fd) noexcept {
         if (fd < 0) return 0;
         const int kick_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);

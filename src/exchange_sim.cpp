@@ -409,8 +409,8 @@ public:
             bool progress = drain();
             while (stats_.sent < quota_ && stats_.sent - stats_.acked < settings_.window) {
                 if (!have) {
-                    if (!buildCommand(cmd)) break;  // 所有报价槽位都有在途命令：等确认
-                                                    // every quote slot has a command in flight: wait for acks
+                    if (!buildCommand(cmd)) break;  // 本轮没有可操作的槽位：下一轮重试
+                                                    // no actionable slot this round: retry next round
                     have = true;
                 }
                 cmd.client_ts = hft::rdtsc();
@@ -435,10 +435,10 @@ public:
     }
 
     // 引擎停止后核对客户端状态与交易所状态：每个"在簿"报价都在订单簿里且价格/剩余量/归属一致，
-    // 每个"不在簿"报价都确实不在；没有遗留的在途命令。返回在簿报价数。
+    // 每个"不在簿"报价都确实不在；没有遗留的在途命令。返回是否通过；在簿报价数写入 live。
     // After the engine stops, checks client state against exchange state: every "in the book" quote is in the
     // order book with matching price/remaining quantity/owner, every "not in the book" quote really is not; no
-    // commands are left in flight. Returns the number of quotes in the book.
+    // commands are left in flight. Returns whether the check passes; writes the number of quotes in the book to live.
     bool verify(const Runner& runner, std::size_t& live, std::string* why) const {
         live = 0;
         for (std::size_t i = 0; i < slots_.size(); ++i) {

@@ -1,11 +1,11 @@
 //
 // app.h
 // 监控程序主体：命令行解析，按配置创建行情源与套利检测器，事件驱动主循环（排空快照队列 → 更新本地簿 → 套利检测 →
-// 定时健康检查 / 渲染 / 价差日志），停止后输出最终报告。src/main.cpp 只负责信号处理并调用这里（测试直接驱动本类）。
+// 定时健康检查 / 渲染 / 价差日志），停止后输出最终报告。src/main.cpp 负责信号与配置并调用这里（测试直接驱动本类）。
 // Monitor core: command-line parsing, creating the feeds and the arbitrage detector from the config, the
 // event-driven main loop (drain the snapshot queues → update the local books → arbitrage detection →
 // periodic health checks / rendering / spread logging), and the final report after stopping.
-// src/main.cpp only handles signals and calls into this (tests drive this class directly).
+// src/main.cpp handles signals and the config, and calls into this (tests drive this class directly).
 //
 
 #pragma once

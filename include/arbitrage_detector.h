@@ -90,7 +90,7 @@ struct SweepResult {
 // - 事件驱动：某个交易所的簿变化后只需检测涉及它的交易所对（detectVenue）。
 //   任一侧为空（行情源断线时会发布空簿）视为"无数据"：不出信号，pairState().has_data = false。
 // - 信号保存在有界 deque 中（最近 kMaxSignals 条），另有累计统计；检测器从不向 stdout 打印。
-// - 每侧一档、两侧手续费相等时与 v1 的公式与去重决策逐位相同（v1 只有两个交易所、只看最优档：max_levels = 1）。
+// - 每侧一档、两侧手续费相等时与 v1 的公式逐位相同（v1 只有两个交易所、只看最优档：max_levels = 1）。
 // - 非线程安全：只在主线程使用。
 // Arbitrage detector:
 // - N exchanges (numbered 0..N-1); checks every ordered exchange pair: buy from buy's asks, sell into
@@ -108,8 +108,8 @@ struct SweepResult {
 //   pairState().has_data = false.
 // - Signals are kept in a bounded deque (the latest kMaxSignals), plus cumulative statistics; the detector
 //   never prints to stdout.
-// - With one level per side and equal fees on both sides, the formula and the dedup decisions are
-//   bit-identical to v1 (v1 had only two exchanges and looked only at the best level: max_levels = 1).
+// - With one level per side and equal fees on both sides, the formula is bit-identical to v1
+//   (v1 had only two exchanges and looked only at the best level: max_levels = 1).
 // - Not thread-safe: used only on the main thread.
 class ArbitrageDetector {
 public:
@@ -163,12 +163,12 @@ public:
     // ---------------- Pure function: sweep ----------------
 
     // asks：买方交易所的卖盘（价格递增），bids：卖方交易所的买盘（价格递减），最优档在下标 0。
-    // 数量 <= 0 或非有限值的档位被跳过；价格 <= 0 或非有限值时停止。两侧手续费相等时手续费按
+    // 数量 <= 0 或 NaN 的档位被跳过；价格 <= 0 或非有限值时停止。两侧手续费相等时手续费按
     // (ask + bid) × q × f 计算，因此每侧一档时与 v1 公式逐位相同：
     //   gross = (bid - ask) × min(q_ask, q_bid)，fee = (ask + bid) × qty × fee_rate，net = gross - fee。
     // asks: the buy exchange's asks (ascending prices), bids: the sell exchange's bids (descending prices),
     // best level at index 0.
-    // Levels whose quantity is <= 0 or non-finite are skipped; a price <= 0 or non-finite stops the sweep.
+    // Levels whose quantity is <= 0 or NaN are skipped; a price <= 0 or non-finite stops the sweep.
     // With equal fees on both sides the fee is computed as (ask + bid) × q × f, so with one level per side it
     // is bit-identical to the v1 formula:
     //   gross = (bid - ask) × min(q_ask, q_bid), fee = (ask + bid) × qty × fee_rate, net = gross - fee.

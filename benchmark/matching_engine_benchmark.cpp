@@ -327,9 +327,11 @@ template <template <class> class BookT>
 Result measure(const Workload& w, int reps) {
     Result r = latencyPass<BookT>(w);
     if (w.all_timed) {
-        // 均值与分配次数改用无逐条计时开销的吞吐量测量（重复 reps 次取中位数）
-        // The mean and the allocation count come from the throughput measurement instead, which has no
-        // per-operation timing overhead (median of reps repetitions)
+        // 均值改用无逐条计时开销的吞吐量测量（重复 reps 次取中位数）；
+        // 分配次数取逐条计时与最后一次吞吐量测量中的较大值
+        // The mean comes from the throughput measurement instead, which has no per-operation timing overhead
+        // (median of reps repetitions); the allocation count is the larger of the counts from the
+        // per-operation timing and the last throughput measurement
         std::vector<double> means;
         double allocs = 0;
         for (int i = 0; i < reps; ++i) {

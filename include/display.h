@@ -193,12 +193,13 @@ public:
         return frame;
     }
 
-    // 把一帧写到 out：光标归位（首帧先清屏），每行后擦除到行尾，最后擦除帧下方的残留；一次 fwrite。
+    // 把一帧写到 out_file：光标归位（首帧先清屏），每行后擦除到行尾，
+    // 最后擦除帧下方的残留；一次 fwrite。
     // max_cols > 0（终端宽度）且小于帧宽时把每行截断到终端宽度：右侧被裁掉，但不会折行打乱整个画面。
     // - 最后一行之后不换行：帧可以占满终端的全部 max_rows 行而不引起滚动（下一帧从光标归位开始）。
     // - 占满整行的行不再发擦除到行尾：光标停在最后一列时 "\033[K" 会把该列（右边框）也擦掉。
-    // Write a frame to out: cursor home (the first frame clears the screen first), erase to end of line after
-    // each line, finally erase what is left below the frame; one fwrite.
+    // Write a frame to out_file: cursor home (the first frame clears the screen first), erase to end of line
+    // after each line, finally erase what is left below the frame; one fwrite.
     // When max_cols > 0 (the terminal width) is less than the frame width, every line is truncated to the
     // terminal width: the right side is cut off, but nothing wraps and scrambles the whole view.
     // - No newline after the last line: the frame can fill all max_rows lines of the terminal without scrolling

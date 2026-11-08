@@ -734,8 +734,10 @@ TEST_CASE("tools: sameState and queriesConsistent detect every tampered query") 
         CHECK(!queriesConsistent(bad, &why));
         CHECK(!why.empty());
     }
-    // sameState 能发现的（与真实簿对比）：所有篡改都会被发现
-    // What sameState can detect (comparison against the real book): every tampering is detected
+    // sameState 能发现的（与真实簿对比）：
+    // 除 DepthPrefix 外的所有篡改都会被发现
+    // What sameState can detect (comparison against the real book):
+    // every tampering except DepthPrefix is detected
     for (T::Fault f : {T::Fault::BestBid, T::Fault::BestAsk, T::Fault::OrderCount, T::Fault::LevelCount,
                        T::Fault::DepthQty, T::Fault::DepthOrders, T::Fault::OrdersAtRemaining,
                        T::Fault::OrdersAtOrder, T::Fault::FindOrder, T::Fault::VolumeAt,
@@ -1815,9 +1817,9 @@ TEST_CASE("optimized: deep books built in random price order match the reference
         if (i % 512 == 0) DUAL_VERIFY(d);
     }
     DUAL_VERIFY(d);
-    // 两次深扫：市价卖单吃掉大半买盘，限价买单穿过一段卖盘后挂单
-    // Two deep sweeps: a market sell takes most of the bids, and a limit buy crosses part of the asks and then
-    // rests
+    // 两次深扫：市价卖单吃掉四成买盘，限价买单在一段卖盘内成交完
+    // Two deep sweeps: a market sell takes 40% of the bids, and a limit buy is fully filled within
+    // part of the asks
     DUAL_RUN(d, Command::newOrder(marketSell(900'001, 2'500).account(7)));
     DUAL_RUN(d, Command::newOrder(buy(900'002, 24'000, 3'000).account(7)));
     DUAL_VERIFY(d);
@@ -1865,8 +1867,8 @@ TEST_CASE("optimized: extreme quantities and prices match the reference without 
     const OrderRequest m1 = marketSell(10, kMax - 1).account(2);
     CHECK_EVENTS(DUAL_RUN(d, Command::newOrder(m1)), accepted(m1),
                  trade(4, 9, 10, 1, 2, Side::Sell, 1, kMax - 1, 1, 0));
-    // 改到最高价、最大数量（失去优先级、重新挂单），再被一张价格为 1 的卖单成交
-    // Modified to the highest price and the maximum quantity (losing priority and resting again), then
+    // 改到次高价、最大数量（失去优先级、重新挂单），再被一张价格为 1 的卖单成交
+    // Modified to the second-highest price and the maximum quantity (losing priority and resting again), then
     // filled by a sell order priced at 1
     CHECK_EVENTS(DUAL_RUN(d, Command::modify(9, kTop - 1, kMax)), modified(9, kTop - 1, kMax));
     CHECK_TOP(d.opt.book, kTop - 1, std::nullopt);
@@ -1921,9 +1923,11 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
         CHECK_EQ(d.opt.book.orderCount(), 0u);
     }
     {
-        // 改单路径：1 手的卖单同价加量到 2^62 被拒，订单原样保留（含队列位置）；加到 2^62 - 1 恰好到上限
+        // 改单路径：1 手的卖单同价加量到 2^62 被拒，订单原样保留（含队列位置）；
+        // 同档成交 5 手后加到 2^62 + 4 恰好到上限
         // Modify path: increasing a 1-lot sell order at the same price to 2^62 is rejected and the order is kept
-        // as is (including its queue position); increasing it to 2^62 - 1 reaches the bound exactly
+        // as is (including its queue position); after 5 lots trade at the same level, increasing it to 2^62 + 4
+        // reaches the bound exactly
         DualBook d(0, 8);
         DUAL_RUN(d, Command::newOrder(sell(1, 100, kP62).account(1)));
         DUAL_RUN(d, Command::newOrder(sell(2, 100, 1).account(2)));

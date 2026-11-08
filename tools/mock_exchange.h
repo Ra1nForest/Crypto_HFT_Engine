@@ -250,8 +250,8 @@ public:
         std::uint64_t bytes_sent = 0;
         std::uint64_t requests = 0;          // 收到的客户端文本帧
                                              // client text frames received
-        std::uint64_t bad_requests = 0;      // 其中被拒绝 / 报错的
-                                             // of those, rejected / answered with an error
+        std::uint64_t bad_requests = 0;      // 被拒绝 / 报错的请求
+                                             // requests rejected / answered with an error
         std::uint64_t rest_requests = 0;     // HTTP 请求（Binance REST）
                                              // HTTP requests (Binance REST)
         std::uint64_t dropped = 0;           // 故障注入丢弃的推送报文

@@ -366,9 +366,9 @@ struct FeedRunner {
     }
 };
 
-// 指向模拟服务器的基础配置：tls_verify + ca_file = 服务器证书；短退避；关闭应用层心跳与 stderr 输出
+// 指向模拟服务器的基础配置：tls_verify + ca_file = 服务器证书；短退避；关闭心跳与 stderr 输出
 // Base config pointing at the mock server: tls_verify + ca_file = the server certificate; short backoff;
-// application-level heartbeats and stderr output disabled
+// heartbeats and stderr output disabled
 FeedConfig baseConfig(Exchange exchange, MockExchangeServer& server) {
     FeedConfig c;
     c.exchange = exchange;

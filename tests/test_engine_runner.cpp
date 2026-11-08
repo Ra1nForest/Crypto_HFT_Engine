@@ -594,14 +594,14 @@ private:
 // 随机命令流：每个 (网关, 交易对) 一个 RandomCommandGenerator（各自跟踪自己的订单，撤单/改单多半命中
 // 自己的订单），按命令随机选交易对；可选极少量未知交易对与非法命令类型。
 // colliding：各网关共用 id 空间 [1, 4096]（大量跨网关重复 id、撤/改别人的订单）；
-// 否则各网关 id 加不同偏移（边界 id 0 / UINT64_MAX 保持原样，仍会偶尔碰撞）。
+// 否则各网关 id 加不同偏移（边界 id UINT64_MAX 与 UINT64_MAX - 1 保持原样，仍会偶尔碰撞）。
 // Random command stream: one RandomCommandGenerator per (gateway, symbol) (each tracks its own orders, so
 // cancels/modifies mostly hit its own orders), with a random symbol per command; optionally a tiny share
 // of unknown symbols and invalid command types.
 // colliding: all gateways share the id space [1, 4096] (many cross-gateway duplicate ids, cancels/modifies
 // of other gateways' orders);
-// otherwise each gateway's ids get a different offset (the boundary ids 0 / UINT64_MAX stay unchanged and
-// still collide occasionally).
+// otherwise each gateway's ids get a different offset (the boundary ids UINT64_MAX and UINT64_MAX - 1 stay
+// unchanged and still collide occasionally).
 // ============================================================================
 struct ScriptOptions {
     std::size_t symbols = 1;

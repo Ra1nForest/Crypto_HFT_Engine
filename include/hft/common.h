@@ -26,11 +26,12 @@
 // Forced inlining: for small functions on hot paths
 #define HFT_ALWAYS_INLINE inline __attribute__((always_inline))
 
-// 调试断言（默认关闭）。本项目所有构建都是 -O2 且未定义 NDEBUG，标准 assert 会留在热路径里；
+// 调试断言（默认关闭）。本项目所有构建都是 -O2（sanitizer 构建为 -O1）且未定义 NDEBUG，
+// 标准 assert 会留在热路径里；
 // 在包含任何 hft 头文件之前定义 HFT_ENABLE_ASSERTS 即可启用（tests/test_hft.cpp 会启用）。
 // 关闭时表达式不求值，但仍参与编译（避免"变量未使用"告警）。
-// Debug assertions (off by default). Every build of this project is -O2 without NDEBUG, so a standard
-// assert would stay in hot paths;
+// Debug assertions (off by default). Every build of this project is -O2 (sanitizer builds are -O1)
+// without NDEBUG, so a standard assert would stay in hot paths;
 // define HFT_ENABLE_ASSERTS before including any hft header to enable them (tests/test_hft.cpp does).
 // When disabled, the expression is not evaluated but still compiled (avoiding "unused variable" warnings).
 #if defined(HFT_ENABLE_ASSERTS)

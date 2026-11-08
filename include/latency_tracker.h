@@ -1,8 +1,8 @@
 //
 // latency_tracker.h
-// 延迟统计器：带展示名称的纳秒 hft::LatencyHistogram（HDR 直方图），供行情线程写、界面与日志读。
-// Latency tracker: a nanosecond hft::LatencyHistogram (HDR histogram) with a display name, written by the
-// market data thread and read by the UI and logging.
+// 延迟统计器：带展示名称的纳秒 hft::LatencyHistogram（HDR 直方图），供单个线程写、界面与日志读。
+// Latency tracker: a nanosecond hft::LatencyHistogram (HDR histogram) with a display name, written
+// by a single thread and read by the UI and logging.
 //
 
 #pragma once

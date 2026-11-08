@@ -507,8 +507,8 @@ private:
         return true;
     }
 
-    // 安全阀：关闭校验并释放原始字符串表
-    // Safety valve: turns verification off and releases the original-string tables
+    // 安全阀：关闭校验并清空原始字符串表
+    // Safety valve: turns verification off and clears the original-string tables
     void disableChecksum(AdapterResult& out, const std::string& why) {
         verify_ = false;
         bid_text_.clear();

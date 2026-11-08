@@ -660,9 +660,9 @@ private:
         *slot = rest(taker, price, post_only, pos);
     }
 
-    // 索引中有占位条目 slot 时调用监听器：回调抛异常则撤销占位（簿回到命令之前的一致状态），异常原样传播
+    // 索引中有占位条目 slot 时调用监听器：回调抛异常则撤销占位（簿保持结构一致），异常原样传播
     // Invoke the listener while the index holds the placeholder entry slot: if the callback throws, remove the
-    // placeholder (the book returns to its consistent pre-command state) and let the exception propagate as is
+    // placeholder (the book stays structurally consistent) and let the exception propagate as is
     template <class Callback>
     HFT_ALWAYS_INLINE void notifyHolding(Order** slot, Callback&& callback) {
         try {

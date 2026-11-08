@@ -139,9 +139,9 @@ double queueThroughputNsPerItem(Queue& q, std::uint64_t items, bool pin) {
     return ns / static_cast<double>(items);
 }
 
-// 往返延迟：主线程推入 TSC 时间戳，回声线程原样送回，主线程记录 RTT
-// Round-trip latency: the main thread pushes a TSC timestamp, the echo thread sends it back as is, and the
-// main thread records the RTT
+// 往返延迟：发送线程推入 TSC 时间戳，回声线程原样送回，前者记录 RTT
+// Round-trip latency: the sending thread pushes a TSC timestamp, the echo thread sends it back as is,
+// and the former records the RTT
 template <class Queue>
 void queuePingPong(Queue& to_echo, Queue& from_echo, std::uint64_t rounds, bool pin, hft::LatencyHistogram& rtt) {
     std::thread echo([&] {

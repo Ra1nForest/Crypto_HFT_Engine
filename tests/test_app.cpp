@@ -773,9 +773,9 @@ TEST_CASE("sweep: fees stop the walk at the first unprofitable marginal unit (eq
     CHECK_EQ(none.qty, 0.0);
     CHECK_EQ(none.net, 0.0);
     CHECK_EQ(none.levelsUsed(), 0);
-    // 边际判断：bid*(1-fs) - ask*(1+fb) > 0 恰好不成立时不交易（103*0.99 - 100*1.0197 = 1.97 - 1.97 < 0）
+    // 边际判断：bid*(1-fs) - ask*(1+fb) > 0 恰好不成立时不交易（103*0.99 - 100*1.0198 = 1.97 - 1.98 < 0）
     // Marginal check: no trade when bid*(1-fs) - ask*(1+fb) > 0 only just fails to hold
-    // (103*0.99 - 100*1.0197 = 1.97 - 1.97 < 0)
+    // (103*0.99 - 100*1.0198 = 1.97 - 1.98 < 0)
     const SweepResult edge = sweepOf(L({{100.0, 1.0}}), L({{103.0, 1.0}}), 0.0198, 0.01);
     CHECK_EQ(edge.qty, 0.0);
 }

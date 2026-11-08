@@ -54,7 +54,8 @@ struct LevelBatchScratch {
 //   （保证簿始终满足 validate()）。
 // - 快路径：先比较尾部（追加更差的价格，O(1) 均摊），再顺序检查最优的 8 档（顶部更新最常见），其余情况二分查找。
 //   旧行情代码"clearBids + 按交易所顺序逐档 updateBid"因此仍是每档 O(1)。
-// - 价格相等用 double 精确比较：相同的交易所字符串经 from_chars（正确舍入）解析出相同的 double。
+// - 价格相等用 double 精确比较：相同的交易所字符串经 parseDecimal（正确舍入，与 from_chars 逐位相同）
+//   解析出相同的 double。
 // - 设计取舍：扁平 vector 让顶部读取与整簿拷贝极快、缓存友好；代价是在顶部插入/删除新档位需要
 //   memmove 整个一侧（400 档约 6.4 KB，百纳秒级）。修改已有档位的数量不移动内存。
 //   一条增量消息有很多档位变化时用 applyLevels：一次线性归并（输入不是最优在前时先排序），避免逐档 memmove
@@ -69,14 +70,14 @@ struct LevelBatchScratch {
 //   levels in order (top-of-book updates are the most common), otherwise binary search.
 //   The old market data code "clearBids + updateBid level by level in exchange order" is therefore still O(1)
 //   per level.
-// - Price equality is an exact double comparison: identical exchange strings parse through from_chars
-//   (correctly rounded) to identical doubles.
+// - Price equality is an exact double comparison: identical exchange strings parse through parseDecimal
+//   (correctly rounded, bit-identical to from_chars) to identical doubles.
 // - Design trade-off: flat vectors make top-of-book reads and whole-book copies very fast and cache-friendly;
 //   the cost is that inserting/deleting a level at the top has to memmove the whole side (about 6.4 KB for
 //   400 levels, on the order of 100 ns). Changing the quantity of an existing level moves no memory.
 //   When one incremental message changes many levels, use applyLevels: a single linear merge (sorting first
 //   if the input is not best first) avoids a memmove per level (an order of magnitude faster on deep books).
-// - Not thread-safe: the owner synchronizes (private to the market data thread, or copied under a lock).
+// - Not thread-safe: the owner synchronizes (private to the feed thread, or copied under a lock).
 class OrderBook {
 public:
     // 默认构造：symbol 为空

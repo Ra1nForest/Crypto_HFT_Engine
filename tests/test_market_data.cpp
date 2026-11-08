@@ -587,8 +587,8 @@ TEST_CASE("orderbook: every insert/update/erase position on books of 0..20 level
     // Covers every boundary between the three parts: the tail fast path, the sequential search of the top
     // (8 levels) and the binary search
     for (int size = 0; size <= 20; ++size) {
-        for (int target = -1; target <= 2 * size + 1; ++target) {   // 偶数位置 = 已有档位，奇数 = 两档之间
-                                                                    // even = existing level, odd = between two levels
+        for (int target = -1; target <= 2 * size + 1; ++target) {   // 奇数位置 = 已有档位，偶数 = 两档之间
+                                                                    // odd = existing level, even = between two levels
             for (int op = 0; op < 3; ++op) {                      // 0 改量/插入, 1 删除, 2 数量不变
                                                                   // 0 update/insert, 1 erase, 2 quantity unchanged
                 for (BookSide side : {BookSide::Bid, BookSide::Ask}) {
@@ -2138,8 +2138,8 @@ class OkxSim {
 public:
     explicit OkxSim(std::uint64_t seed, int levels = 400) : rng_(seed) {
         for (int t = 1; t <= levels; ++t) {
-            const std::int64_t bt = kMid - t - static_cast<std::int64_t>(rng_() % 2) * 1000;  // 偶尔远端
-                                                                                              // occasionally far out
+            const std::int64_t bt = kMid - t - static_cast<std::int64_t>(rng_() % 2) * 1000;  // 半数远端
+                                                                                              // half of them far out
             const std::int64_t at = kMid + t + static_cast<std::int64_t>(rng_() % 2) * 1000;
             state_.bids[bt] = {okxPrice(bt), randomSize(rng_)};
             state_.asks[at] = {okxPrice(at), randomSize(rng_)};

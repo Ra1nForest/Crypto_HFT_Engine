@@ -19,7 +19,7 @@
 // - 非法的 UTF-8 字节（孤立的续字节、缺少续字节的首字节、过长编码、代理码点、0xF5-0xFF 等）每个按 1 列计
 //   （终端显示为 U+FFFD）。
 // - 已知局限：东亚宽字符、emoji 在终端中占 2 列，组合字符占 0 列，这里都按 1 列计。
-//   本程序的输出只有 ASCII、框线字符（'─'、'│'、'═' 等 U+2500 区段）、'…' 与 'µ'，都是单宽字符，不受影响。
+//   本程序的输出只有 ASCII、框线字符（'─'、'│'、'═' 等 U+2500 区段）、'…'、'≤' 与 'µ'，都是单宽字符，不受影响。
 // - "悬空"转义序列：字符串在一个转义序列中间结束（如孤立的 ESC、"\033[31"、没有结束符的 OSC）。在它后面追加的
 //   文本会被终端（和 visibleWidth）当作序列的一部分吞掉，所以生成文本的函数（truncateVisible / padRight / padLeft /
 //   center / fit）都会丢掉结尾的悬空序列（它本来就不可见），保证结果可以安全地与其他文本拼接。
@@ -35,7 +35,7 @@
 //   U+FFFD).
 // - Known limitation: East Asian wide characters and emoji take 2 columns in a terminal and combining
 //   characters 0, but all of them count as 1 column here. This program's output has only ASCII, box-drawing
-//   characters ('─', '│', '═' etc., the U+2500 block), '…' and 'µ', all single-width, so it is not affected.
+//   characters ('─', '│', '═' etc., the U+2500 block), '…', '≤' and 'µ', all single-width, so it is not affected.
 // - "Dangling" escape sequence: the string ends in the middle of an escape sequence (e.g. a lone ESC,
 //   "\033[31", an OSC without its terminator). Text appended after it would be swallowed by the terminal (and
 //   visibleWidth) as part of the sequence, so the functions that produce text (truncateVisible / padRight /

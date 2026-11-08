@@ -136,8 +136,8 @@ inline constexpr AccountId kC = 3;
 inline constexpr AccountId kD = 4;
 
 // ============================================================================
-// submit 校验（规则 1-6 及其优先顺序）
-// submit validation (rules 1-6 and their precedence)
+// submit 校验（规则 1-7 及其优先顺序）
+// submit validation (rules 1-7 and their precedence)
 // ============================================================================
 template <template <class> class BookT>
 void registerValidationSpecs(const SpecRegistrar& add) {
