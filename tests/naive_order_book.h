@@ -43,10 +43,8 @@ public:
     NaiveOrderBook& operator=(const NaiveOrderBook&) = delete;
 
     void submit(const OrderRequest& req) {
-        if (const std::optional<RejectReason> reason = newOrderRejection(req)) {
-            listener_.onRejected(req.id, RequestType::New, *reason);
-            return;
-        }
+        if (const std::optional<RejectReason> reason = newOrderRejection(req))
+            return reject(req.id, RequestType::New, *reason);
         listener_.onAccepted(req);
 
         const TakerSpec taker{req.id, req.account, req.side, req.type == OrderType::Market,
@@ -79,10 +77,7 @@ public:
 
     void cancel(OrderId id) {
         const std::size_t i = indexOf(id);
-        if (i == kNone) {
-            listener_.onRejected(id, RequestType::Cancel, RejectReason::UnknownOrder);
-            return;
-        }
+        if (i == kNone) return reject(id, RequestType::Cancel, RejectReason::UnknownOrder);
         const Qty remaining = orders_[i].info.remaining;
         orders_.erase(orders_.begin() + static_cast<std::ptrdiff_t>(i));
         listener_.onCancelled(id, remaining, CancelReason::UserRequested);
@@ -90,29 +85,16 @@ public:
 
     void modify(OrderId id, Price new_price, Qty new_qty) {
         const std::size_t i = indexOf(id);
-        if (i == kNone) {
-            listener_.onRejected(id, RequestType::Modify, RejectReason::UnknownOrder);
-            return;
-        }
-        if (new_qty <= 0) {
-            listener_.onRejected(id, RequestType::Modify, RejectReason::InvalidQuantity);
-            return;
-        }
-        if (new_price <= 0) {
-            listener_.onRejected(id, RequestType::Modify, RejectReason::InvalidPrice);
-            return;
-        }
+        if (i == kNone) return reject(id, RequestType::Modify, RejectReason::UnknownOrder);
+        if (new_qty <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+        if (new_price <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidPrice);
         OrderInfo info = orders_[i].info;
         // 改价或加量会把订单重新挂到 new_price：挂上去之后该档总量不得越界（原地减量不受限）
         const bool in_place = new_price == info.price && new_qty <= info.remaining;
-        if (!in_place && exceedsLevelBound(info.side, new_price, id, new_qty)) {
-            listener_.onRejected(id, RequestType::Modify, RejectReason::InvalidQuantity);
-            return;
-        }
-        if (info.post_only && new_price != info.price && wouldCross(info.side, new_price)) {
-            listener_.onRejected(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
-            return;
-        }
+        if (!in_place && exceedsLevelBound(info.side, new_price, id, new_qty))
+            return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+        if (info.post_only && new_price != info.price && wouldCross(info.side, new_price))
+            return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
         if (in_place) {
             orders_[i].info.remaining = new_qty;  // 原地修改：seq 不变，保留时间优先级
             listener_.onModified(id, new_price, new_qty);
@@ -351,6 +333,8 @@ private:
     }
 
     void insert(const OrderInfo& info) { orders_.push_back(Resting{info, next_seq_++}); }
+
+    void reject(OrderId id, RequestType request, RejectReason reason) { listener_.onRejected(id, request, reason); }
 
     Listener& listener_;
     std::size_t max_orders_;

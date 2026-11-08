@@ -26,7 +26,6 @@
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <random>
 #include <string>
@@ -41,7 +40,6 @@
 
 // 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-std::atomic<std::uint64_t>& g_heap_allocations = hft::alloc_counter::g_total;
 std::uint64_t heapAllocations() { return hft::alloc_counter::total(); }
 }  // namespace
 
@@ -422,9 +420,7 @@ public:
 
     // 重放一条命令；内部不一致（maker 找不到所属网关）时返回 false 并写明原因
     bool apply(std::uint64_t engine_seq, GatewayId g, const EngineCommand& cmd, std::string* why) {
-        auto make = [&](EventType type, SymbolId s, OrderId id) {
-            return header(Hdr{engine_seq, cmd.client_ts, g, s}, type, id);
-        };
+        auto hdr = [&](SymbolId symbol) { return Hdr{engine_seq, cmd.client_ts, g, symbol}; };
         recorder_.events.clear();
         const SymbolId s = cmd.symbol;
         const bool known = s < engine_.symbolCount();
@@ -437,9 +433,7 @@ public:
                 if (known) {
                     const auto it = owners_.find(Key{s, cmd.order_id});
                     if (it != owners_.end() && it->second != g) {  // 会话隔离：别人的订单
-                        EngineEvent e = make(EventType::Rejected, s, cmd.order_id);
-                        e.rejected = RejectedInfo{cmd.type, RejectReason::UnknownOrder};
-                        expected_[g].push_back(e);
+                        expected_[g].push_back(evRejected(hdr(s), cmd.order_id, cmd.type, RejectReason::UnknownOrder));
                         ++foreign_;
                         return true;
                     }
@@ -448,31 +442,21 @@ public:
                 else engine_.modify(s, cmd.order_id, cmd.price, cmd.qty);
                 break;
             }
-            default: {
-                EngineEvent e = make(EventType::Rejected, s, cmd.order_id);
-                e.rejected = RejectedInfo{cmd.type, RejectReason::InvalidFlags};
-                expected_[g].push_back(e);
+            default:
+                expected_[g].push_back(evRejected(hdr(s), cmd.order_id, cmd.type, RejectReason::InvalidFlags));
                 return true;
-            }
         }
         bool touched_own = false;  // 命令自身的订单被接受 / 改单生效 / 被撤
         for (const RawEvent& r : recorder_.events) {
             const mt::Event& ev = r.event;
             switch (ev.kind) {
-                case mt::Event::Kind::Accepted: {
-                    const OrderRequest& q = ev.request;
-                    EngineEvent e = make(EventType::Accepted, r.symbol, q.id);
-                    e.accepted = AcceptedInfo{q.price, q.qty, q.account, q.side, q.type, q.tif, q.post_only, q.stp};
-                    expected_[g].push_back(e);
+                case mt::Event::Kind::Accepted:
+                    expected_[g].push_back(evAccepted(hdr(r.symbol), ev.request));
                     touched_own = true;
                     break;
-                }
-                case mt::Event::Kind::Rejected: {
-                    EngineEvent e = make(EventType::Rejected, r.symbol, ev.id);
-                    e.rejected = RejectedInfo{ev.request_type, ev.reject_reason};
-                    expected_[g].push_back(e);
+                case mt::Event::Kind::Rejected:
+                    expected_[g].push_back(evRejected(hdr(r.symbol), ev.id, ev.request_type, ev.reject_reason));
                     break;
-                }
                 case mt::Event::Kind::Trade: {
                     const Trade& t = ev.trade;
                     if (t.taker_id != cmd.order_id) return fail(why, "trade taker is not the command's order");
@@ -480,20 +464,16 @@ public:
                     if (it == owners_.end()) return fail(why, "maker " + std::to_string(t.maker_id) + " has no owner");
                     const GatewayId maker_gw = it->second;
                     if (t.maker_remaining == 0) owners_.erase(it);
-                    EngineEvent m = make(EventType::Fill, r.symbol, t.maker_id);
-                    m.liquidity = Liquidity::Maker;
-                    m.fill = FillInfo{t.trade_id, t.price, t.qty, t.maker_remaining};
-                    expected_[maker_gw].push_back(m);
-                    EngineEvent k = make(EventType::Fill, r.symbol, t.taker_id);
-                    k.liquidity = Liquidity::Taker;
-                    k.fill = FillInfo{t.trade_id, t.price, t.qty, t.taker_remaining};
-                    expected_[g].push_back(k);
+                    const Hdr h = hdr(r.symbol);
+                    expected_[maker_gw].push_back(
+                        evFill(h, t.maker_id, Liquidity::Maker, t.trade_id, t.price, t.qty, t.maker_remaining));
+                    expected_[g].push_back(
+                        evFill(h, t.taker_id, Liquidity::Taker, t.trade_id, t.price, t.qty, t.taker_remaining));
                     ++trades_;
                     break;
                 }
                 case mt::Event::Kind::Cancelled: {
-                    EngineEvent e = make(EventType::Cancelled, r.symbol, ev.id);
-                    e.cancelled = CancelledInfo{ev.qty, ev.cancel_reason};
+                    const EngineEvent e = evCancelled(hdr(r.symbol), ev.id, ev.qty, ev.cancel_reason);
                     if (ev.id == cmd.order_id) {
                         expected_[g].push_back(e);
                         touched_own = true;
@@ -507,13 +487,10 @@ public:
                     }
                     break;
                 }
-                case mt::Event::Kind::Modified: {
-                    EngineEvent e = make(EventType::Modified, r.symbol, ev.id);
-                    e.modified = ModifiedInfo{ev.price, ev.qty};
-                    expected_[g].push_back(e);
+                case mt::Event::Kind::Modified:
+                    expected_[g].push_back(evModified(hdr(r.symbol), ev.id, ev.price, ev.qty));
                     touched_own = true;
                     break;
-                }
             }
         }
         if (touched_own) {
@@ -768,19 +745,6 @@ std::size_t firstAllowedCpu() {
     return 0;
 }
 
-OrderRequest limitReq(OrderId id, Side side, Price px, Qty qty, AccountId acct = 1, StpMode stp = StpMode::None) {
-    OrderRequest r;
-    r.id = id;
-    r.account = acct;
-    r.side = side;
-    r.type = OrderType::Limit;
-    r.tif = TimeInForce::GTC;
-    r.price = px;
-    r.qty = qty;
-    r.stp = stp;
-    return r;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -801,16 +765,8 @@ TEST_CASE("runner: commands and events are one-cache-line PODs") {
 }
 
 TEST_CASE("runner: command factories round-trip every field") {
-    OrderRequest r;
-    r.id = 0xFFFF'FFFF'FFFF'FFFEULL;
-    r.account = 77;
-    r.side = Side::Sell;
-    r.type = OrderType::Market;
-    r.tif = TimeInForce::FOK;
-    r.price = -5;
-    r.qty = 123456789;
-    r.post_only = true;
-    r.stp = StpMode::CancelBoth;
+    const OrderRequest r = mt::marketSell(0xFFFF'FFFF'FFFF'FFFEULL, 123456789)
+                               .account(77).fok().price(-5).postOnly().stp(StpMode::CancelBoth);
     const EngineCommand n = EngineCommand::newOrder(3, 9, 4, r, 555);
     CHECK_EQ(n.type, RequestType::New);
     CHECK_EQ(n.gateway, 3u);
@@ -872,12 +828,12 @@ TEST_CASE("runner: single gateway event flow echoes sequence, timestamp and gate
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
 
-    const OrderRequest s1 = limitReq(1, Side::Sell, 101, 5, 1);
+    const OrderRequest s1 = mt::sell(1, 101, 5);
     Hdr h = d.submit(0, 0, s1);
     CHECK_EQ(h.seq, 1u);
     CHECK_STREAM(d.drain(0), evAccepted(h, s1));
 
-    const OrderRequest b2 = limitReq(2, Side::Buy, 101, 3, 2);
+    const OrderRequest b2 = mt::buy(2, 101, 3).account(2);
     h = d.submit(0, 0, b2);
     // 同一网关两侧：先 maker 的 Fill，后 taker 的 Fill
     CHECK_STREAM(d.drain(0), evAccepted(h, b2), evFill(h, 1, Liquidity::Maker, 1, 101, 3, 2),
@@ -894,15 +850,11 @@ TEST_CASE("runner: single gateway event flow echoes sequence, timestamp and gate
     h = d.cancel(0, 0, 1);
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Cancel, RejectReason::UnknownOrder));
 
-    OrderRequest m3;
-    m3.id = 3;
-    m3.side = Side::Buy;
-    m3.type = OrderType::Market;
-    m3.qty = 2;
+    const OrderRequest m3 = mt::marketBuy(3, 2).account(0);
     h = d.submit(0, 0, m3);  // 空簿上的市价单
     CHECK_STREAM(d.drain(0), evAccepted(h, m3), evCancelled(h, 3, 2, CancelReason::MarketRemainder));
 
-    OrderRequest bad = limitReq(4, Side::Buy, 0, 1);  // 非法价格
+    const OrderRequest bad = mt::buy(4, 0, 1);  // 非法价格
     h = d.submit(0, 0, bad);
     CHECK_STREAM(d.drain(0), evRejected(h, 4, RequestType::New, RejectReason::InvalidPrice));
 
@@ -923,14 +875,14 @@ TEST_CASE("runner: trades are reported to both the maker's and the taker's gatew
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
 
-    const OrderRequest a = limitReq(10, Side::Sell, 100, 4, 1);
-    const OrderRequest b = limitReq(11, Side::Sell, 100, 4, 2);
+    const OrderRequest a = mt::sell(10, 100, 4);
+    const OrderRequest b = mt::sell(11, 100, 4).account(2);
     Hdr ha = d.submit(0, 0, a);
     Hdr hb = d.submit(1, 0, b);
     CHECK_STREAM(d.drain(0), evAccepted(ha, a));
     CHECK_STREAM(d.drain(1), evAccepted(hb, b));
 
-    const OrderRequest t = limitReq(20, Side::Buy, 100, 6, 3);
+    const OrderRequest t = mt::buy(20, 100, 6).account(3);
     const Hdr ht = d.submit(2, 0, t);
     // maker 收到的 Fill 带 taker 命令的引擎序号、时间戳与网关
     CHECK_STREAM(d.drain(0), evFill(ht, 10, Liquidity::Maker, 1, 100, 4, 0));
@@ -954,35 +906,35 @@ TEST_CASE("runner: self-trade prevention cancels are routed to the maker's gatew
     constexpr AccountId kShared = 7;  // 同一账户经由两个网关下单
 
     // CancelMaker：跨网关撤掉 maker；taker 继续撮合，无对手后挂单
-    const OrderRequest s1 = limitReq(1, Side::Sell, 100, 5, kShared);
+    const OrderRequest s1 = mt::sell(1, 100, 5).account(kShared);
     Hdr h = d.submit(0, 0, s1);
     CHECK_STREAM(d.drain(0), evAccepted(h, s1));
-    const OrderRequest b2 = limitReq(2, Side::Buy, 100, 3, kShared, StpMode::CancelMaker);
+    const OrderRequest b2 = mt::buy(2, 100, 3).account(kShared).stp(StpMode::CancelMaker);
     h = d.submit(1, 0, b2);
     CHECK_STREAM(d.drain(0), evCancelled(h, 1, 5, CancelReason::SelfTradePrevention));
     CHECK_STREAM(d.drain(1), evAccepted(h, b2));
 
     // CancelBoth，maker 与 taker 同属网关 1：两条撤单都发给网关 1
-    const OrderRequest s3 = limitReq(3, Side::Sell, 100, 1, kShared, StpMode::CancelBoth);
+    const OrderRequest s3 = mt::sell(3, 100, 1).account(kShared).stp(StpMode::CancelBoth);
     h = d.submit(1, 0, s3);
     CHECK_STREAM(d.drain(1), evAccepted(h, s3), evCancelled(h, 2, 3, CancelReason::SelfTradePrevention),
                  evCancelled(h, 3, 1, CancelReason::SelfTradePrevention));
     CHECK_SILENT(d.drain(0));
 
     // CancelBoth 跨网关：maker 的撤单发给网关 0，taker 的撤单发给网关 1
-    const OrderRequest s4 = limitReq(4, Side::Sell, 105, 2, kShared);
+    const OrderRequest s4 = mt::sell(4, 105, 2).account(kShared);
     h = d.submit(0, 0, s4);
     CHECK_STREAM(d.drain(0), evAccepted(h, s4));
-    const OrderRequest b5 = limitReq(5, Side::Buy, 105, 1, kShared, StpMode::CancelBoth);
+    const OrderRequest b5 = mt::buy(5, 105, 1).account(kShared).stp(StpMode::CancelBoth);
     h = d.submit(1, 0, b5);
     CHECK_STREAM(d.drain(0), evCancelled(h, 4, 2, CancelReason::SelfTradePrevention));
     CHECK_STREAM(d.drain(1), evAccepted(h, b5), evCancelled(h, 5, 1, CancelReason::SelfTradePrevention));
 
     // CancelTaker：只有 taker 被撤，maker 原封不动、仍属网关 0
-    const OrderRequest s6 = limitReq(6, Side::Sell, 110, 2, kShared);
+    const OrderRequest s6 = mt::sell(6, 110, 2).account(kShared);
     h = d.submit(0, 0, s6);
     CHECK_STREAM(d.drain(0), evAccepted(h, s6));
-    const OrderRequest b7 = limitReq(7, Side::Buy, 110, 1, kShared, StpMode::CancelTaker);
+    const OrderRequest b7 = mt::buy(7, 110, 1).account(kShared).stp(StpMode::CancelTaker);
     h = d.submit(1, 0, b7);
     CHECK_SILENT(d.drain(0));
     CHECK_STREAM(d.drain(1), evAccepted(h, b7), evCancelled(h, 7, 1, CancelReason::SelfTradePrevention));
@@ -1003,7 +955,7 @@ TEST_CASE("runner: a gateway cannot cancel or modify another gateway's order") {
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
 
-    const OrderRequest b1 = limitReq(1, Side::Buy, 99, 5);
+    const OrderRequest b1 = mt::buy(1, 99, 5);
     Hdr h = d.submit(0, 0, b1);
     CHECK_STREAM(d.drain(0), evAccepted(h, b1));
 
@@ -1015,7 +967,7 @@ TEST_CASE("runner: a gateway cannot cancel or modify another gateway's order") {
     CHECK_EQ(runner.stats().foreign_rejects, 2u);
 
     // 重复 id：由引擎拒绝，回给发送方（不算会话隔离拒单）
-    const OrderRequest dup = limitReq(1, Side::Buy, 98, 1);
+    const OrderRequest dup = mt::buy(1, 98, 1);
     h = d.submit(1, 0, dup);
     CHECK_STREAM(d.drain(1), evRejected(h, 1, RequestType::New, RejectReason::DuplicateOrderId));
     CHECK_EQ(runner.stats().foreign_rejects, 2u);
@@ -1027,7 +979,7 @@ TEST_CASE("runner: a gateway cannot cancel or modify another gateway's order") {
     CHECK_STREAM(d.drain(0), evCancelled(h, 1, 4, CancelReason::UserRequested));
 
     // id 释放后被网关 1 复用：现在轮到网关 0 动不了它
-    const OrderRequest s1 = limitReq(1, Side::Sell, 105, 2);
+    const OrderRequest s1 = mt::sell(1, 105, 2);
     h = d.submit(1, 0, s1);
     CHECK_STREAM(d.drain(1), evAccepted(h, s1));
     h = d.cancel(0, 0, 1);
@@ -1050,8 +1002,8 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
 
-    const OrderRequest b1 = limitReq(1, Side::Buy, 99, 5, 1);
-    const OrderRequest s2 = limitReq(2, Side::Sell, 101, 3, 2);
+    const OrderRequest b1 = mt::buy(1, 99, 5);
+    const OrderRequest s2 = mt::sell(2, 101, 3).account(2);
     d.submit(0, 0, b1);
     d.submit(1, 0, s2);
     d.drain(0);
@@ -1061,7 +1013,7 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     CHECK_STREAM(d.drain(0), evModified(h, 1, 101, 5), evFill(h, 1, Liquidity::Taker, 1, 101, 3, 2));
     CHECK_STREAM(d.drain(1), evFill(h, 2, Liquidity::Maker, 1, 101, 3, 0));
 
-    const OrderRequest s3 = limitReq(3, Side::Sell, 101, 2, 2);
+    const OrderRequest s3 = mt::sell(3, 101, 2).account(2);
     h = d.submit(1, 0, s3);  // 吃掉改单后挂着的剩余
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 2, 101, 2, 0));
     CHECK_STREAM(d.drain(1), evAccepted(h, s3), evFill(h, 3, Liquidity::Taker, 2, 101, 2, 0));
@@ -1070,8 +1022,8 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     CHECK_STREAM(d.drain(0), evRejected(h, 1, RequestType::Modify, RejectReason::UnknownOrder));
 
     // 改单后作为 taker 完全成交：订单离开订单簿，归属同步删除
-    const OrderRequest s4 = limitReq(4, Side::Sell, 102, 1, 2);
-    const OrderRequest b5 = limitReq(5, Side::Buy, 100, 1, 1);
+    const OrderRequest s4 = mt::sell(4, 102, 1).account(2);
+    const OrderRequest b5 = mt::buy(5, 100, 1);
     d.submit(1, 0, s4);
     d.submit(0, 0, b5);
     d.drain(0);
@@ -1081,8 +1033,8 @@ TEST_CASE("runner: a crossing modify re-matches as taker and keeps ownership con
     CHECK_STREAM(d.drain(1), evFill(h, 4, Liquidity::Maker, 3, 102, 1, 0));
 
     // 改单后被 STP 撤销（CancelTaker）：订单同样离开订单簿
-    const OrderRequest s6 = limitReq(6, Side::Sell, 104, 1, 9);
-    const OrderRequest b7 = limitReq(7, Side::Buy, 100, 2, 9, StpMode::CancelTaker);
+    const OrderRequest s6 = mt::sell(6, 104, 1).account(9);
+    const OrderRequest b7 = mt::buy(7, 100, 2).account(9).stp(StpMode::CancelTaker);
     d.submit(1, 0, s6);
     d.submit(0, 0, b7);
     d.drain(0);
@@ -1108,26 +1060,24 @@ TEST_CASE("runner: requests that would push a level total past INT64_MAX are rej
     SyncDriver<EngineRunner<>> d(runner);
     constexpr Qty kP62 = Qty{1} << 62;
 
-    const OrderRequest s1 = limitReq(1, Side::Sell, 100, kP62, 1);
+    const OrderRequest s1 = mt::sell(1, 100, kP62);
     Hdr h = d.submit(0, 0, s1);
     CHECK_STREAM(d.drain(0), evAccepted(h, s1));
-    h = d.submit(0, 0, limitReq(2, Side::Sell, 100, kP62, 2));
+    h = d.submit(0, 0, mt::sell(2, 100, kP62).account(2));
     CHECK_STREAM(d.drain(0), evRejected(h, 2, RequestType::New, RejectReason::InvalidQuantity));
 
     // 网关 1 的 FOK（不启用 STP 与 CancelMaker）照常成交；maker 一侧的 Fill 发给网关 0
-    OrderRequest f3 = limitReq(3, Side::Buy, 100, 10, 9);
-    f3.tif = TimeInForce::FOK;
+    const OrderRequest f3 = mt::buy(3, 100, 10).account(9).fok();
     h = d.submit(1, 0, f3);
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 1, 100, 10, kP62 - 10));
     CHECK_STREAM(d.drain(1), evAccepted(h, f3), evFill(h, 3, Liquidity::Taker, 1, 100, 10, 0));
-    OrderRequest f4 = limitReq(4, Side::Buy, 100, 10, 9, StpMode::CancelMaker);
-    f4.tif = TimeInForce::FOK;
+    const OrderRequest f4 = mt::buy(4, 100, 10).account(9).stp(StpMode::CancelMaker).fok();
     h = d.submit(1, 0, f4);
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 2, 100, 10, kP62 - 20));
     CHECK_STREAM(d.drain(1), evAccepted(h, f4), evFill(h, 4, Liquidity::Taker, 2, 100, 10, 0));
 
     // 改单加量同样受限：被拒的改单不改变订单与归属；恰好到上限的改单生效
-    const OrderRequest s5 = limitReq(5, Side::Sell, 100, 1, 1);
+    const OrderRequest s5 = mt::sell(5, 100, 1);
     h = d.submit(0, 0, s5);
     CHECK_STREAM(d.drain(0), evAccepted(h, s5));
     h = d.modify(0, 0, 5, 100, kP62 + 20);
@@ -1155,20 +1105,20 @@ TEST_CASE("runner: multi-symbol routing keeps books and owners separate") {
     SyncDriver<EngineRunner<>> d(runner);
 
     // 同一个订单 id 在两个交易对上分属不同网关
-    const OrderRequest a1 = limitReq(1, Side::Sell, 100, 5);
-    const OrderRequest b1 = limitReq(1, Side::Sell, 200, 5);
+    const OrderRequest a1 = mt::sell(1, 100, 5);
+    const OrderRequest b1 = mt::sell(1, 200, 5);
     Hdr h = d.submit(0, A, a1);
     CHECK_STREAM(d.drain(0), evAccepted(h, a1));
     h = d.submit(1, B, b1);
     CHECK_STREAM(d.drain(1), evAccepted(h, b1));
 
-    const OrderRequest ta = limitReq(7, Side::Buy, 100, 5);
+    const OrderRequest ta = mt::buy(7, 100, 5);
     h = d.submit(2, A, ta);
     CHECK_STREAM(d.drain(0), evFill(h, 1, Liquidity::Maker, 1, 100, 5, 0));
     CHECK_SILENT(d.drain(1));
     CHECK_STREAM(d.drain(2), evAccepted(h, ta), evFill(h, 7, Liquidity::Taker, 1, 100, 5, 0));
 
-    const OrderRequest tb = limitReq(7, Side::Buy, 200, 3);
+    const OrderRequest tb = mt::buy(7, 200, 3);
     h = d.submit(2, B, tb);  // 成交 id 按交易对各自从 1 开始
     CHECK_SILENT(d.drain(0));
     CHECK_STREAM(d.drain(1), evFill(h, 1, Liquidity::Maker, 1, 200, 3, 2));
@@ -1195,7 +1145,7 @@ TEST_CASE("runner: unknown symbols are rejected to the sender without side effec
     runner.addSymbol("BBB");
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
-    const OrderRequest r = limitReq(1, Side::Buy, 100, 1);
+    const OrderRequest r = mt::buy(1, 100, 1);
     Hdr h = d.submit(1, 2, r);
     CHECK_STREAM(d.drain(1), evRejected(h, 1, RequestType::New, RejectReason::UnknownSymbol));
     h = d.cancel(1, 7, 1);
@@ -1229,7 +1179,7 @@ TEST_CASE("runner: the inbound queue index is the authoritative gateway") {
     EngineRunner<RecordingJournal> runner(testConfig(2), RecordingJournal{&journal});
     runner.addSymbol("AAA");
     runner.start();
-    const OrderRequest r = limitReq(1, Side::Buy, 100, 1);
+    const OrderRequest r = mt::buy(1, 100, 1);
     EngineCommand c = EngineCommand::newOrder(0, 1, 0, r, 77);  // 声称来自网关 0，实际经由网关 1 的队列
     while (!runner.inbound(1).tryPush(c)) std::this_thread::yield();
     while (runner.processedCommands() < 1) std::this_thread::yield();
@@ -1284,7 +1234,7 @@ TEST_CASE("runner: stop() drains every inbound queue before the engine exits") {
     for (std::size_t g = 0; g < kGateways; ++g) {
         for (std::size_t i = 0; i < kPerGateway; ++i) {
             const OrderId id = (g + 1) * 100'000 + i;
-            const OrderRequest r = limitReq(id, Side::Buy, 1000 + static_cast<Price>(i % 50), 1);
+            const OrderRequest r = mt::buy(id, 1000 + static_cast<Price>(i % 50), 1);
             REQUIRE(runner.inbound(static_cast<GatewayId>(g))
                         .tryPush(EngineCommand::newOrder(static_cast<GatewayId>(g), i + 1, 0, r, tokenOf(g, i))));
         }
@@ -1346,19 +1296,19 @@ TEST_CASE("runner: stop with idle queues, restart, and engine sequence continuit
 
     runner.start();
     SyncDriver<EngineRunner<>> d(runner);
-    const OrderRequest b1 = limitReq(1, Side::Buy, 100, 3);
+    const OrderRequest b1 = mt::buy(1, 100, 3);
     Hdr h = d.submit(0, 0, b1);
     CHECK_STREAM(d.drain(0), evAccepted(h, b1));
     runner.stop();
 
     runner.addSymbol("BBB");  // 停止期间可以继续添加交易对
     runner.start();
-    const OrderRequest s2 = limitReq(2, Side::Sell, 100, 1);
+    const OrderRequest s2 = mt::sell(2, 100, 1);
     h = d.submit(0, 0, s2);  // 状态与引擎序号都延续
     CHECK_EQ(h.seq, 2u);
     CHECK_STREAM(d.drain(0), evAccepted(h, s2), evFill(h, 1, Liquidity::Maker, 1, 100, 1, 2),
                  evFill(h, 2, Liquidity::Taker, 1, 100, 1, 0));
-    const OrderRequest b3 = limitReq(1, Side::Buy, 50, 1);
+    const OrderRequest b3 = mt::buy(1, 50, 1);
     h = d.submit(0, 1, b3);
     CHECK_STREAM(d.drain(0), evAccepted(h, b3));
     runner.stop();
@@ -1373,7 +1323,7 @@ TEST_CASE("runner: destroying a running runner drains pending commands") {
         EngineRunner<RecordingJournal> runner(testConfig(1, 1024, 2048), RecordingJournal{&journal});
         runner.addSymbol("AAA");
         for (std::size_t i = 0; i < 500; ++i) {
-            const OrderRequest r = limitReq(i + 1, Side::Sell, 200 + static_cast<Price>(i % 7), 1);
+            const OrderRequest r = mt::sell(i + 1, 200 + static_cast<Price>(i % 7), 1);
             REQUIRE(runner.inbound(0).tryPush(EngineCommand::newOrder(0, i + 1, 0, r)));
         }
         runner.start();
@@ -1414,7 +1364,7 @@ TEST_CASE("runner: optional CPU pinning of the engine thread") {
         runner.addSymbol("AAA");
         runner.start();
         SyncDriver<EngineRunner<>> d(runner);
-        d.submit(0, 0, limitReq(1, Side::Buy, 10, 1));
+        d.submit(0, 0, mt::buy(1, 10, 1));
         CHECK(runner.pinned());  // 收到事件之后读取：绑核结果对本线程可见
         runner.stop();
     }
@@ -1425,7 +1375,7 @@ TEST_CASE("runner: optional CPU pinning of the engine thread") {
         runner.addSymbol("AAA");
         runner.start();
         SyncDriver<EngineRunner<>> d(runner);
-        const OrderRequest r = limitReq(1, Side::Buy, 10, 1);
+        const OrderRequest r = mt::buy(1, 10, 1);
         const Hdr h = d.submit(0, 0, r);
         CHECK_STREAM(d.drain(0), evAccepted(h, r));
         runner.stop();

@@ -217,6 +217,23 @@ struct RecordingListener {
     void clear() { events.clear(); }
 };
 
+// 只计数的监听器：不分配、不哈希（零分配测试与基准测试用）
+struct CountingListener {
+    std::uint64_t events = 0;
+    std::uint64_t trades = 0;
+    std::uint64_t traded_qty = 0;
+
+    void onAccepted(const OrderRequest&) { ++events; }
+    void onRejected(OrderId, RequestType, RejectReason) { ++events; }
+    void onTrade(const Trade& t) {
+        ++events;
+        ++trades;
+        traded_qty += static_cast<std::uint64_t>(t.qty);
+    }
+    void onCancelled(OrderId, Qty, CancelReason) { ++events; }
+    void onModified(OrderId, Price, Qty) { ++events; }
+};
+
 // ============================================================================
 // 命令：New / Cancel / Modify，可回放到任意订单簿
 // ============================================================================
@@ -288,7 +305,6 @@ public:
         r_.qty = qty;
     }
     Req& account(AccountId a) { r_.account = a; return *this; }
-    Req& limit() { r_.type = OrderType::Limit; return *this; }
     Req& market() { r_.type = OrderType::Market; return *this; }
     Req& tif(TimeInForce t) { r_.tif = t; return *this; }
     Req& gtc() { return tif(TimeInForce::GTC); }
@@ -297,9 +313,7 @@ public:
     Req& postOnly(bool v = true) { r_.post_only = v; return *this; }
     Req& stp(StpMode m) { r_.stp = m; return *this; }
     Req& price(Price p) { r_.price = p; return *this; }
-    Req& qty(Qty q) { r_.qty = q; return *this; }
 
-    const OrderRequest& request() const { return r_; }
     operator OrderRequest() const { return r_; }  // NOLINT: 允许隐式转换，测试书写更简洁
 
 private:
@@ -640,16 +654,8 @@ public:
         return makeModify();
     }
 
-    std::vector<Command> take(std::size_t n) {
-        std::vector<Command> out;
-        out.reserve(n);
-        for (std::size_t i = 0; i < n; ++i) out.push_back(next());
-        return out;
-    }
-
     Price mid() const noexcept { return mid_; }
     std::size_t trackedCount() const noexcept { return tracked_.size(); }
-    const GeneratorConfig& config() const noexcept { return cfg_; }
 
 private:
     struct Tracked {  // 生成器记下的候选挂单（不一定仍活动：可能已成交或被拒）

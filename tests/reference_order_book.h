@@ -61,39 +61,23 @@ public:
     // ---- 新订单（docs/MATCHING_ENGINE.md「submit」）----
     void submit(const OrderRequest& req) {
         // 校验：按规范顺序检查，第一条失败的规则生效，且只发出这一个拒单事件
-        if (req.qty <= 0) {
-            reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
-            return;
-        }
-        if (req.type == OrderType::Limit && req.price <= 0) {
-            reject(req.id, RequestType::New, RejectReason::InvalidPrice);
-            return;
-        }
-        if (req.post_only && (req.type != OrderType::Limit || req.tif != TimeInForce::GTC)) {
-            reject(req.id, RequestType::New, RejectReason::InvalidFlags);
-            return;
-        }
-        if (isLive(req.id)) {
-            reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
-            return;
-        }
+        if (req.qty <= 0) return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
+        if (req.type == OrderType::Limit && req.price <= 0)
+            return reject(req.id, RequestType::New, RejectReason::InvalidPrice);
+        if (req.post_only && (req.type != OrderType::Limit || req.tif != TimeInForce::GTC))
+            return reject(req.id, RequestType::New, RejectReason::InvalidFlags);
+        if (isLive(req.id)) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
         if (max_orders_ != 0 && orderCount() >= max_orders_ &&
-            req.type == OrderType::Limit && req.tif == TimeInForce::GTC) {
-            reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
-            return;
-        }
+            req.type == OrderType::Limit && req.tif == TimeInForce::GTC)
+            return reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
         // 档位总量上限：只有限价 GTC 会挂单。撮合循环从不触及 taker 自己这一侧；本侧该价位已有档位时
         // 订单也不可能穿价（盘口不交叉），会整单挂上去——所以这条检查恰好拒绝会让该档总量越界的请求
         // （该价位没有档位时检查恒通过）
         if (req.type == OrderType::Limit && req.tif == TimeInForce::GTC &&
-            !fitsInLevel(req.side, req.price, req.qty, 0)) {
-            reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
-            return;
-        }
-        if (req.post_only && crosses(req.side, req.price)) {
-            reject(req.id, RequestType::New, RejectReason::PostOnlyWouldCross);
-            return;
-        }
+            !fitsInLevel(req.side, req.price, req.qty, 0))
+            return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
+        if (req.post_only && crosses(req.side, req.price))
+            return reject(req.id, RequestType::New, RejectReason::PostOnlyWouldCross);
 
         listener_.onAccepted(req);
 
@@ -115,10 +99,8 @@ public:
             listener_.onCancelled(req.id, taker.remaining, CancelReason::IocRemainder);
             return;
         }
-        if (req.tif == TimeInForce::FOK) {
-            // 预检保证 FOK 不会走到这里；走到即说明参考模型自身有错
-            fatal("FOK order has a remainder after a successful pre-check");
-        }
+        // 预检保证 FOK 不会走到这里；走到即说明参考模型自身有错
+        if (req.tif == TimeInForce::FOK) fatal("FOK order has a remainder after a successful pre-check");
         // 限价 GTC：剩余量挂到该价位 FIFO 队尾，不发事件
         rest(OrderInfo{req.id, req.account, req.side, req.price, taker.remaining,
                        req.post_only, req.stp});
@@ -127,10 +109,7 @@ public:
     // ---- 撤单 ----
     void cancel(OrderId id) {
         auto found = index_.find(id);
-        if (found == index_.end()) {
-            reject(id, RequestType::Cancel, RejectReason::UnknownOrder);
-            return;
-        }
+        if (found == index_.end()) return reject(id, RequestType::Cancel, RejectReason::UnknownOrder);
         const Qty remaining = found->second->remaining;
         removeOrder(id);
         listener_.onCancelled(id, remaining, CancelReason::UserRequested);
@@ -139,32 +118,19 @@ public:
     // ---- 改单：new_qty 是新的剩余（未成交）数量 ----
     void modify(OrderId id, Price new_price, Qty new_qty) {
         auto found = index_.find(id);
-        if (found == index_.end()) {
-            reject(id, RequestType::Modify, RejectReason::UnknownOrder);
-            return;
-        }
+        if (found == index_.end()) return reject(id, RequestType::Modify, RejectReason::UnknownOrder);
         OrderInfo& order = *found->second;
-        if (new_qty <= 0) {
-            reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
-            return;
-        }
-        if (new_price <= 0) {
-            reject(id, RequestType::Modify, RejectReason::InvalidPrice);
-            return;
-        }
+        if (new_qty <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+        if (new_price <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidPrice);
         // 档位总量上限：改价或加量会把订单重新挂到 new_price（原地减量不会增加档位总量，不受限）。
         // 目标档位中其他订单的总量 = 该档现有总量；同价加量时扣掉订单自己原来的数量
         if (new_price != order.price || new_qty > order.remaining) {
             const Qty own = new_price == order.price ? order.remaining : 0;
-            if (!fitsInLevel(order.side, new_price, new_qty, own)) {
-                reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
-                return;
-            }
+            if (!fitsInLevel(order.side, new_price, new_qty, own))
+                return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
         }
-        if (order.post_only && new_price != order.price && crosses(order.side, new_price)) {
-            reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
-            return;
-        }
+        if (order.post_only && new_price != order.price && crosses(order.side, new_price))
+            return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
 
         // 价格不变且数量不增加：原地修改，保留时间优先级（档位总量随之变化）
         if (new_price == order.price && new_qty <= order.remaining) {

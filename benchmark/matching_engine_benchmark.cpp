@@ -2,10 +2,11 @@
 // matching_engine_benchmark.cpp
 // 撮合引擎基准测试。注意：本程序直接包含并测试 include/matching/ 下的真实优化引擎（LimitOrderBook，
 // 不是另写的副本），对照组是 tests/reference_order_book.h 中的参考模型（std::map + std::list + unordered_map）。
-// 三类负载：(a) 盘口附近的被动挂单 + 撤单；(b) 随机生成器的混合真实流量（含拒单、STP、FOK、改单）；
-// (c) 一次扫过多个价位的主动单。每类给出 ns/op 均值、p50/p99/p99.9（rdtsc 逐条计时、hft::TscClock 换算）、
-// Mops/s、每操作的堆分配次数（计数版全局 operator new，只统计计时区间）。两个实现在同一命令流上的
-// 事件流必须逐条一致（FNV-1a 哈希校验，不一致则以非零码退出）。
+// 四类负载：(a) 盘口附近的被动挂单 + 撤单；(b) 随机生成器的混合真实流量（含拒单、STP、FOK、改单）；
+// (c) 一次扫过多个价位的主动单；(d) 做市商式的被动改价（改价/加量失去时间优先级、减量原地修改）。
+// 每类给出 ns/op 均值、p50/p99/p99.9（rdtsc 逐条计时、hft::TscClock 换算）、Mops/s、每操作的堆分配次数
+// （计数版全局 operator new，只统计计时区间）。两个实现在同一命令流上的事件流必须逐条一致
+// （FNV-1a 哈希校验，不一致则以非零码退出）。
 // 用法：./build/matching_engine_benchmark [--quick] [--pin] [--reps N]
 //   --quick  规模缩小 10 倍（冒烟运行）
 //   --pin    把基准线程绑定到 CPU 0
@@ -27,89 +28,38 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <new>
 #include <random>
 #include <string>
 #include <vector>
 
-// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
-namespace {
-std::atomic<std::uint64_t>& g_allocations = hft::alloc_counter::g_total;
-}  // namespace
-
 namespace {
 
 using namespace hft::matching;
+using hft::matching::test::apply;
 using hft::matching::test::Command;
+using hft::matching::test::CountingListener;
+using hft::alloc_counter::total;  // 堆分配计数（计数版全局 operator new，本程序唯一包含它的翻译单元）
 
 // 编译器屏障：不让被测代码跨过计时点重排
 inline void compilerBarrier() { __asm__ __volatile__("" : : : "memory"); }
-
-// 计时用的监听器：只计数（与真实监听器一样有一点工作量，但不分配、不哈希）
-struct CountingListener {
-    std::uint64_t events = 0;
-    std::uint64_t trades = 0;
-    std::uint64_t traded_qty = 0;
-    void onAccepted(const OrderRequest&) { ++events; }
-    void onRejected(OrderId, RequestType, RejectReason) { ++events; }
-    void onTrade(const Trade& t) {
-        ++events;
-        ++trades;
-        traded_qty += static_cast<std::uint64_t>(t.qty);
-    }
-    void onCancelled(OrderId, Qty, CancelReason) { ++events; }
-    void onModified(OrderId, Price, Qty) { ++events; }
-};
 
 // 校验用的监听器：对每个事件的全部字段做 FNV-1a 哈希（不计时）
 struct HashListener {
     std::uint64_t hash = 1469598103934665603ULL;
     std::uint64_t events = 0;
-    void mix(std::uint64_t v) { hash = (hash ^ v) * 1099511628211ULL; }
-    template <class E>
-    std::uint64_t u(E v) {
-        return static_cast<std::uint64_t>(v);
-    }
-    void onAccepted(const OrderRequest& r) {
+    template <class... Fields>
+    void mix(std::uint64_t kind, Fields... fields) {
         ++events;
-        mix(1);
-        mix(r.id);
+        for (const std::uint64_t v : {kind, static_cast<std::uint64_t>(fields)...}) hash = (hash ^ v) * 1099511628211ULL;
     }
-    void onRejected(OrderId id, RequestType t, RejectReason r) {
-        ++events;
-        mix(2);
-        mix(id);
-        mix(u(t));
-        mix(u(r));
-    }
+    void onAccepted(const OrderRequest& r) { mix(1, r.id); }
+    void onRejected(OrderId id, RequestType t, RejectReason r) { mix(2, id, t, r); }
     void onTrade(const Trade& t) {
-        ++events;
-        mix(3);
-        mix(t.trade_id);
-        mix(t.maker_id);
-        mix(t.taker_id);
-        mix(t.maker_account);
-        mix(t.taker_account);
-        mix(u(t.taker_side));
-        mix(u(t.price));
-        mix(u(t.qty));
-        mix(u(t.maker_remaining));
-        mix(u(t.taker_remaining));
+        mix(3, t.trade_id, t.maker_id, t.taker_id, t.maker_account, t.taker_account, t.taker_side, t.price, t.qty,
+            t.maker_remaining, t.taker_remaining);
     }
-    void onCancelled(OrderId id, Qty q, CancelReason r) {
-        ++events;
-        mix(4);
-        mix(id);
-        mix(u(q));
-        mix(u(r));
-    }
-    void onModified(OrderId id, Price p, Qty q) {
-        ++events;
-        mix(5);
-        mix(id);
-        mix(u(p));
-        mix(u(q));
-    }
+    void onCancelled(OrderId id, Qty q, CancelReason r) { mix(4, id, q, r); }
+    void onModified(OrderId id, Price p, Qty q) { mix(5, id, p, q); }
 };
 
 // 一个负载：setup 不计时；steps 中 timed == false 的步骤（例如扫单之后补回流动性）也不计时
@@ -127,6 +77,12 @@ struct Workload {
     bool all_timed = true;
 };
 
+constexpr Price kMid = 1'000'000;
+
+OrderRequest limitOrder(OrderId id, bool is_buy, Price price, Qty qty, AccountId account) {
+    return is_buy ? test::buy(id, price, qty).account(account) : test::sell(id, price, qty).account(account);
+}
+
 // ---------------------------------------------------------------------------
 // (a) 盘口附近的被动挂单 + 撤单：两侧各 20 档底仓（价差 6 tick，永不撤），新单落在离盘口 -2..+4 tick 内
 //     （价差内的价位会被反复新建与删除），活动新单维持在几百到两千之间，撤单随机挑一个活动新单。
@@ -135,7 +91,6 @@ Workload makePassive(std::size_t ops) {
     Workload w;
     w.name = "(a) passive add/cancel near the touch";
     w.unit = "one add or one cancel";
-    constexpr Price kMid = 1'000'000;
     OrderId next_id = 1;
     for (Price d = 3; d < 23; ++d) {
         for (int k = 0; k < 4; ++k) {
@@ -154,9 +109,7 @@ Workload makePassive(std::size_t ops) {
             const Price price = is_buy ? kMid - 3 - offset : kMid + 3 + offset;
             const Qty qty = 1 + static_cast<Qty>(rng() % 10);
             const AccountId account = static_cast<AccountId>(3 + rng() % 8);
-            const OrderRequest r = is_buy ? test::buy(next_id, price, qty).account(account)
-                                          : test::sell(next_id, price, qty).account(account);
-            w.steps.push_back({Command::newOrder(r), true});
+            w.steps.push_back({Command::newOrder(limitOrder(next_id, is_buy, price, qty, account)), true});
             live.push_back(next_id++);
         } else {
             const std::size_t k = static_cast<std::size_t>(rng() % live.size());
@@ -194,21 +147,18 @@ Workload makeSweeps(std::size_t sweeps) {
     w.name = "(c) aggressive sweep of 20 levels";
     w.unit = "one sweep (40 fills)";
     w.all_timed = false;
-    constexpr Price kMid = 1'000'000;
     constexpr Price kDepth = 200;
     constexpr Qty kLot = 5;
     OrderId next_id = 1;
-    auto maker = [&](Side side, Price price) {
-        const AccountId account = static_cast<AccountId>(1 + next_id % 4);
-        const OrderRequest r = side == Side::Buy ? test::buy(next_id, price, kLot).account(account)
-                                                 : test::sell(next_id, price, kLot).account(account);
+    auto maker = [&](bool is_buy, Price price) {
+        const OrderRequest r = limitOrder(next_id, is_buy, price, kLot, static_cast<AccountId>(1 + next_id % 4));
         ++next_id;
         return Command::newOrder(r);
     };
     for (Price d = kDepth; d >= 1; --d) {
         for (int k = 0; k < 2; ++k) {
-            w.setup.push_back(maker(Side::Buy, kMid - d));
-            w.setup.push_back(maker(Side::Sell, kMid + d));
+            w.setup.push_back(maker(true, kMid - d));
+            w.setup.push_back(maker(false, kMid + d));
         }
     }
     for (std::size_t s = 0; s < sweeps; ++s) {
@@ -221,9 +171,37 @@ Workload makeSweeps(std::size_t sweeps) {
         // 由远及近补回被吃掉的价位：每次新建的都是新的最优档
         for (Price d = kSweepLevels; d >= 1; --d) {
             for (int k = 0; k < 2; ++k) {
-                w.steps.push_back({buy_side_taker ? maker(Side::Sell, kMid + d) : maker(Side::Buy, kMid - d), false});
+                w.steps.push_back({buy_side_taker ? maker(false, kMid + d) : maker(true, kMid - d), false});
             }
         }
+    }
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// (d) 被动改价：两侧各 1000 张挂单分布在离中间价 1..20 tick 内；每次改单随机挑一张，改到本侧
+//     1..20 tick 内的随机价位、数量 1..10（改价或加量失去时间优先级并重新挂单，同价减量原地修改），
+//     永不穿价——做市商挪动报价的典型流量。
+// ---------------------------------------------------------------------------
+Workload makeReprice(std::size_t ops) {
+    Workload w;
+    w.name = "(d) passive reprice near the touch";
+    w.unit = "one modify";
+    std::mt19937_64 rng(13);
+    auto price = [&rng](bool is_buy) {
+        const Price offset = 1 + static_cast<Price>(rng() % 20);
+        return is_buy ? kMid - offset : kMid + offset;
+    };
+    constexpr OrderId kOrders = 2000;  // 奇数 id 为买单
+    for (OrderId id = 1; id <= kOrders; ++id) {
+        const bool is_buy = id % 2 == 1;
+        w.setup.push_back(Command::newOrder(limitOrder(id, is_buy, price(is_buy), 5, is_buy ? 1 : 2)));
+    }
+    for (std::size_t i = 0; i < ops; ++i) {
+        const OrderId id = 1 + rng() % kOrders;
+        const Price p = price(id % 2 == 1);
+        const Qty q = 1 + static_cast<Qty>(rng() % 10);
+        w.steps.push_back({Command::modify(id, p, q), true});
     }
     return w;
 }
@@ -238,24 +216,19 @@ struct Result {
     std::uint64_t timed_ops = 0;
 };
 
-template <class Book>
-void execute(Book& book, const Command& c) {
-    hft::matching::test::apply(book, c);
-}
-
 // 吞吐量：整段循环只在两端取时间，没有逐条计时开销（仅用于全部步骤都计时的负载）
 template <template <class> class BookT>
 void throughputPass(const Workload& w, double& mean_ns, double& allocs_per_op) {
     CountingListener l;
     BookT<CountingListener> book(l, 0, w.reserve_orders);
-    for (const Command& c : w.setup) execute(book, c);
-    const std::uint64_t a0 = g_allocations;
+    for (const Command& c : w.setup) apply(book, c);
+    const std::uint64_t a0 = total();
     compilerBarrier();
     const std::int64_t t0 = hft::nowNs();
-    for (const Step& s : w.steps) execute(book, s.cmd);
+    for (const Step& s : w.steps) apply(book, s.cmd);
     const std::int64_t t1 = hft::nowNs();
     compilerBarrier();
-    allocs_per_op = static_cast<double>(g_allocations - a0) / static_cast<double>(w.steps.size());
+    allocs_per_op = static_cast<double>(total() - a0) / static_cast<double>(w.steps.size());
     mean_ns = static_cast<double>(t1 - t0) / static_cast<double>(w.steps.size());
 }
 
@@ -264,7 +237,7 @@ template <template <class> class BookT>
 Result latencyPass(const Workload& w) {
     CountingListener l;
     BookT<CountingListener> book(l, 0, w.reserve_orders);
-    for (const Command& c : w.setup) execute(book, c);
+    for (const Command& c : w.setup) apply(book, c);
     hft::LatencyHistogram hist;
     std::uint64_t allocs = 0;
     std::uint64_t ticks = 0;
@@ -272,20 +245,20 @@ Result latencyPass(const Workload& w) {
     std::uint64_t events = 0;
     for (const Step& s : w.steps) {
         if (!s.timed) {
-            execute(book, s.cmd);
+            apply(book, s.cmd);
             continue;
         }
-        const std::uint64_t a0 = g_allocations;
+        const std::uint64_t a0 = total();
         const std::uint64_t e0 = l.events;
         compilerBarrier();
         const std::uint64_t start = hft::rdtsc();
         compilerBarrier();
-        execute(book, s.cmd);
+        apply(book, s.cmd);
         compilerBarrier();
         const std::uint64_t end = hft::rdtscp();
         compilerBarrier();
         const std::uint64_t dt = end > start ? end - start : 0;
-        allocs += g_allocations - a0;
+        allocs += total() - a0;
         events += l.events - e0;
         hist.record(dt);
         ticks += dt;
@@ -327,8 +300,8 @@ template <template <class> class BookT>
 HashListener eventDigest(const Workload& w) {
     HashListener l;
     BookT<HashListener> book(l, 0, w.reserve_orders);
-    for (const Command& c : w.setup) execute(book, c);
-    for (const Step& s : w.steps) execute(book, s.cmd);
+    for (const Command& c : w.setup) apply(book, c);
+    for (const Step& s : w.steps) apply(book, s.cmd);
     return l;
 }
 
@@ -377,13 +350,14 @@ int main(int argc, char** argv) {
     std::printf("Matching engine benchmark: optimized LimitOrderBook (include/matching/order_book.h)\n");
     std::printf("vs ReferenceOrderBook (tests/reference_order_book.h). TSC %.3f GHz; timer overhead p50 %.1f ns\n",
                 1.0 / ns_per_tick, timerOverheadNs());
-    std::printf("(included in the percentiles; ns/op mean of (a)/(b) is the median of %d untimed-loop runs).\n\n",
+    std::printf("(included in the percentiles; ns/op mean of (a)/(b)/(d) is the median of %d untimed-loop runs).\n\n",
                 reps);
 
     const std::vector<Workload> workloads = {
         makePassive(2'000'000 / scale),
         makeMixed(2'000'000 / scale),
         makeSweeps(100'000 / scale),
+        makeReprice(2'000'000 / scale),
     };
 
     std::printf("%-38s %-10s %9s %9s %8s %8s %8s %9s %10s %9s\n", "workload", "impl", "ops", "ns/op", "p50",

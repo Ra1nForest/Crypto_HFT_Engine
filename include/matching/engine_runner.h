@@ -117,18 +117,13 @@ struct alignas(kCacheLineSize) EngineCommand {
     bool post_only;            // New
     StpMode stp;               // New
 
+    // 命令工厂（未用到的字段为 0）
     static EngineCommand newOrder(GatewayId gateway, std::uint64_t seq, SymbolId symbol, const OrderRequest& req,
                                   std::uint64_t client_ts = 0) noexcept {
-        EngineCommand c{};
-        c.client_ts = client_ts;
-        c.seq = seq;
-        c.order_id = req.id;
+        EngineCommand c = make(RequestType::New, gateway, seq, symbol, req.id, client_ts);
         c.price = req.price;
         c.qty = req.qty;
-        c.symbol = symbol;
         c.account = req.account;
-        c.gateway = gateway;
-        c.type = RequestType::New;
         c.side = req.side;
         c.order_type = req.type;
         c.tif = req.tif;
@@ -139,43 +134,33 @@ struct alignas(kCacheLineSize) EngineCommand {
 
     static EngineCommand cancel(GatewayId gateway, std::uint64_t seq, SymbolId symbol, OrderId id,
                                 std::uint64_t client_ts = 0) noexcept {
-        EngineCommand c{};
-        c.client_ts = client_ts;
-        c.seq = seq;
-        c.order_id = id;
-        c.symbol = symbol;
-        c.gateway = gateway;
-        c.type = RequestType::Cancel;
-        return c;
+        return make(RequestType::Cancel, gateway, seq, symbol, id, client_ts);
     }
 
     static EngineCommand modify(GatewayId gateway, std::uint64_t seq, SymbolId symbol, OrderId id, Price new_price,
                                 Qty new_qty, std::uint64_t client_ts = 0) noexcept {
-        EngineCommand c{};
-        c.client_ts = client_ts;
-        c.seq = seq;
-        c.order_id = id;
+        EngineCommand c = make(RequestType::Modify, gateway, seq, symbol, id, client_ts);
         c.price = new_price;
         c.qty = new_qty;
-        c.symbol = symbol;
-        c.gateway = gateway;
-        c.type = RequestType::Modify;
         return c;
     }
 
     // New 命令对应的订单请求
     OrderRequest request() const noexcept {
-        OrderRequest r;
-        r.id = order_id;
-        r.account = account;
-        r.side = side;
-        r.type = order_type;
-        r.tif = tif;
-        r.price = price;
-        r.qty = qty;
-        r.post_only = post_only;
-        r.stp = stp;
-        return r;
+        return OrderRequest{order_id, account, side, order_type, tif, price, qty, post_only, stp};
+    }
+
+private:
+    static EngineCommand make(RequestType type, GatewayId gateway, std::uint64_t seq, SymbolId symbol, OrderId id,
+                              std::uint64_t client_ts) noexcept {
+        EngineCommand c{};
+        c.client_ts = client_ts;
+        c.seq = seq;
+        c.order_id = id;
+        c.symbol = symbol;
+        c.gateway = gateway;
+        c.type = type;
+        return c;
     }
 };
 
@@ -308,12 +293,10 @@ class EngineRunner {
     class Listener;
 
 public:
-    using journal_type = Journal;
     using CommandQueue = SpscQueue<EngineCommand>;
     using EventQueue = SpscQueue<EngineEvent>;
     using Engine = MatchingEngine<Listener>;
     using Book = typename Engine::Book;
-    using OwnerMap = FlatHashMap<OrderId, GatewayId>;
     static constexpr std::size_t kDefaultReserveOrders = Engine::kDefaultReserveOrders;
 
     explicit EngineRunner(const EngineRunnerConfig& config = EngineRunnerConfig(), Journal journal = Journal())
@@ -321,13 +304,9 @@ public:
         const std::size_t n = config_.gateways;
         inbound_.reserve(n);
         outbound_.reserve(n);
-        inbound_ptrs_.reserve(n);
-        outbound_ptrs_.reserve(n);
         for (std::size_t g = 0; g < n; ++g) {
             inbound_.push_back(std::make_unique<CommandQueue>(config_.inbound_capacity));
             outbound_.push_back(std::make_unique<EventQueue>(config_.outbound_capacity));
-            inbound_ptrs_.push_back(inbound_.back().get());
-            outbound_ptrs_.push_back(outbound_.back().get());
         }
         next_seq_.assign(n, 1);
     }
@@ -345,7 +324,7 @@ public:
     // 活动订单数不超过它时热路径零分配。名称重复时抛 std::invalid_argument（运行器不变）。
     SymbolId addSymbol(std::string name, std::size_t max_orders = 0,
                        std::size_t reserve_orders = kDefaultReserveOrders) {
-        requireStopped("addSymbol");
+        if (running()) throw std::logic_error("EngineRunner::addSymbol: engine thread is running");
         owners_.reserve(owners_.size() + 1);  // 之后的 push_back 不会抛异常
         OwnerMap owners(reserve_orders);      // 先分配归属表：失败时引擎尚未改变
         const SymbolId id = engine_.addSymbol(std::move(name), max_orders, reserve_orders);
@@ -379,7 +358,6 @@ public:
 
     std::size_t gatewayCount() const noexcept { return inbound_.size(); }
     std::size_t symbolCount() const noexcept { return owners_.size(); }
-    const EngineRunnerConfig& config() const noexcept { return config_; }
 
     // ---------------------------------------------------------------- 统计（任意线程）
     // 已处理的命令数（acquire）：读到 n 时，前 n 条命令产生的全部事件都已写入出站队列、对读者可见。
@@ -403,8 +381,6 @@ public:
 
     // ---------------------------------------------------------------- 引擎状态（仅在引擎线程未运行时访问）
     const Engine& engine() const noexcept { return engine_; }
-    Journal& journal() noexcept { return journal_; }
-    const Journal& journal() const noexcept { return journal_; }
 
     // 订单所属网关（不在簿上返回空）
     std::optional<GatewayId> ownerOf(SymbolId symbol, OrderId id) const noexcept {
@@ -449,11 +425,15 @@ public:
     }
 
 private:
-    // 撮合引擎监听器：把回调转给运行器（运行器持有当前命令的上下文）
+    using OwnerMap = FlatHashMap<OrderId, GatewayId>;
+
+    // 撮合引擎监听器：把回调转给运行器（运行器持有当前命令的上下文）。
+    // onAccepted / onModified 几乎每条命令都会走到：整条转发链强制内联，否则 submit/modify 体积变大后
+    // 编译器会把它留成函数调用（实测 exchange_sim 吞吐因此下降约 3%）
     class Listener {
     public:
         explicit Listener(EngineRunner& runner) noexcept : runner_(&runner) {}
-        void onAccepted(SymbolId s, const OrderRequest& req) { runner_->handleAccepted(s, req); }
+        HFT_ALWAYS_INLINE void onAccepted(SymbolId s, const OrderRequest& req) { runner_->handleAccepted(s, req); }
         void onRejected(SymbolId s, OrderId id, RequestType request, RejectReason reason) {
             runner_->publishRejected(s, id, request, reason);
         }
@@ -461,7 +441,9 @@ private:
         void onCancelled(SymbolId s, OrderId id, Qty qty, CancelReason reason) {
             runner_->handleCancelled(s, id, qty, reason);
         }
-        void onModified(SymbolId s, OrderId id, Price price, Qty qty) { runner_->handleModified(s, id, price, qty); }
+        HFT_ALWAYS_INLINE void onModified(SymbolId s, OrderId id, Price price, Qty qty) {
+            runner_->handleModified(s, id, price, qty);
+        }
 
     private:
         EngineRunner* runner_;
@@ -487,13 +469,8 @@ private:
         return c;
     }
 
-    void requireStopped(const char* what) const {
-        if (running())
-            throw std::logic_error(std::string("EngineRunner::") + what + ": engine thread is running");
-    }
-
     // 单写者计数器：relaxed 读 + 写（无 RMW 指令）
-    static void bump(std::atomic<std::uint64_t>& counter) noexcept {
+    HFT_ALWAYS_INLINE static void bump(std::atomic<std::uint64_t>& counter) noexcept {
         counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
@@ -511,8 +488,8 @@ private:
     void run() noexcept {
         if (!config_.thread_name.empty()) setThreadName(config_.thread_name.c_str());
         if (config_.engine_cpu >= 0) pinned_.store(pinThreadToCpu(config_.engine_cpu), std::memory_order_relaxed);
-        CommandQueue* const* const queues = inbound_ptrs_.data();
-        const std::size_t n = inbound_ptrs_.size();
+        const std::unique_ptr<CommandQueue>* const queues = inbound_.data();
+        const std::size_t n = inbound_.size();
         const std::size_t batch = config_.batch;
         const std::uint32_t yield_after = config_.idle_spins_before_yield;
         std::uint32_t spins = 0;
@@ -547,14 +524,7 @@ private:
         expected = cmd.seq + 1;
         journal_.onCommand(seq, g, cmd);
 
-        ctx_.engine_seq = seq;
-        ctx_.client_ts = cmd.client_ts;
-        ctx_.order_id = cmd.order_id;
-        ctx_.remaining = 0;
-        ctx_.gateway = g;
-        ctx_.accepted = false;
-        ctx_.rests = false;
-        ctx_.terminated = false;
+        ctx_ = CommandContext{seq, cmd.client_ts, cmd.order_id, 0, g, false, false, false};
 
         switch (cmd.type) {
             case RequestType::New: processNew(cmd); break;
@@ -584,31 +554,30 @@ private:
     }
 
     void processCancel(const EngineCommand& cmd) {
-        if (HFT_UNLIKELY(ownedByOtherGateway(cmd.symbol, cmd.order_id))) {
-            bump(foreign_rejects_);
-            publishRejected(cmd.symbol, cmd.order_id, RequestType::Cancel, RejectReason::UnknownOrder);
-            return;
-        }
+        const GatewayId* const owner = ownerSlot(cmd.symbol, cmd.order_id);
+        if (HFT_UNLIKELY(ownedByOther(owner))) return rejectForeign(cmd);
         engine_.cancel(cmd.symbol, cmd.order_id);
-        if (ctx_.terminated) owners_[cmd.symbol].erase(cmd.order_id);  // 撤单成功（交易对必然合法）
+        // 撤单成功：订单此前挂在簿上，归属条目就是 owner（撤单不改动归属表，指针仍然有效）
+        if (ctx_.terminated) owners_[cmd.symbol].eraseAt(owner);
     }
 
     void processModify(const EngineCommand& cmd) {
-        if (HFT_UNLIKELY(ownedByOtherGateway(cmd.symbol, cmd.order_id))) {
-            bump(foreign_rejects_);
-            publishRejected(cmd.symbol, cmd.order_id, RequestType::Modify, RejectReason::UnknownOrder);
-            return;
-        }
+        if (HFT_UNLIKELY(ownedByOther(ownerSlot(cmd.symbol, cmd.order_id)))) return rejectForeign(cmd);
         engine_.modify(cmd.symbol, cmd.order_id, cmd.price, cmd.qty);
-        // 改价 / 加量后作为 taker 完全成交或被 STP 撤销：订单已离开订单簿
+        // 改价 / 加量后作为 taker 完全成交或被 STP 撤销：订单已离开订单簿（撮合会删除 maker 的归属条目，按 id 删除）
         if (ctx_.accepted && (ctx_.terminated || ctx_.remaining == 0)) owners_[cmd.symbol].erase(cmd.order_id);
     }
 
-    // 订单正挂在簿上且属于其他网关（未知交易对交给引擎拒绝为 UnknownSymbol）
-    bool ownedByOtherGateway(SymbolId s, OrderId id) const noexcept {
-        if (s >= owners_.size()) return false;
-        const GatewayId* owner = owners_[s].find(id);
-        return owner != nullptr && *owner != ctx_.gateway;
+    // 挂单的归属条目；未知交易对或订单不在簿上时为 nullptr（未知交易对交给引擎拒绝为 UnknownSymbol）
+    const GatewayId* ownerSlot(SymbolId s, OrderId id) const noexcept {
+        return s < owners_.size() ? owners_[s].find(id) : nullptr;
+    }
+
+    bool ownedByOther(const GatewayId* owner) const noexcept { return owner != nullptr && *owner != ctx_.gateway; }
+
+    void rejectForeign(const EngineCommand& cmd) {
+        bump(foreign_rejects_);
+        publishRejected(cmd.symbol, cmd.order_id, cmd.type, RejectReason::UnknownOrder);
     }
 
     // ---------------------------------------------------------------- 事件（引擎线程，在撮合回调内）
@@ -624,7 +593,7 @@ private:
         return ev;
     }
 
-    void handleAccepted(SymbolId s, const OrderRequest& req) {
+    HFT_ALWAYS_INLINE void handleAccepted(SymbolId s, const OrderRequest& req) {
         ctx_.accepted = true;
         ctx_.rests = req.type == OrderType::Limit && req.tif == TimeInForce::GTC;
         ctx_.remaining = req.qty;
@@ -640,13 +609,13 @@ private:
     }
 
     void handleTrade(SymbolId s, const Trade& t) {
-        // maker 一侧：发给 maker 所属网关；完全成交则移出归属表（先取出网关 id：erase 会移动槽位）
+        // maker 一侧：发给 maker 所属网关；完全成交则移出归属表（先取出网关 id：删除会移动槽位）
         OwnerMap& owners = owners_[s];
         const GatewayId* found = owners.find(t.maker_id);
         HFT_ASSERT(found != nullptr && "resting maker has no owning gateway");
         if (HFT_LIKELY(found != nullptr)) {
             const GatewayId maker_gateway = *found;
-            if (t.maker_remaining == 0) owners.erase(t.maker_id);
+            if (t.maker_remaining == 0) owners.eraseAt(found);
             EngineEvent ev = makeEvent(EventType::Fill, s, t.maker_id);
             ev.liquidity = Liquidity::Maker;
             ev.fill = FillInfo{t.trade_id, t.price, t.qty, t.maker_remaining};
@@ -678,14 +647,14 @@ private:
                 return;
             }
             to = *found;
-            owners.erase(id);
+            owners.eraseAt(found);
         }
         EngineEvent ev = makeEvent(EventType::Cancelled, s, id);
         ev.cancelled = CancelledInfo{qty, reason};
         publish(to, ev);
     }
 
-    void handleModified(SymbolId s, OrderId id, Price price, Qty qty) {
+    HFT_ALWAYS_INLINE void handleModified(SymbolId s, OrderId id, Price price, Qty qty) {
         ctx_.accepted = true;
         ctx_.remaining = qty;
         EngineEvent ev = makeEvent(EventType::Modified, s, id);
@@ -695,7 +664,7 @@ private:
 
     // 写入网关 to 的出站队列；满了就自旋等待（背压），绝不丢弃
     HFT_ALWAYS_INLINE void publish(GatewayId to, const EngineEvent& ev) {
-        EventQueue& q = *outbound_ptrs_[to];
+        EventQueue& q = *outbound_[to];
         if (HFT_UNLIKELY(!q.tryPush(ev))) {
             bump(outbound_full_);
             std::uint32_t spins = 0;
@@ -712,10 +681,8 @@ private:
     Listener listener_;  // 必须先于 engine_ 构造（引擎持有它的引用）
     Engine engine_;
     std::vector<OwnerMap> owners_;  // [symbol]：挂单 id → 所属网关
-    std::vector<std::unique_ptr<CommandQueue>> inbound_;
-    std::vector<std::unique_ptr<EventQueue>> outbound_;
-    std::vector<CommandQueue*> inbound_ptrs_;  // 热路径少一次间接寻址
-    std::vector<EventQueue*> outbound_ptrs_;
+    std::vector<std::unique_ptr<CommandQueue>> inbound_;  // [gateway]
+    std::vector<std::unique_ptr<EventQueue>> outbound_;   // [gateway]
     std::vector<std::uint64_t> next_seq_;      // [gateway]：期望的下一个网关序号（引擎线程独占）
     CommandContext ctx_;                       // 引擎线程独占
     std::uint64_t engine_seq_ = 0;             // 引擎线程独占（对外发布的是 processed_）

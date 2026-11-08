@@ -16,7 +16,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,12 +25,13 @@ namespace hft::matching {
 namespace detail {
 
 // 把单个订单簿的回调转发给引擎监听器，并把交易对 id 补作第一个参数
+// （onAccepted / onModified 是热路径，强制内联，见 EngineRunner::Listener）
 template <class EngineListener>
 struct SymbolRelay {
     EngineListener* target;
     SymbolId symbol;
 
-    void onAccepted(const OrderRequest& req) { target->onAccepted(symbol, req); }
+    HFT_ALWAYS_INLINE void onAccepted(const OrderRequest& req) { target->onAccepted(symbol, req); }
     void onRejected(OrderId id, RequestType request, RejectReason reason) {
         target->onRejected(symbol, id, request, reason);
     }
@@ -39,7 +39,7 @@ struct SymbolRelay {
     void onCancelled(OrderId id, Qty cancelled_qty, CancelReason reason) {
         target->onCancelled(symbol, id, cancelled_qty, reason);
     }
-    void onModified(OrderId id, Price new_price, Qty new_qty) {
+    HFT_ALWAYS_INLINE void onModified(OrderId id, Price new_price, Qty new_qty) {
         target->onModified(symbol, id, new_price, new_qty);
     }
 };
@@ -54,7 +54,8 @@ struct SymbolRelay {
 //   void onModified(SymbolId, OrderId, Price, Qty);
 //
 // 设计要点：
-// - SymbolId 即 addSymbol() 的返回值：按添加顺序从 0 开始连续编号，路由就是一次数组下标访问。
+// - SymbolId 即 addSymbol() 的返回值：按添加顺序从 0 开始连续编号（id < symbolCount() 即为已知交易对），
+//   路由就是一次数组下标访问。
 // - 各交易对的订单簿完全独立：订单 id 只需在本交易对内唯一，成交 id 按交易对各自从 1 开始。
 // - 未知交易对的 submit/cancel/modify 发出 onRejected(symbol, id, request, UnknownSymbol)，不产生其他事件。
 // - 每个交易对的订单簿与转发器放在独立的堆对象中（地址稳定），addSymbol() 之后 book() 返回的引用一直有效。
@@ -63,7 +64,6 @@ struct SymbolRelay {
 template <class Listener>
 class MatchingEngine {
 public:
-    using listener_type = Listener;
     using Relay = detail::SymbolRelay<Listener>;
     using Book = LimitOrderBook<Relay>;
     static constexpr std::size_t kDefaultReserveOrders = Book::kDefaultReserveOrders;
@@ -116,17 +116,10 @@ public:
     }
 
     // ---- 访问 ----
-    // 交易对的订单簿；未知 id 抛 std::out_of_range（需要不抛异常的版本用 findBook）
+    // 交易对的订单簿；未知 id 抛 std::out_of_range
     Book& book(SymbolId symbol) { return slotAt(symbol).book; }
     const Book& book(SymbolId symbol) const { return slotAt(symbol).book; }
 
-    // 未知 id 返回 nullptr
-    Book* findBook(SymbolId symbol) noexcept { return symbol < slots_.size() ? &slots_[symbol]->book : nullptr; }
-    const Book* findBook(SymbolId symbol) const noexcept {
-        return symbol < slots_.size() ? &slots_[symbol]->book : nullptr;
-    }
-
-    bool hasSymbol(SymbolId symbol) const noexcept { return symbol < slots_.size(); }
     std::size_t symbolCount() const noexcept { return slots_.size(); }
 
     // 交易对名称；未知 id 抛 std::out_of_range
@@ -138,9 +131,6 @@ public:
         if (it == names_.end()) return std::nullopt;
         return it->second;
     }
-
-    Listener& listener() noexcept { return listener_; }
-    const Listener& listener() const noexcept { return listener_; }
 
 private:
     // 转发器必须先于订单簿构造（订单簿持有它的引用）

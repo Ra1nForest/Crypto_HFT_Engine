@@ -20,9 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
-#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -31,11 +29,6 @@
 #if defined(__linux__)
 #include <sched.h>
 #endif
-
-// 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
-namespace {
-std::atomic<std::uint64_t>& g_heap_allocations = hft::alloc_counter::g_total;
-}  // namespace
 
 namespace {
 
@@ -46,17 +39,19 @@ using Runner = EngineRunner<>;
 // 命令行
 // ============================================================================
 
+constexpr std::uint64_t kAuto = UINT64_MAX;  // 取值由程序自动决定的选项
+
 struct Options {
     std::uint64_t orders = 2'000'000;  // 全部网关发送的命令总数
-    std::size_t gateways = 2;
-    std::size_t symbols = 1;
+    std::uint64_t gateways = 2;
+    std::uint64_t symbols = 1;
     std::uint64_t seed = 1;
+    std::uint64_t makers = kAuto;       // 做市网关数（自动：一半，向上取整）
+    std::uint64_t window = 8;           // 每个网关的最大在途命令数
+    std::uint64_t levels = 10;          // 每个做市商在每个交易对每一侧报价的档数
+    std::uint64_t batch = 32;           // 引擎每轮每个入站队列最多处理的命令数
+    std::uint64_t yield_after = kAuto;  // 连续空转多少次后 yield（自动：见 --help）
     bool pin = false;
-    std::size_t makers = SIZE_MAX;  // 做市网关数（SIZE_MAX = 自动：一半，向上取整）
-    std::size_t window = 8;     // 每个网关的最大在途命令数
-    std::size_t levels = 10;    // 每个做市商在每个交易对每一侧报价的档数
-    std::size_t batch = 32;     // 引擎每轮每个入站队列最多处理的命令数
-    long long yield_after = -1; // 连续空转多少次后 yield（-1 = 自动）
 };
 
 constexpr std::size_t kMaxSimGateways = 4096;  // 订单 id 编码用 16 位网关字段（见 makeOrderId）
@@ -89,6 +84,27 @@ void printUsage(std::FILE* out) {
 
 using cli_util::parseUnsigned;
 
+// 带一个整数参数的选项：取值范围与出错时说明的要求
+struct NumericOption {
+    const char* name;
+    std::uint64_t Options::*field;
+    std::uint64_t lo;
+    std::uint64_t hi;
+    const char* needs;
+};
+
+constexpr NumericOption kNumericOptions[] = {
+    {"--orders", &Options::orders, 1, std::uint64_t{1} << 40, "an integer in [1, 2^40]"},
+    {"--gateways", &Options::gateways, 1, kMaxSimGateways, "an integer in [1, 4096]"},
+    {"--symbols", &Options::symbols, 1, 4096, "an integer in [1, 4096]"},
+    {"--seed", &Options::seed, 0, UINT64_MAX, "a non-negative integer"},
+    {"--makers", &Options::makers, 0, kMaxSimGateways, "an integer in [0, 4096]"},
+    {"--window", &Options::window, 1, 1 << 16, "an integer in [1, 65536]"},
+    {"--levels", &Options::levels, 1, 1000, "an integer in [1, 1000]"},
+    {"--batch", &Options::batch, 1, 1 << 20, "an integer in [1, 1048576]"},
+    {"--yield-after", &Options::yield_after, 0, UINT32_MAX, "a non-negative 32-bit integer"},
+};
+
 // 返回 0 = 继续运行，1 = 已打印帮助（正常退出），2 = 参数错误
 int parseOptions(int argc, char** argv, Options& o) {
     auto bad = [](const std::string& msg) {
@@ -105,46 +121,15 @@ int parseOptions(int argc, char** argv, Options& o) {
             o.pin = true;
             continue;
         }
-        auto value = [&](std::uint64_t lo, std::uint64_t hi, std::uint64_t& out) -> bool {
-            if (i + 1 >= argc) return false;
-            std::uint64_t v = 0;
-            if (!parseUnsigned(argv[++i], v) || v < lo || v > hi) return false;
-            out = v;
-            return true;
-        };
+        const NumericOption* opt = std::find_if(std::begin(kNumericOptions), std::end(kNumericOptions),
+                                                [&arg](const NumericOption& n) { return arg == n.name; });
+        if (opt == std::end(kNumericOptions)) return bad("unknown option '" + arg + "'");
         std::uint64_t v = 0;
-        if (arg == "--orders") {
-            if (!value(1, std::uint64_t{1} << 40, v)) return bad("--orders needs an integer in [1, 2^40]");
-            o.orders = v;
-        } else if (arg == "--gateways") {
-            if (!value(1, kMaxSimGateways, v)) return bad("--gateways needs an integer in [1, 4096]");
-            o.gateways = static_cast<std::size_t>(v);
-        } else if (arg == "--symbols") {
-            if (!value(1, 4096, v)) return bad("--symbols needs an integer in [1, 4096]");
-            o.symbols = static_cast<std::size_t>(v);
-        } else if (arg == "--seed") {
-            if (!value(0, UINT64_MAX, v)) return bad("--seed needs a non-negative integer");
-            o.seed = v;
-        } else if (arg == "--makers") {
-            if (!value(0, kMaxSimGateways, v)) return bad("--makers needs an integer in [0, 4096]");
-            o.makers = static_cast<std::size_t>(v);
-        } else if (arg == "--window") {
-            if (!value(1, 1 << 16, v)) return bad("--window needs an integer in [1, 65536]");
-            o.window = static_cast<std::size_t>(v);
-        } else if (arg == "--levels") {
-            if (!value(1, 1000, v)) return bad("--levels needs an integer in [1, 1000]");
-            o.levels = static_cast<std::size_t>(v);
-        } else if (arg == "--batch") {
-            if (!value(1, 1 << 20, v)) return bad("--batch needs an integer in [1, 1048576]");
-            o.batch = static_cast<std::size_t>(v);
-        } else if (arg == "--yield-after") {
-            if (!value(0, UINT32_MAX, v)) return bad("--yield-after needs a non-negative 32-bit integer");
-            o.yield_after = static_cast<long long>(v);
-        } else {
-            return bad("unknown option '" + arg + "'");
-        }
+        if (i + 1 >= argc || !parseUnsigned(argv[++i], v) || v < opt->lo || v > opt->hi)
+            return bad(arg + " needs " + opt->needs);
+        o.*(opt->field) = v;
     }
-    if (o.makers != SIZE_MAX && o.makers > o.gateways) return bad("--makers cannot exceed --gateways");
+    if (o.makers != kAuto && o.makers > o.gateways) return bad("--makers cannot exceed --gateways");
     if (o.symbols * 2 * o.levels >= kMaxSlots) return bad("--symbols x --levels x 2 must stay below 65535");
     if (o.orders < o.gateways) return bad("--orders must be at least --gateways");
     return 0;
@@ -296,6 +281,25 @@ struct TraderStats {
     std::uint64_t cancel_reasons[5] = {};
     std::uint64_t echo_mismatches = 0;   // 首个事件回显的 client_ts 与最早在途命令不符（恒应为 0）
     std::uint64_t stale_events = 0;      // 本网关订单 id 但不是任何槽位当前订单的事件（恒应为 0）
+
+    // 累加另一个网关的统计（汇总用）
+    void add(const TraderStats& s) noexcept {
+        sent += s.sent;
+        acked += s.acked;
+        for (int i = 0; i < 3; ++i) sent_by_type[i] += s.sent_by_type[i];
+        quotes += s.quotes;
+        iocs += s.iocs;
+        markets += s.markets;
+        for (int i = 0; i < 5; ++i) events_by_type[i] += s.events_by_type[i];
+        maker_fills += s.maker_fills;
+        taker_fills += s.taker_fills;
+        maker_qty += s.maker_qty;
+        taker_qty += s.taker_qty;
+        for (int i = 0; i < 8; ++i) reject_reasons[i] += s.reject_reasons[i];
+        for (int i = 0; i < 5; ++i) cancel_reasons[i] += s.cancel_reasons[i];
+        echo_mismatches += s.echo_mismatches;
+        stale_events += s.stale_events;
+    }
 };
 
 struct StartGate {
@@ -641,11 +645,6 @@ private:
 // 报告
 // ============================================================================
 
-void printLatencyHeader() {
-    std::printf("  %-8s %-7s %12s %7s %7s %7s %7s %8s %9s %8s\n", "gateway", "role", "samples", "min", "p50", "p90",
-                "p99", "p99.9", "max", "mean");
-}
-
 void printLatencyRow(const std::string& label, const char* role, const hft::LatencyHistogram& h) {
     std::printf("  %-8s %-7s %12s %7" PRIu64 " %7" PRIu64 " %7" PRIu64 " %7" PRIu64 " %8" PRIu64 " %9" PRIu64
                 " %8.0f\n",
@@ -653,11 +652,9 @@ void printLatencyRow(const std::string& label, const char* role, const hft::Late
                 h.percentile(0.99), h.percentile(0.999), h.max(), h.mean());
 }
 
-double perSecond(std::uint64_t n, double seconds) { return seconds > 0 ? static_cast<double>(n) / seconds : 0.0; }
-
 std::string rate(std::uint64_t n, double seconds) {
     char buf[32];
-    const double r = perSecond(n, seconds);
+    const double r = seconds > 0 ? static_cast<double>(n) / seconds : 0.0;
     if (r >= 1e6) std::snprintf(buf, sizeof(buf), "%.2f M/s", r / 1e6);
     else if (r >= 1e3) std::snprintf(buf, sizeof(buf), "%.1f k/s", r / 1e3);
     else std::snprintf(buf, sizeof(buf), "%.0f /s", r);
@@ -680,16 +677,13 @@ std::string breakdown(const std::uint64_t (&counts)[N]) {
 
 int main(int argc, char** argv) {
     Options opt;
-    const int parsed = parseOptions(argc, argv, opt);
-    if (parsed == 1) return 0;
-    if (parsed != 0) return 2;
+    if (const int parsed = parseOptions(argc, argv, opt); parsed != 0) return parsed == 1 ? 0 : 2;
 
     const std::size_t G = opt.gateways;
-    std::size_t makers = opt.makers != SIZE_MAX ? opt.makers : (G + 1) / 2;
-    if (G == 1) makers = 1;  // 单网关：hybrid
+    const std::size_t makers = G == 1 ? 1 : opt.makers != kAuto ? opt.makers : (G + 1) / 2;  // 单网关：hybrid
     const std::vector<int> cpus = allowedCpus();
-    const std::uint32_t yield_after =
-        opt.yield_after >= 0 ? static_cast<std::uint32_t>(opt.yield_after) : (G + 1 <= cpus.size() ? 0u : 64u);
+    const std::uint32_t yield_after = opt.yield_after != kAuto ? static_cast<std::uint32_t>(opt.yield_after)
+                                                               : (G + 1 <= cpus.size() ? 0u : 64u);
 
     // 预留容量：只有报价会挂单（吃单都是 IOC / 市价），每个交易对的活动订单不超过 做市网关数 x 2 x levels。
     // 留 4 倍余量并取 2 的幂（至少 4096），保证撮合热路径零分配（运行结束时报告实际分配次数）。
@@ -726,13 +720,8 @@ int main(int argc, char** argv) {
     auto plural = [](std::size_t n, const char* word) {
         return std::to_string(n) + " " + word + (n == 1 ? "" : "s");
     };
-    std::size_t n_makers = 0, n_takers = 0;
-    for (const auto& t : traders) {
-        if (t->role() == Role::Maker) ++n_makers;
-        if (t->role() == Role::Taker) ++n_takers;
-    }
     const std::string roles =
-        G == 1 ? std::string("hybrid maker/taker") : plural(n_makers, "maker") + ", " + plural(n_takers, "taker");
+        G == 1 ? std::string("hybrid maker/taker") : plural(makers, "maker") + ", " + plural(G - makers, "taker");
     std::printf("exchange_sim: %s (%s), %s, %s commands, seed %" PRIu64 "\n", plural(G, "gateway").c_str(),
                 roles.c_str(), plural(opt.symbols, "symbol").c_str(), withCommas(opt.orders).c_str(), opt.seed);
     std::printf("  window %zu in flight/gateway, engine batch %zu, queues in %zu / out %zu, reserve %s orders/symbol\n",
@@ -756,11 +745,11 @@ int main(int argc, char** argv) {
         threads.emplace_back([tp, &gate] { tp->run(gate); });
     }
     while (gate.ready.load(std::memory_order_acquire) < G) std::this_thread::yield();
-    const std::uint64_t allocations_before = g_heap_allocations.load(std::memory_order_relaxed);
+    const std::uint64_t allocations_before = hft::alloc_counter::total();  // 计数版全局 operator new（hft/alloc_counter.h）
     const std::int64_t t0 = hft::nowNs();
     gate.go.store(true, std::memory_order_release);
     while (gate.done.load(std::memory_order_acquire) < G) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const std::uint64_t allocations = g_heap_allocations.load(std::memory_order_relaxed) - allocations_before;
+    const std::uint64_t allocations = hft::alloc_counter::total() - allocations_before;
     runner.stop();  // 排空（此时没有在途命令）
     gate.stopped.store(true, std::memory_order_release);
     for (std::thread& th : threads) th.join();
@@ -773,22 +762,7 @@ int main(int argc, char** argv) {
     TraderStats total;
     hft::LatencyHistogram all_latency;
     for (const auto& t : traders) {
-        const TraderStats& s = t->stats();
-        total.sent += s.sent;
-        total.acked += s.acked;
-        for (int i = 0; i < 3; ++i) total.sent_by_type[i] += s.sent_by_type[i];
-        total.quotes += s.quotes;
-        total.iocs += s.iocs;
-        total.markets += s.markets;
-        for (int i = 0; i < 5; ++i) total.events_by_type[i] += s.events_by_type[i];
-        total.maker_fills += s.maker_fills;
-        total.taker_fills += s.taker_fills;
-        total.maker_qty += s.maker_qty;
-        total.taker_qty += s.taker_qty;
-        for (int i = 0; i < 8; ++i) total.reject_reasons[i] += s.reject_reasons[i];
-        for (int i = 0; i < 5; ++i) total.cancel_reasons[i] += s.cancel_reasons[i];
-        total.echo_mismatches += s.echo_mismatches;
-        total.stale_events += s.stale_events;
+        total.add(t->stats());
         all_latency.merge(t->latency());
     }
     std::uint64_t events_received = 0;
@@ -808,7 +782,8 @@ int main(int argc, char** argv) {
                 withCommas(total.taker_qty).c_str());
 
     std::printf("\nRound-trip latency, ns (command sent -> first event for it received by the same gateway)\n");
-    printLatencyHeader();
+    std::printf("  %-8s %-7s %12s %7s %7s %7s %7s %8s %9s %8s\n", "gateway", "role", "samples", "min", "p50", "p90",
+                "p99", "p99.9", "max", "mean");
     for (const auto& t : traders) printLatencyRow(std::to_string(t->id()), roleName(t->role()), t->latency());
     if (G > 1) printLatencyRow("all", "", all_latency);
 

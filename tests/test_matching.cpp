@@ -18,7 +18,6 @@
 #include "test_framework.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -28,9 +27,9 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <new>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <unordered_set>
@@ -57,18 +56,30 @@ struct RegisterSpecSuites {
 using RefBook = ReferenceOrderBook<RecordingListener>;
 using NaiveBook = NaiveOrderBook<RecordingListener>;
 
-// 单个订单簿 + 记录型监听器：逐条执行命令并返回该命令产生的事件
+// 单个订单簿 + 记录型监听器：逐条执行命令并返回该命令产生的事件（引用在下一次 run() 之前有效）。
+// 三个实现的构造参数相同：(listener, max_orders, reserve_orders)
 template <class Book>
 struct Stepper {
     RecordingListener listener;
     Book book;
-    explicit Stepper(std::size_t max_orders = 0) : listener(), book(listener, max_orders) {}
-    std::vector<Event> run(const Command& cmd) {
+    explicit Stepper(std::size_t max_orders = 0, std::size_t reserve_orders = 1024)
+        : listener(), book(listener, max_orders, reserve_orders) {}
+    const std::vector<Event>& run(const Command& cmd) {
         listener.clear();
         hft::matching::test::apply(book, cmd);
-        return listener.take();
+        return listener.events;
     }
 };
+
+// 把命令发给多交易对引擎的某个交易对
+template <class Engine>
+void applyTo(Engine& engine, SymbolId symbol, const Command& c) {
+    switch (c.type) {
+        case RequestType::New: engine.submit(symbol, c.order); return;
+        case RequestType::Cancel: engine.cancel(symbol, c.id); return;
+        case RequestType::Modify: engine.modify(symbol, c.id, c.price, c.qty); return;
+    }
+}
 
 // ============================================================================
 // 与实现无关的单命令事件流检查：只依赖命令前后的查询结果，
@@ -417,19 +428,22 @@ const std::vector<const char*>& requiredBranches() {
     return kRequired;
 }
 
-// 逐个报告从未触发过的分支（requiredBranches() 加上 extra）；有遗漏时打印完整覆盖统计
+// 逐个报告 keys 中从未触发过的分支；全部触发过时返回 true
+bool checkExercised(const Coverage& cov, const std::vector<const char*>& keys, const char* file, int line) {
+    bool all = true;
+    for (const char* key : keys) {
+        if (cov.get(key) != 0) continue;
+        all = false;
+        ::hft_test::reportFailure(file, line, std::string("branch never exercised: ") + key);
+    }
+    return all;
+}
+
+// requiredBranches() 加上 extra 都必须触发过；有遗漏时打印完整覆盖统计
 void checkAllBranchesExercised(const Coverage& cov, const char* file, int line,
                                const std::vector<const char*>& extra = {}) {
-    bool all = true;
-    for (const std::vector<const char*>* keys : {&requiredBranches(), &extra}) {
-        for (const char* key : *keys) {
-            if (cov.get(key) == 0) {
-                all = false;
-                ::hft_test::reportFailure(file, line, std::string("branch never exercised: ") + key);
-            }
-        }
-    }
-    if (!all) std::printf("%s", cov.summary().c_str());
+    const bool required = checkExercised(cov, requiredBranches(), file, line);
+    if (!(checkExercised(cov, extra, file, line) && required)) std::printf("%s", cov.summary().c_str());
 }
 
 struct FuzzRun {
@@ -487,7 +501,7 @@ TEST_CASE("reference/fuzz: random streams keep invariants and a self-consistent 
         for (std::size_t i = 0; i < run.commands; ++i) {
             const Command cmd = gen.next();
             const PreState pre = capturePre(s.book, cmd);
-            const std::vector<Event> ev = s.run(cmd);
+            const std::vector<Event>& ev = s.run(cmd);
             std::string why;
             if (!s.book.checkInvariants(&why)) FAIL(describe(run, i, cmd, ev) + "checkInvariants: " + why);
             if (!checkCommandEvents(cmd, pre, ev, s.book, run.max_orders, &why))
@@ -537,8 +551,8 @@ TEST_CASE("differential/reference vs naive: identical event streams and book sta
         Stepper<NaiveBook> naive(run.max_orders);
         for (std::size_t i = 0; i < run.commands; ++i) {
             const Command cmd = gen.next();
-            const std::vector<Event> expected = ref.run(cmd);
-            const std::vector<Event> actual = naive.run(cmd);
+            const std::vector<Event>& expected = ref.run(cmd);
+            const std::vector<Event>& actual = naive.run(cmd);
             std::string why;
             if (!sameEvents(actual, expected, &why))
                 FAIL(describe(run, i, cmd, expected) + "naive diverged from reference:\n" + why);
@@ -808,7 +822,7 @@ TEST_CASE("generator: produces every request flavour around a drifting mid") {
 }
 
 // ============================================================================
-// 参考模型特有的行为与规模测试
+// 参考模型特有的行为：回调时刻的簿状态
 // ============================================================================
 
 namespace {
@@ -841,53 +855,6 @@ TEST_CASE("reference: the book is consistent whenever a callback runs") {
     CHECK_EQ(probe.violations, 0);
 }
 
-TEST_CASE("reference: long FIFO queues and deep books") {
-    // 同一价位 3000 个订单（账户轮换），市价单吃掉前 2000 个再加 1 手
-    Stepper<RefBook> s;
-    for (OrderId id = 1; id <= 3000; ++id) {
-        s.run(Command::newOrder(sell(id, 500, 2).account(static_cast<AccountId>(1 + id % 3))));
-    }
-    REQUIRE_EQ(s.book.orderCount(), 3000u);
-    CHECK_LEVELS(s.book.depth(Side::Sell), {500, 6000, 3000});
-    const std::vector<Event> ev = s.run(Command::newOrder(marketBuy(9000, 4001).account(9)));
-    // Accepted + 2000 笔完整成交 + 1 笔部分成交；市价单全部成交，没有撤单
-    REQUIRE_EQ(ev.size(), 2002u);
-    bool fifo = true;
-    for (std::size_t i = 1; i < ev.size(); ++i) {
-        const Trade& t = ev[i].trade;
-        fifo = fifo && ev[i].kind == Event::Kind::Trade && t.maker_id == i && t.trade_id == i && t.price == 500;
-    }
-    CHECK(fifo);
-    CHECK_EQ(ev.back().trade.maker_remaining, 1);
-    CHECK_EQ(ev.back().trade.taker_remaining, 0);
-    CHECK_EQ(s.book.orderCount(), 1000u);
-    CHECK_LEVELS(s.book.depth(Side::Sell), {500, 1999, 1000});
-    // 先把临时 vector 存下来：CHECK_EQ 内部用 const auto& 绑定，取临时对象成员的引用会悬空
-    const std::vector<OrderInfo> queue = s.book.ordersAt(Side::Sell, 500);
-    REQUIRE_EQ(queue.size(), 1000u);
-    CHECK_EQ(queue.front().id, 2001u);
-    CHECK_EQ(queue.back().id, 3000u);
-    std::string why;
-    CHECK(s.book.checkInvariants(&why));
-
-    // 2000 个价位的深簿：一张卖单从 2000 扫到 1，剩余量挂在 1
-    Stepper<RefBook> d;
-    for (OrderId id = 1; id <= 2000; ++id) d.run(Command::newOrder(buy(id, static_cast<Price>(id), 1)));
-    CHECK_EQ(d.book.levelCount(Side::Buy), 2000u);
-    CHECK_TOP(d.book, 2000, std::nullopt);
-    const std::vector<Event> sweep = d.run(Command::newOrder(sell(5000, 1, 2500).account(2)));
-    REQUIRE_EQ(sweep.size(), 2001u);
-    bool descending = true;
-    for (std::size_t i = 1; i < sweep.size(); ++i) {
-        descending = descending && sweep[i].kind == Event::Kind::Trade &&
-                     sweep[i].trade.price == static_cast<Price>(2001 - i);
-    }
-    CHECK(descending);
-    CHECK_TOP(d.book, std::nullopt, 1);
-    CHECK_ORDER(d.book, 5000, orderInfo(5000, 2, Side::Sell, 1, 500));
-    CHECK(d.book.checkInvariants(&why));
-}
-
 // ============================================================================
 // 优化引擎（matching/order_book.h、matching/matching_engine.h）专项测试：
 // 与参考模型的多场景差分模糊测试、回调时刻的簿状态、零分配、白盒不变量、极端数值、多交易对路由
@@ -895,7 +862,6 @@ TEST_CASE("reference: long FIFO queues and deep books") {
 
 // 堆分配计数见 hft/alloc_counter.h（计数版全局 operator new/delete，本程序唯一包含它的翻译单元）
 namespace {
-std::atomic<std::uint64_t>& g_heap_allocations = hft::alloc_counter::g_total;
 std::uint64_t heapAllocations() { return hft::alloc_counter::total(); }
 }  // namespace
 
@@ -913,20 +879,6 @@ struct OrderBookTestPeer {
 namespace {
 
 using OptBook = LimitOrderBook<RecordingListener>;
-
-// 可指定预留容量的执行器（Stepper 只接受 max_orders；扩容路径需要很小的预留量）
-template <class Book>
-struct SizedStepper {
-    RecordingListener listener;
-    Book book;
-    SizedStepper(std::size_t max_orders, std::size_t reserve_orders)
-        : listener(), book(listener, max_orders, reserve_orders) {}
-    std::vector<Event> run(const Command& cmd) {
-        listener.clear();
-        hft::matching::test::apply(book, cmd);
-        return listener.take();
-    }
-};
 
 // 场景改写器的随机源：与生成器一样只用 mt19937_64 的原始输出，任何标准库实现上都可复现
 class Mutator {
@@ -1094,18 +1046,14 @@ std::string runDifferential(const DiffProfile& p, std::uint64_t seed, std::size_
     RandomCommandGenerator gen(seed, p.gen);
     Mutator mutator(seed);
     Stepper<RefBook> ref(p.max_orders);
-    SizedStepper<OptBook> opt(p.max_orders, p.reserve_orders);
+    Stepper<OptBook> opt(p.max_orders, p.reserve_orders);
     std::string why;
     for (std::size_t i = 0; i < commands; ++i) {
         Command cmd = gen.next();
         if (p.mutate != nullptr) p.mutate(cmd, mutator);
         const PreState pre = capturePre(opt.book, cmd);
-        ref.listener.clear();
-        opt.listener.clear();
-        hft::matching::test::apply(ref.book, cmd);
-        hft::matching::test::apply(opt.book, cmd);
-        const std::vector<Event>& expected = ref.listener.events;
-        const std::vector<Event>& actual = opt.listener.events;
+        const std::vector<Event>& expected = ref.run(cmd);
+        const std::vector<Event>& actual = opt.run(cmd);
         if (!sameEvents(actual, expected, &why))
             return diffFailure(p, seed, i, cmd, expected, actual,
                                "event streams differ (expected = reference, actual = optimized):\n" + why);
@@ -1206,20 +1154,17 @@ TEST_CASE("optimized/differential: identical events and state vs the naive model
     for (const FuzzRun& run : runs) {
         RandomCommandGenerator gen(run.seed, run.gen);
         Stepper<NaiveBook> naive(run.max_orders);
-        SizedStepper<OptBook> opt(run.max_orders, 64);
+        Stepper<OptBook> opt(run.max_orders, 64);
         for (std::size_t i = 0; i < run.commands; ++i) {
             const Command cmd = gen.next();
-            naive.listener.clear();
-            opt.listener.clear();
-            hft::matching::test::apply(naive.book, cmd);
-            hft::matching::test::apply(opt.book, cmd);
+            const std::vector<Event>& expected = naive.run(cmd);
+            const std::vector<Event>& actual = opt.run(cmd);
             std::string why;
-            if (!sameEvents(opt.listener.events, naive.listener.events, &why))
-                FAIL(describe(run, i, cmd, naive.listener.events) + "optimized diverged from naive:\n" + why);
+            if (!sameEvents(actual, expected, &why))
+                FAIL(describe(run, i, cmd, expected) + "optimized diverged from naive:\n" + why);
             if (i % 16 == 15 || i + 1 == run.commands) {
-                if (!opt.book.checkInvariants(&why)) FAIL(describe(run, i, cmd, opt.listener.events) + why);
-                if (!sameState(naive.book, opt.book, &why))
-                    FAIL(describe(run, i, cmd, opt.listener.events) + "state differs: " + why);
+                if (!opt.book.checkInvariants(&why)) FAIL(describe(run, i, cmd, actual) + why);
+                if (!sameState(naive.book, opt.book, &why)) FAIL(describe(run, i, cmd, actual) + "state differs: " + why);
             }
         }
     }
@@ -1238,8 +1183,8 @@ TEST_CASE("differential/reference vs naive: level totals at the INT64_MAX bound"
             Command cmd = gen.next();
             mutateExtremeQty(cmd, mutator);
             const PreState pre = capturePre(ref.book, cmd);
-            const std::vector<Event> expected = ref.run(cmd);
-            const std::vector<Event> actual = naive.run(cmd);
+            const std::vector<Event>& expected = ref.run(cmd);
+            const std::vector<Event>& actual = naive.run(cmd);
             const std::string where = "seed " + std::to_string(seed) + " command #" + std::to_string(i) + " " +
                                       cmd.toString() + "\n    reference events: " + str(expected) + "\n    ";
             std::string why;
@@ -1254,9 +1199,7 @@ TEST_CASE("differential/reference vs naive: level totals at the INT64_MAX bound"
             }
         }
     }
-    for (const char* key : requiredLevelBoundBranches()) {
-        if (cov.get(key) == 0) ::hft_test::reportFailure(__FILE__, __LINE__, std::string("branch never exercised: ") + key);
-    }
+    checkExercised(cov, requiredLevelBoundBranches(), __FILE__, __LINE__);
     std::printf("    bound rejections: %llu new, %llu modify; %llu commands left a level at exactly INT64_MAX\n",
                 static_cast<unsigned long long>(cov.get("bound/reject_new")),
                 static_cast<unsigned long long>(cov.get("bound/reject_modify")),
@@ -1389,17 +1332,6 @@ TEST_CASE("optimized: listeners observe exactly the reference book state during 
 // ============================================================================
 namespace {
 
-// 不分配内存的监听器
-struct CountingListener {
-    std::uint64_t events = 0;
-    std::uint64_t trades = 0;
-    void onAccepted(const OrderRequest&) { ++events; }
-    void onRejected(OrderId, RequestType, RejectReason) { ++events; }
-    void onTrade(const Trade&) { ++events; ++trades; }
-    void onCancelled(OrderId, Qty, CancelReason) { ++events; }
-    void onModified(OrderId, Price, Qty) { ++events; }
-};
-
 struct CountingEngineListener {
     std::uint64_t events = 0;
     std::uint64_t trades = 0;
@@ -1466,14 +1398,7 @@ TEST_CASE("optimized: no heap allocation once capacity is reserved") {
         const std::vector<Command> b = profileCommands(profiles[2], 92, 30'000);
         const std::uint64_t before = heapAllocations();
         for (std::size_t i = 0; i < a.size(); ++i) {
-            for (SymbolId s : {SymbolId{0}, SymbolId{1}, SymbolId{7}}) {
-                const Command& c = s == 0 ? a[i] : b[i];
-                switch (c.type) {
-                    case RequestType::New: engine.submit(s, c.order); break;
-                    case RequestType::Cancel: engine.cancel(s, c.id); break;
-                    case RequestType::Modify: engine.modify(s, c.id, c.price, c.qty); break;
-                }
-            }
+            for (SymbolId s : {SymbolId{0}, SymbolId{1}, SymbolId{7}}) applyTo(engine, s, s == 0 ? a[i] : b[i]);
         }
         CHECK_EQ(heapAllocations() - before, 0u);
         CHECK_EQ(l.unknown_symbol, 30'000u);
@@ -1541,6 +1466,13 @@ TEST_CASE("optimized: checkInvariants detects every kind of internal corruption"
         {"missing index entry", "missing from the index", [](OptBook& b) { Peer::index(b).erase(4); }},
         {"index points elsewhere", "points to another order",
          [](OptBook& b) { *Peer::index(b).find(1) = *Peer::index(b).find(2); }},
+        {"extra index entry", "index holds 7 entries (0 placeholders)",
+         [](OptBook& b) { Peer::index(b).insert(OrderId{99}, *Peer::index(b).find(1)); }},
+        // 占位条目（空指针）只在回调期间存在且至多一个
+        {"two placeholder entries", "(2 placeholders)", [](OptBook& b) {
+             Peer::index(b).insert(OrderId{98}, nullptr);
+             Peer::index(b).insert(OrderId{99}, nullptr);
+         }},
         {"crossed book", "book crossed", [](OptBook& b) {
              auto& best_bid = Peer::sides(b)[0].back();
              best_bid.level->price = 102;
@@ -1600,30 +1532,28 @@ namespace {
 // 同一命令同时执行在参考模型与优化引擎上：事件必须完全相同
 struct DualBook {
     Stepper<RefBook> ref;
-    SizedStepper<OptBook> opt;
+    Stepper<OptBook> opt;
     std::size_t executed = 0;
 
     explicit DualBook(std::size_t max_orders = 0, std::size_t reserve_orders = 1024)
         : ref(max_orders), opt(max_orders, reserve_orders) {}
 
-    std::vector<Event> run(const Command& cmd, const char* file, int line) {
-        ref.listener.clear();
-        opt.listener.clear();
-        hft::matching::test::apply(ref.book, cmd);
-        hft::matching::test::apply(opt.book, cmd);
+    const std::vector<Event>& run(const Command& cmd, const char* file, int line) {
+        const std::vector<Event>& expected = ref.run(cmd);
         ++executed;
         std::string why;
-        if (!sameEvents(opt.listener.events, ref.listener.events, &why)) {
+        if (!sameEvents(opt.run(cmd), expected, &why)) {
             ::hft_test::reportFailure(file, line, "command #" + std::to_string(executed - 1) + " " +
                                                       cmd.toString() + ": optimized diverged from reference:\n" + why);
             throw ::hft_test::RequireFailure();
         }
-        return ref.listener.events;
+        return expected;
     }
 
     void verify(const char* file, int line) const {
         std::string why;
-        bool ok = opt.book.checkInvariants(&why);
+        bool ok = ref.book.checkInvariants(&why);
+        if (ok) ok = opt.book.checkInvariants(&why);
         if (ok) ok = sameState(ref.book, opt.book, &why);
         if (ok) ok = queriesConsistent(opt.book, &why);
         if (!ok) {
@@ -1645,22 +1575,47 @@ void shuffleInPlace(std::vector<T>& v, std::mt19937_64& rng) {
 }  // namespace
 
 TEST_CASE("optimized: long FIFO queues and deep books match the reference") {
-    DualBook d(0, 16);  // 小预留量：同时覆盖扩容路径
+    // 两个实现的事件逐条相同、DUAL_VERIFY 校验两边不变量与完整状态相同：以下断言对两者同时成立。
+    // 同一价位 3000 个订单（账户轮换），市价单吃掉前 2000 个再加 1 手；优化引擎的小预留量同时覆盖扩容路径
+    DualBook d(0, 16);
     for (OrderId id = 1; id <= 3000; ++id)
         DUAL_RUN(d, Command::newOrder(sell(id, 500, 2).account(static_cast<AccountId>(1 + id % 3))));
     DUAL_VERIFY(d);
+    REQUIRE_EQ(d.ref.book.orderCount(), 3000u);
+    CHECK_LEVELS(d.ref.book.depth(Side::Sell), {500, 6000, 3000});
     const std::vector<Event> ev = DUAL_RUN(d, Command::newOrder(marketBuy(9000, 4001).account(9)));
+    // Accepted + 2000 笔完整成交 + 1 笔部分成交；市价单全部成交，没有撤单
     REQUIRE_EQ(ev.size(), 2002u);
+    bool fifo = true;
+    for (std::size_t i = 1; i < ev.size(); ++i) {
+        const Trade& t = ev[i].trade;
+        fifo = fifo && ev[i].kind == Event::Kind::Trade && t.maker_id == i && t.trade_id == i && t.price == 500;
+    }
+    CHECK(fifo);
+    CHECK_EQ(ev.back().trade.maker_remaining, 1);
+    CHECK_EQ(ev.back().trade.taker_remaining, 0);
     CHECK_EQ(d.opt.book.orderCount(), 1000u);
     CHECK_LEVELS(d.opt.book.depth(Side::Sell), {500, 1999, 1000});
+    // 先把临时 vector 存下来：CHECK_EQ 内部用 const auto& 绑定，取临时对象成员的引用会悬空
+    const std::vector<OrderInfo> queue = d.ref.book.ordersAt(Side::Sell, 500);
+    REQUIRE_EQ(queue.size(), 1000u);
+    CHECK_EQ(queue.front().id, 2001u);
+    CHECK_EQ(queue.back().id, 3000u);
     DUAL_VERIFY(d);
-    // 2000 个价位的深簿（新簿），一张卖单扫到底，剩余量挂单
+    // 2000 个价位的深簿（新簿）：一张卖单从 2000 扫到 1，剩余量挂在 1
     DualBook e(0, 16);
     for (OrderId id = 1; id <= 2000; ++id) DUAL_RUN(e, Command::newOrder(buy(id, static_cast<Price>(id), 1)));
     DUAL_VERIFY(e);
     CHECK_EQ(e.opt.book.levelCount(Side::Buy), 2000u);
+    CHECK_TOP(e.ref.book, 2000, std::nullopt);
     const std::vector<Event> sweep = DUAL_RUN(e, Command::newOrder(sell(5000, 1, 2500).account(2)));
-    CHECK_EQ(sweep.size(), 2001u);
+    REQUIRE_EQ(sweep.size(), 2001u);
+    bool descending = true;
+    for (std::size_t i = 1; i < sweep.size(); ++i) {
+        descending = descending && sweep[i].kind == Event::Kind::Trade &&
+                     sweep[i].trade.price == static_cast<Price>(2001 - i);
+    }
+    CHECK(descending);
     CHECK_TOP(e.opt.book, std::nullopt, 1);
     CHECK_ORDER(e.opt.book, 5000, orderInfo(5000, 2, Side::Sell, 1, 500));
     DUAL_VERIFY(e);
@@ -1821,7 +1776,7 @@ TEST_CASE("optimized: orders that would push a level total past INT64_MAX are re
 
 TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {
     // 规范之外的输入（只能经强制类型转换构造）：优化引擎按 InvalidFlags 拒单，不越界、不崩溃
-    SizedStepper<OptBook> s(0, 16);
+    Stepper<OptBook> s(0, 16);
     s.book.submit(sell(1, 101, 5));
     s.book.submit(buy(2, 99, 5));
     s.listener.clear();
@@ -1849,6 +1804,52 @@ TEST_CASE("optimized: out-of-range enum values are rejected as InvalidFlags") {
     CHECK_UNCHANGED(before, s.book);
     std::string why;
     CHECK(s.book.checkInvariants(&why));
+}
+
+namespace {
+
+// 下一次 onAccepted / onModified 记录事件后抛异常的监听器
+struct ThrowingListener : RecordingListener {
+    bool throw_on_accepted = false;
+    bool throw_on_modified = false;
+    void onAccepted(const OrderRequest& r) {
+        RecordingListener::onAccepted(r);
+        if (std::exchange(throw_on_accepted, false)) throw std::runtime_error("onAccepted");
+    }
+    void onModified(OrderId id, Price p, Qty q) {
+        RecordingListener::onModified(id, p, q);
+        if (std::exchange(throw_on_modified, false)) throw std::runtime_error("onModified");
+    }
+};
+
+}  // namespace
+
+TEST_CASE("optimized: a listener exception aborts the command and leaves the book consistent") {
+    // 不穿价的新单与改单在回调期间持有索引中的占位条目：回调抛异常时占位必须撤销，id 随即可以再用
+    ThrowingListener l;
+    LimitOrderBook<ThrowingListener> book(l, 0, 16);
+    book.submit(sell(1, 105, 5));
+    std::string why;
+    l.throw_on_accepted = true;
+    CHECK_THROWS(book.submit(buy(2, 100, 3)));
+    CHECK(book.checkInvariants(&why));
+    CHECK_NO_ORDER(book, 2);
+    CHECK_EQ(book.orderCount(), 1u);
+    l.clear();
+    book.submit(buy(2, 100, 3));
+    CHECK_EVENTS(l.take(), accepted(buy(2, 100, 3)));
+    // 改价：onModified 发出时订单已离开订单簿，命令中止后它不再挂单
+    l.throw_on_modified = true;
+    CHECK_THROWS(book.modify(2, 101, 3));
+    CHECK(book.checkInvariants(&why));
+    CHECK_NO_ORDER(book, 2);
+    CHECK_DEPTH_EMPTY(book, Side::Buy);
+    l.clear();
+    book.cancel(2);
+    CHECK_EVENTS(l.take(), rejectedCancel(2));
+    book.submit(buy(2, 99, 1));
+    CHECK_ORDER(book, 2, orderInfo(2, 1, Side::Buy, 99, 1));
+    CHECK(book.checkInvariants(&why));
 }
 
 TEST_CASE("optimized: zero reservation and growth from empty are fine") {
@@ -1889,14 +1890,6 @@ struct EngineRecorder {
 
 using Engine = MatchingEngine<EngineRecorder>;
 
-void applyTo(Engine& engine, SymbolId symbol, const Command& c) {
-    switch (c.type) {
-        case RequestType::New: engine.submit(symbol, c.order); return;
-        case RequestType::Cancel: engine.cancel(symbol, c.id); return;
-        case RequestType::Modify: engine.modify(symbol, c.id, c.price, c.qty); return;
-    }
-}
-
 std::vector<SymbolEvent> tagged(SymbolId symbol, const std::vector<Event>& events) {
     std::vector<SymbolEvent> out;
     for (const Event& e : events) out.push_back({symbol, e});
@@ -1920,8 +1913,6 @@ TEST_CASE("engine: addSymbol assigns sequential ids and exposes names and books"
     EngineRecorder rec;
     Engine engine(rec);
     CHECK_EQ(engine.symbolCount(), 0u);
-    CHECK(!engine.hasSymbol(0));
-    CHECK(engine.findBook(0) == nullptr);
     CHECK_THROWS(engine.book(0));
     CHECK_THROWS(engine.symbolName(0));
     const SymbolId btc = engine.addSymbol("BTC-USDT");
@@ -1934,9 +1925,7 @@ TEST_CASE("engine: addSymbol assigns sequential ids and exposes names and books"
     CHECK_EQ(engine.symbolName(eth), std::string("ETH-USDT"));
     CHECK(engine.findSymbol("SOL-USDT") == std::optional<SymbolId>(sol));
     CHECK(!engine.findSymbol("DOGE-USDT").has_value());
-    CHECK(engine.hasSymbol(sol));
-    CHECK(!engine.hasSymbol(3));
-    CHECK(engine.findBook(eth) == &engine.book(eth));
+    CHECK_THROWS(engine.book(3));
     CHECK_EQ(engine.book(eth).maxOrders(), 10u);
     CHECK_EQ(engine.book(btc).maxOrders(), 0u);
     // 名称重复：抛异常且引擎不变
@@ -1944,8 +1933,8 @@ TEST_CASE("engine: addSymbol assigns sequential ids and exposes names and books"
     CHECK_EQ(engine.symbolCount(), 3u);
     CHECK(engine.findSymbol("ETH-USDT") == std::optional<SymbolId>(eth));
     const Engine& view = engine;
-    CHECK(view.findBook(btc) == &view.book(btc));
-    CHECK(view.findBook(99) == nullptr);
+    CHECK(&view.book(btc) == &engine.book(btc));
+    CHECK_THROWS(view.book(99));
     CHECK(rec.events.empty());
 }
 

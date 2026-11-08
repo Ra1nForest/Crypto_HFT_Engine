@@ -32,6 +32,7 @@ struct OrderBookTestPeer;
 //
 // - 订单 Order：来自 hft::ObjectPool<Order>（地址稳定、LIFO 复用），48 字节；同一价位的订单用
 //   prev/next 侵入式双向链表串成 FIFO（头部时间优先级最高）。订单不存价格，价格在所属 Level 中。
+//   订单对象只在挂单时创建，因此对象池的存活对象数就是挂单数（orderCount()）。
 // - 价位 Level：来自 hft::ObjectPool<Level>（地址稳定），缓存该档剩余总量与订单数，查询 O(1)。
 // - 每侧一个按价格有序的扁平数组，最优档在末尾（买盘价格升序、卖盘价格降序）：吃掉盘口 = pop_back，
 //   在盘口附近新建价位 = 靠近末尾的短 memmove。
@@ -42,21 +43,24 @@ struct OrderBookTestPeer;
 //   对手最优 key >= taker 限价在对手 key 空间中的值（市价单取 INT64_MIN，总是成立）。
 //   查找从末尾（盘口）先线性探测 kLinearProbe 个元素，再对剩余前缀二分：绝大多数价位操作发生在盘口附近。
 // - 订单索引：hft::FlatHashMap<OrderId, Order*>（线性探测 + 反向移位删除）。0 和 UINT64_MAX 都是普通 id
-//   （后者由哈希表存放在表外专用槽位）。索引返回的槽位指针在任何插入/删除之后都可能失效，
-//   因此代码只立即取出其中的 Order*，从不跨越修改操作持有槽位指针。
+//   （后者由哈希表存放在表外专用槽位）。每次增删只探测一次：撤单用 extract；不穿价的新单用 insert 查重，
+//   同时插入一个值为空指针的占位条目占好槽位，onAccepted 之后经槽位指针写入订单；改价/加量的改单复用
+//   find 得到的槽位（不穿价时原地占位、挂单后写回，穿价时 eraseAt）。占位条目对全部查询不可见。
+//   槽位指针在任何插入/删除之后都可能失效，因此只在两次索引修改之间持有它。
 // - 只用整数运算；不抛异常的正常控制流；回调里不做任何分配。
 //
 // 容量与分配：构造时为 reserve_orders 个订单预留全部结构（订单池、价位池、两侧价位数组、索引）。
 // 活动订单数不超过预留量时，submit/cancel/modify 不做任何堆分配（基准测试用计数版 operator new 验证）。
-// 超过预留量时按倍增扩容：会挂单的操作在产生第一个事件或修改任何状态之前就先完成扩容
+// 超过预留量时按倍增扩容：会挂单的新单在产生第一个事件或修改任何状态之前就先完成扩容
 // （ensureCapacityForOneMore），因此内存分配失败（std::bad_alloc）时簿与事件流都保持不变（强异常保证）。
+// 改单不增加订单数，现有容量总够用，从不扩容。Order/Level 都是平凡析构类型，析构时对象池直接释放内存。
 //
 // 回调时机（与参考模型一致，监听器可以在回调中调用 const 查询）：每个事件发出时，簿内状态已经包含
 // 该事件的全部效果——成交回报发出时完全成交的 maker 已被移除、空价位已删除；STP 撤 maker 时 maker
 // 已移除；改价/加量的 onModified 发出时该订单已离开订单簿（之后作为 taker 撮合，剩余量最后静默挂单）；
 // 原地改单的 onModified 发出时剩余量与档位总量已更新；新订单在 onAccepted 时尚未进入订单簿。
 // 监听器不得在回调中重入调用本簿的 submit/cancel/modify；回调抛出的异常会原样传播，簿保持结构一致
-// （checkInvariants() 成立），但正在处理的那条命令就此中止（例如主动单不再继续撮合、也不挂单）。
+// （checkInvariants() 成立，占位条目也会撤销），但正在处理的那条命令就此中止（例如主动单不再继续撮合、也不挂单）。
 //
 // 档位总量上限（契约的一部分，三个实现完全一致，见 matching/types.h 的 kMaxLevelQty）：会让某档总量超过
 // INT64_MAX 的限价 GTC 新单与改价/加量改单，在产生任何其他事件之前以 InvalidQuantity 拒绝。缓存的档位
@@ -132,17 +136,12 @@ class LimitOrderBook {
     static constexpr std::size_t kMinGrowth = 64;    // 超出预留容量后的最小扩容量
 
 public:
-    using listener_type = Listener;
     static constexpr std::size_t kDefaultReserveOrders = 1024;
 
     // max_orders：活动挂单上限（0 = 不限）；reserve_orders：预留容量（活动订单不超过它时热路径零分配）
     explicit LimitOrderBook(Listener& listener, std::size_t max_orders = 0,
                             std::size_t reserve_orders = kDefaultReserveOrders)
-        : listener_(listener),
-          max_orders_(max_orders),
-          order_pool_(reserve_orders, true),
-          level_pool_(reserve_orders, true),
-          index_(reserve_orders) {
+        : listener_(listener), max_orders_(max_orders) {
         reserve(reserve_orders);
     }
 
@@ -151,7 +150,6 @@ public:
     LimitOrderBook& operator=(const LimitOrderBook&) = delete;
     LimitOrderBook(LimitOrderBook&&) = delete;
     LimitOrderBook& operator=(LimitOrderBook&&) = delete;
-    ~LimitOrderBook() = default;  // Order/Level 都是平凡析构类型，对象池直接释放内存
 
     // ---------------------------------------------------------------- 新订单（docs/MATCHING_ENGINE.md「submit」）
     void submit(const OrderRequest& req) {
@@ -159,109 +157,82 @@ public:
         if (req.qty <= 0) return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
         if (req.type == OrderType::Limit && req.price <= 0)
             return reject(req.id, RequestType::New, RejectReason::InvalidPrice);
-        if (HFT_UNLIKELY(!validEnums(req)) ||
-            (req.post_only && (req.type != OrderType::Limit || req.tif != TimeInForce::GTC)))
-            return reject(req.id, RequestType::New, RejectReason::InvalidFlags);
-        if (index_.contains(req.id)) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
         const bool rests = req.type == OrderType::Limit && req.tif == TimeInForce::GTC;
-        if (max_orders_ != 0 && index_.size() >= max_orders_ && rests)
-            return reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
-        // 档位总量上限：只有限价 GTC 会挂单。撮合不触及本侧；本侧该价位已有档位时订单也不可能穿价
-        // （盘口不交叉），会整单挂上去——所以这条检查恰好拒绝会让该档总量越界的请求。顺便记下挂单位置
-        // 交给 rest()：从这里到挂单，撮合只改动对手方、回调不得重入、扩容不改变下标，本侧数组不变
-        std::size_t rest_pos = 0;
-        if (rests) {
-            const SideLevels& own = sides_[sideIndex(req.side)];
-            const Price key = keyOf(req.side, req.price);
-            rest_pos = lowerBoundFromBack(own, key);
-            const Qty resting = rest_pos < own.size() && own[rest_pos].key == key ? own[rest_pos].level->total : 0;
-            if (HFT_UNLIKELY(req.qty > kMaxLevelQty - resting))
-                return reject(req.id, RequestType::New, RejectReason::InvalidQuantity);
-        }
-        if (req.post_only && crosses(req.side, req.price))
-            return reject(req.id, RequestType::New, RejectReason::PostOnlyWouldCross);
-
+        if (HFT_UNLIKELY(!validEnums(req)) || (req.post_only && !rests))
+            return reject(req.id, RequestType::New, RejectReason::InvalidFlags);
         // 回调之前先把需要的字段取成局部变量：req 是调用方的引用，不依赖它在回调期间保持不变
         const bool market = req.type == OrderType::Market;
-        const TimeInForce tif = req.tif;
-        const Price price = req.price;
-        const bool post_only = req.post_only;
         Taker taker{req.id, req.qty, market ? kMarketKey : keyOf(opposite(req.side), req.price),
                     req.account, req.side, req.stp};
-        if (rests) ensureCapacityForOneMore();  // 可能扩容（抛 bad_alloc 时尚无任何副作用）
+        if (rests) return submitGtc(req, taker);
 
+        // IOC / FOK / 市价单：从不挂单，剩余量撤销
+        if (index_.contains(req.id)) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
+        const bool fok = req.tif == TimeInForce::FOK;
         listener_.onAccepted(req);
-
         // FOK：按撮合顺序预检能否全部成交；不能则整单撤销，簿不受任何影响
-        if (tif == TimeInForce::FOK && !fokFillable(taker)) {
+        if (fok && !fokFillable(taker)) {
             listener_.onCancelled(taker.id, taker.remaining, CancelReason::FokUnfillable);
             return;
         }
-        if (crossesTop(taker) && !match(taker)) return;  // 被自成交保护终止：不挂单
+        if (crossesTop(taker) && !match(taker)) return;  // 被自成交保护终止
         if (taker.remaining == 0) return;                // 全部成交
-        if (market) {
-            listener_.onCancelled(taker.id, taker.remaining, CancelReason::MarketRemainder);
-            return;
-        }
-        if (tif == TimeInForce::IOC) {
-            listener_.onCancelled(taker.id, taker.remaining, CancelReason::IocRemainder);
-            return;
-        }
-        HFT_ASSERT(tif == TimeInForce::GTC && "FOK order has a remainder after a successful pre-check");
-        rest(taker, price, post_only, rest_pos);  // 限价 GTC：剩余量挂到该价位 FIFO 队尾，不发事件
+        HFT_ASSERT(!fok && "FOK order has a remainder after a successful pre-check");
+        listener_.onCancelled(taker.id, taker.remaining,
+                              market ? CancelReason::MarketRemainder : CancelReason::IocRemainder);
     }
 
     // ---------------------------------------------------------------- 撤单
     void cancel(OrderId id) {
-        Order* const* slot = index_.find(id);
-        if (slot == nullptr) return reject(id, RequestType::Cancel, RejectReason::UnknownOrder);
-        Order* const order = *slot;  // 立即取出：removeOrder 会修改索引，使槽位指针失效
-        const Qty remaining = order->remaining;
-        removeOrder(order);
+        const std::optional<Order*> found = index_.extract(id);  // 查找并删除索引条目：一次探测
+        if (!found) return reject(id, RequestType::Cancel, RejectReason::UnknownOrder);
+        const Qty remaining = (*found)->remaining;
+        unlink(*found);
         listener_.onCancelled(id, remaining, CancelReason::UserRequested);
     }
 
     // ---------------------------------------------------------------- 改单（new_qty 是新的剩余数量）
     void modify(OrderId id, Price new_price, Qty new_qty) {
-        Order* const* slot = index_.find(id);
+        Order** const slot = index_.find(id);
         if (slot == nullptr) return reject(id, RequestType::Modify, RejectReason::UnknownOrder);
         Order* const order = *slot;
         if (new_qty <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
         if (new_price <= 0) return reject(id, RequestType::Modify, RejectReason::InvalidPrice);
         Level* const level = order->level;
         const bool same_price = new_price == level->price;
-        const bool in_place = same_price && new_qty <= order->remaining;
-        // 档位总量上限：改价或加量会把订单重新挂到 new_price（原地减量不会增加档位总量）。目标档位中其他
-        // 订单的总量：同价时是本档总量减去它自己，改价时是新价位的现有总量（没有该价位为 0）
-        if (!in_place) {
-            const Qty others = same_price ? level->total - order->remaining : volumeAt(order->side, new_price);
-            if (HFT_UNLIKELY(new_qty > kMaxLevelQty - others))
-                return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
-        }
-        if (order->post_only && !same_price && crosses(order->side, new_price))
-            return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
-
-        // 价格不变且数量不增加：原地修改，保留时间优先级（档位总量随之调整）
-        if (in_place) {
+        // 价格不变且数量不增加：原地修改，保留时间优先级（档位总量随之调整）；规则 4、5 都不适用
+        if (same_price && new_qty <= order->remaining) {
             level->total -= order->remaining - new_qty;
             order->remaining = new_qty;
             listener_.onModified(id, new_price, new_qty);
             return;
         }
+        // 档位总量上限：订单将重新挂到 new_price。目标档位中其他订单的总量：同价时是本档总量减去它自己，
+        // 改价时是新价位的现有总量（没有该价位为 0）
+        const Qty others = same_price ? level->total - order->remaining : volumeAt(order->side, new_price);
+        if (HFT_UNLIKELY(new_qty > kMaxLevelQty - others))
+            return reject(id, RequestType::Modify, RejectReason::InvalidQuantity);
+        if (order->post_only && !same_price && crosses(order->side, new_price))
+            return reject(id, RequestType::Modify, RejectReason::PostOnlyWouldCross);
 
         // 改价或加量：移出（失去时间优先级）→ onModified → 作为限价 GTC taker 撮合 → 剩余量挂到新价位队尾。
         // 订单对象直接归还对象池、挂单时再取（LIFO 复用同一个槽位），与参考模型一样不存在"游离订单"状态。
-        ensureCapacityForOneMore();  // 新价位可能需要新档位：先扩容，失败时尚无副作用
         Taker taker{id, new_qty, keyOf(opposite(order->side), new_price), order->account, order->side,
                     order->stp};
         const bool post_only = order->post_only;
-        removeOrder(order);
+        unlink(order);
+        const SideLevels& own = sides_[sideIndex(taker.side)];  // 移出旧价位（可能删掉该档）之后再查挂单位置
+        if (!crossesTop(taker)) {
+            // 不穿价：整单挂到新价位。索引条目原地占位（查询看不到），挂单后写回，省掉一次删除与一次插入
+            *slot = nullptr;
+            notifyHolding(slot, [&] { listener_.onModified(id, new_price, new_qty); });
+            *slot = rest(taker, new_price, post_only, lowerBoundFromBack(own, keyOf(taker.side, new_price)));
+            return;
+        }
+        index_.eraseAt(slot);  // 撮合会删除 maker 的索引条目、移动其他槽位：先删掉本单的条目
         listener_.onModified(id, new_price, new_qty);
-        if (crossesTop(taker) && !match(taker)) return;  // 被自成交保护撤销
-        if (taker.remaining == 0) return;                // 全部成交
-        // 移出旧价位（可能删掉该档）之后本侧数组已变：在这里查找挂单位置
-        rest(taker, new_price, post_only,
-             lowerBoundFromBack(sides_[sideIndex(taker.side)], keyOf(taker.side, new_price)));
+        if (!match(taker) || taker.remaining == 0) return;  // 被自成交保护撤销，或全部成交
+        index_.insert(id, rest(taker, new_price, post_only, lowerBoundFromBack(own, keyOf(taker.side, new_price))));
     }
 
     // ---------------------------------------------------------------- 查询（const，绝不调用监听器）
@@ -278,7 +249,7 @@ public:
     }
 
     // 活动（挂单中）订单数
-    std::size_t orderCount() const noexcept { return index_.size(); }
+    std::size_t orderCount() const noexcept { return order_pool_.size(); }
 
     std::size_t levelCount(Side side) const noexcept { return sides_[sideIndex(side)].size(); }
 
@@ -307,7 +278,7 @@ public:
 
     std::optional<OrderInfo> findOrder(OrderId id) const noexcept {
         Order* const* slot = index_.find(id);
-        if (slot == nullptr) return std::nullopt;
+        if (slot == nullptr || *slot == nullptr) return std::nullopt;  // 空指针：挂单前的占位条目
         return infoOf(**slot);
     }
 
@@ -321,17 +292,6 @@ public:
     TradeId lastTradeId() const noexcept { return last_trade_id_; }
 
     std::size_t maxOrders() const noexcept { return max_orders_; }
-
-    // 预留容量：保证活动订单数不超过 n 时 submit/cancel/modify 不分配内存（只增不减）
-    void reserve(std::size_t n) {
-        index_.reserve(n);
-        order_pool_.reserve(n);
-        level_pool_.reserve(n);
-        sides_[0].reserve(n);
-        sides_[1].reserve(n);
-        safe_orders_ = std::min({index_.capacity(), order_pool_.capacity(), level_pool_.capacity(),
-                                 sides_[0].capacity(), sides_[1].capacity()});
-    }
 
     // 结构不变量检查（O(n)，测试与调试用）：失败时返回 false，并在 why 中写明第一处违例。
     // 检查：两侧严格有序且 key 与价格一致、没有空价位、FIFO 双向链接完整、档位总量与订单数与链表一致、
@@ -395,10 +355,16 @@ public:
                 resting += static_cast<std::size_t>(n);
             }
         }
-        // 每个挂单都在索引中且索引指向它自身，再加上数量相等 => 索引与挂单一一对应
-        if (resting != index_.size())
-            return fail("index holds " + std::to_string(index_.size()) + " entries but " +
-                        std::to_string(resting) + " orders rest in the book");
+        // 每个挂单都在索引中且索引指向它自身，再加上数量相等 => 索引与挂单一一对应。唯一的例外是挂单前的
+        // 占位条目（空指针）：它只在不穿价的新单 / 改单的那一次回调期间存在，因此至多一个
+        if (index_.size() != resting) {
+            std::size_t placeholders = 0;
+            index_.forEach([&placeholders](OrderId, Order* const& o) { placeholders += o == nullptr ? 1 : 0; });
+            if (placeholders != 1 || resting + 1 != index_.size())
+                return fail("index holds " + std::to_string(index_.size()) + " entries (" +
+                            std::to_string(placeholders) + " placeholders) but " + std::to_string(resting) +
+                            " orders rest in the book");
+        }
         if (order_pool_.size() != resting)
             return fail("order pool holds " + std::to_string(order_pool_.size()) + " live orders but " +
                         std::to_string(resting) + " rest in the book (leak)");
@@ -406,8 +372,7 @@ public:
         if (level_pool_.size() != levels)
             return fail("level pool holds " + std::to_string(level_pool_.size()) + " live levels but the book has " +
                         std::to_string(levels) + " (leak)");
-        if (safe_orders_ > std::min({index_.capacity(), order_pool_.capacity(), level_pool_.capacity(),
-                                     sides_[0].capacity(), sides_[1].capacity()}))
+        if (safe_orders_ > capacityBound())
             return fail("capacity bound safe_orders_ exceeds an actual capacity");
         std::string map_why;
         if (!index_.checkInvariants(&map_why)) return fail("order index: " + map_why);
@@ -458,7 +423,8 @@ private:
 
     // 在 key 升序的数组中找第一个 key >= k 的下标（等价于 std::lower_bound）。
     // 先从末尾（盘口）线性探测至多 kLinearProbe 个元素，未命中再对剩余前缀二分。
-    static std::size_t lowerBoundFromBack(const SideLevels& v, Price key) noexcept {
+    // 每张挂单都会调用：强制内联（submit 很大，编译器的内联预算用完后会把它留成函数调用）
+    HFT_ALWAYS_INLINE static std::size_t lowerBoundFromBack(const SideLevels& v, Price key) noexcept {
         const LevelRef* d = v.data();
         std::size_t hi = v.size();
         // 不变量：下标 >= hi 的元素 key 都 >= key
@@ -497,26 +463,89 @@ private:
         return !v.empty() && v.back().key >= t.limit_key;
     }
 
+    // 限价 GTC 新单：撮合后的剩余量挂到该价位 FIFO 队尾（不发事件）。规则 4~7 按规范顺序检查，但其中两条
+    // 只对一类订单可能成立：穿价的订单在本侧该价位不可能已有档位（盘口不交叉），规则 6 恒通过；
+    // 不穿价的订单规则 7 恒通过，而且会整单挂上去
+    HFT_ALWAYS_INLINE void submitGtc(const OrderRequest& req, Taker& taker) {
+        const SideLevels& own = sides_[sideIndex(req.side)];
+        const Price key = keyOf(req.side, req.price);
+        // 挂单位置：从这里到挂单，撮合只改动对手方、回调不得重入、扩容不改变下标，本侧数组不变
+        const std::size_t pos = lowerBoundFromBack(own, key);
+        const bool full = max_orders_ != 0 && orderCount() >= max_orders_;
+        const Price price = req.price;
+        const bool post_only = req.post_only;
+        if (crossesTop(taker)) {
+            if (index_.contains(req.id)) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
+            if (full) return reject(req.id, RequestType::New, RejectReason::CapacityExceeded);
+            if (post_only) return reject(req.id, RequestType::New, RejectReason::PostOnlyWouldCross);
+            ensureCapacityForOneMore();  // 可能扩容（抛 bad_alloc 时尚无任何副作用）
+            listener_.onAccepted(req);
+            if (!match(taker) || taker.remaining == 0) return;  // 被自成交保护终止，或全部成交
+            [[maybe_unused]] const bool fresh = index_.insert(taker.id, rest(taker, price, post_only, pos)).second;
+            HFT_ASSERT(fresh && "accepted order id is already in the index");
+            return;
+        }
+        // 规则 6（档位总量上限）只在本侧该价位已有档位时可能触发
+        const Qty resting = pos < own.size() && own[pos].key == key ? own[pos].level->total : 0;
+        if (HFT_UNLIKELY(full || req.qty > kMaxLevelQty - resting)) {
+            if (index_.contains(req.id)) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
+            return reject(req.id, RequestType::New,
+                          full ? RejectReason::CapacityExceeded : RejectReason::InvalidQuantity);
+        }
+        ensureCapacityForOneMore();  // 先扩容（抛 bad_alloc 时尚无任何副作用），下面的占位插入就不会再扩容
+        const auto [slot, fresh] = index_.insert(req.id, nullptr);  // 规则 4 查重，同时为挂单占好索引槽位
+        if (!fresh) return reject(req.id, RequestType::New, RejectReason::DuplicateOrderId);
+        notifyHolding(slot, [&] { listener_.onAccepted(req); });
+        *slot = rest(taker, price, post_only, pos);
+    }
+
+    // 索引中有占位条目 slot 时调用监听器：回调抛异常则撤销占位（簿回到命令之前的一致状态），异常原样传播
+    template <class Callback>
+    HFT_ALWAYS_INLINE void notifyHolding(Order** slot, Callback&& callback) {
+        try {
+            callback();
+        } catch (...) {
+            index_.eraseAt(slot);  // 回调不能修改索引，slot 仍然有效
+            throw;
+        }
+    }
+
     // ---------------------------------------------------------------- 容量
     // 保证接下来挂一个新订单（可能新建一个价位）不需要任何分配。热路径上只有一次比较：
     // safe_orders_ = min(索引、订单池、价位池、两侧价位数组的容量)。每个价位至少有一个订单，所以价位总数
     // 与任一侧的价位数都不超过订单数；订单数 < safe_orders_ 时再加一个订单和一个价位不会超出任何一项容量。
-    // 否则统一倍增扩容（可能抛 std::bad_alloc，此时尚未修改任何状态）。
+    // 否则统一倍增扩容（可能抛 std::bad_alloc，此时尚未修改任何状态）。订单数因此始终不超过 safe_orders_，
+    // 不增加订单数的改单也就总有足够的容量。
     void ensureCapacityForOneMore() {
-        if (HFT_LIKELY(index_.size() < safe_orders_)) return;
+        if (HFT_LIKELY(orderCount() < safe_orders_)) return;
         grow();
     }
 
     __attribute__((noinline, cold)) void grow() {
-        const std::size_t need = std::max(safe_orders_, index_.size() + 1);
+        const std::size_t need = std::max(safe_orders_, orderCount() + 1);
         reserve(need + std::max(need, kMinGrowth));
     }
 
+    // 预留容量：保证活动订单数不超过 n 时 submit/cancel/modify 不分配内存（只增不减）
+    void reserve(std::size_t n) {
+        index_.reserve(n);
+        order_pool_.reserve(n);
+        level_pool_.reserve(n);
+        sides_[0].reserve(n);
+        sides_[1].reserve(n);
+        safe_orders_ = capacityBound();
+    }
+
+    std::size_t capacityBound() const noexcept {
+        return std::min({index_.capacity(), order_pool_.capacity(), level_pool_.capacity(), sides_[0].capacity(),
+                         sides_[1].capacity()});
+    }
+
     // ---------------------------------------------------------------- 挂单与移除
-    // 剩余量挂到 price 价位 FIFO 队尾（价位不存在则在 pos 处创建）。pos 是 price 在本侧价位数组中的
-    // lowerBound 位置，由调用方查好、其后本侧数组未变。调用前必须已 ensureCapacityForOneMore()，
-    // 因此这里的对象池、价位数组、索引操作都不会分配内存；调用方也已检查过档位总量上限。
-    HFT_ALWAYS_INLINE void rest(const Taker& t, Price price, bool post_only, std::size_t pos) {
+    // 剩余量挂到 price 价位 FIFO 队尾（价位不存在则在 pos 处创建），返回新订单，由调用方写入索引。
+    // pos 是 price 在本侧价位数组中的 lowerBound 位置，由调用方查好、其后本侧数组未变。容量已经足够
+    // （见 ensureCapacityForOneMore），这里的对象池与价位数组操作都不会分配内存；调用方也已检查过档位总量上限。
+    HFT_ALWAYS_INLINE Order* rest(const Taker& t, Price price, bool post_only, std::size_t pos) {
         SideLevels& v = sides_[sideIndex(t.side)];
         const Price key = keyOf(t.side, price);
         HFT_ASSERT(pos == lowerBoundFromBack(v, key));
@@ -529,7 +558,7 @@ private:
             v.insert(v.begin() + static_cast<std::ptrdiff_t>(pos), LevelRef{key, level});
         }
         HFT_ASSERT(t.remaining <= kMaxLevelQty - level->total);
-        HFT_ASSERT(order_pool_.available() > 0 && index_.size() < index_.capacity());
+        HFT_ASSERT(order_pool_.available() > 0 && orderCount() < index_.capacity());
         Order* const order = order_pool_.create(t.id, t.remaining, t.account, t.side, post_only, t.stp);
         order->level = level;
         order->prev = level->tail;
@@ -538,11 +567,11 @@ private:
         level->tail = order;
         level->total += order->remaining;
         ++level->count;
-        index_.insert(t.id, order);
+        return order;
     }
 
-    // 从订单簿移除一个活动订单（撤单、STP 撤 maker、改价/加量前移出）；价位空了就删除该价位
-    void removeOrder(Order* order) noexcept {
+    // 把订单从所属价位的 FIFO 中摘下并归还对象池，价位空了就删除该价位（索引条目由调用方处理）
+    void unlink(Order* order) noexcept {
         Level* const level = order->level;
         if (order->prev != nullptr) order->prev->next = order->next;
         else level->head = order->next;
@@ -551,7 +580,6 @@ private:
         level->total -= order->remaining;
         --level->count;
         const Side side = order->side;
-        index_.erase(order->id);
         order_pool_.destroy(order);
         if (level->count == 0) removeLevel(side, level);
     }
@@ -608,19 +636,7 @@ private:
             Order* const maker = level->head;
 
             if (HFT_UNLIKELY(t.stp != StpMode::None && maker->account == t.account)) {
-                if (t.stp == StpMode::CancelTaker) {
-                    listener_.onCancelled(t.id, t.remaining, CancelReason::SelfTradePrevention);
-                    return false;
-                }
-                // CancelMaker / CancelBoth：先移除 maker（回调时簿已更新），再发事件
-                const OrderId maker_id = maker->id;
-                const Qty maker_remaining = maker->remaining;
-                removeOrder(maker);
-                listener_.onCancelled(maker_id, maker_remaining, CancelReason::SelfTradePrevention);
-                if (t.stp == StpMode::CancelBoth) {
-                    listener_.onCancelled(t.id, t.remaining, CancelReason::SelfTradePrevention);
-                    return false;
-                }
+                if (!preventSelfTrade(t, maker)) return false;
                 continue;  // CancelMaker：继续撮合
             }
 
@@ -648,13 +664,30 @@ private:
         return true;
     }
 
+    // 自成交保护：taker 撞上同账户的 maker（撮合循环的冷路径，不内联以免撑大热循环）。
+    // CancelTaker 撤 taker；CancelMaker / CancelBoth 先移除 maker（回调时簿已更新）再发事件，CancelBoth 随后撤 taker。
+    // 返回 false 表示 taker 被撤销、撮合终止
+    __attribute__((noinline, cold)) bool preventSelfTrade(const Taker& t, Order* maker) {
+        if (t.stp != StpMode::CancelTaker) {
+            const OrderId maker_id = maker->id;
+            const Qty maker_remaining = maker->remaining;
+            index_.erase(maker_id);
+            unlink(maker);
+            listener_.onCancelled(maker_id, maker_remaining, CancelReason::SelfTradePrevention);
+            if (t.stp == StpMode::CancelMaker) return true;
+        }
+        listener_.onCancelled(t.id, t.remaining, CancelReason::SelfTradePrevention);
+        return false;
+    }
+
     // ---------------------------------------------------------------- 成员
+    // 对象池与索引在构造函数中由 reserve() 一次预留
     Listener& listener_;
     std::size_t max_orders_;  // 0 = 不限
-    hft::ObjectPool<Order> order_pool_;
-    hft::ObjectPool<Level> level_pool_;
+    hft::ObjectPool<Order> order_pool_{0};
+    hft::ObjectPool<Level> level_pool_{0};
     SideLevels sides_[2];  // [0] 买盘（价格升序），[1] 卖盘（价格降序）；最优档都在末尾
-    hft::FlatHashMap<OrderId, Order*> index_;
+    hft::FlatHashMap<OrderId, Order*> index_{0};  // 值为空指针的条目是挂单前的占位（对查询不可见）
     std::size_t safe_orders_ = 0;  // 订单数低于它时挂单保证不分配（见 ensureCapacityForOneMore）
     TradeId last_trade_id_ = 0;
 };

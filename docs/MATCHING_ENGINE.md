@@ -145,7 +145,13 @@ cache lines as possible:
   one crossing test. Lookups probe linearly from the touch for 8 entries, then binary-search the
   rest, because almost all activity happens near the top of the book.
 - **Order index**: `hft::FlatHashMap<OrderId, Order*>`, an open-addressing map with linear
-  probing, a splitmix64 mixer and backward-shift deletion (no tombstones).
+  probing, a splitmix64 mixer and backward-shift deletion (no tombstones). A cancel and a passive
+  (non-crossing) limit GTC add each probe it once. A cancel extracts the entry. A limit GTC order
+  that does not cross inserts a null placeholder as its duplicate-id check and fills in the order
+  after `onAccepted`. An order that crosses still checks for a duplicate id first and inserts later,
+  only if a remainder rests. A
+  repriced or enlarged order reuses the slot it was found in. Placeholders are invisible to
+  queries, and they are removed if the callback throws.
 - Integer arithmetic only, and none of it can overflow. The cached level totals fit in `int64_t`
   only because of the level-total bound, and the FOK pre-check relies on them: without STP it
   compares the still-needed quantity against whole levels and subtracts a level's total only when
@@ -156,7 +162,7 @@ Capacity is reserved up front (`reserve_orders`, default 1024). While the live o
 below it, `submit`/`cancel`/`modify` perform **zero heap allocations**. The benchmark verifies
 this by counting `operator new`. Beyond the reservation the structures grow by doubling. Growth
 happens before any state change or event, so a `std::bad_alloc` leaves the book and the event
-stream untouched.
+stream untouched. A modify never increases the order count, so it never needs to grow.
 
 ## MatchingEngine (multi-symbol)
 
